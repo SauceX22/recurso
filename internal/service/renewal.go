@@ -233,7 +233,10 @@ func (s *RenewalService) attemptPayment(ctx context.Context, inv *domain.Invoice
 			"invoice_id", inv.ID, "error", err)
 		return
 	}
-	if _, err := s.settler.MarkInvoicePaid(ctx, inv.ID); err != nil {
+	// The billing-cycle sweep's context carries no tenant; settle under the
+	// invoice's own so the tenant-scoped invoice lookup succeeds.
+	tenantCtx := context.WithValue(ctx, domain.TenantIDKey, inv.TenantID)
+	if _, err := s.settler.MarkInvoicePaid(tenantCtx, inv.ID); err != nil {
 		slog.ErrorContext(ctx, "renewal charge succeeded but settlement failed (webhook will reconcile)",
 			"invoice_id", inv.ID, "error", err)
 	}
