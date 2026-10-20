@@ -122,8 +122,10 @@ entity's Deferred. Gapless invoice series is per-entity.
 
 `factory.go:20` routes: IN → GST engine (intra/inter-state CGST+SGST vs IGST),
 US → sales-tax engine (**0% stub unless a provider is injected** — `factory.go:24`,
-PARTIAL for live US rates), EU-27+GB → VAT engine, else → no-tax (0% with audit
-note, ENG-152). Tax posts via Code-6 (Revenue/Deferred → Tax Payable), so Revenue
+PARTIAL for live US rates), EU-27+GB → VAT engine, SA → KSA VAT engine
+(`ksa_vat.go`: 15% domestic B2C and B2B, zero-rated exports; no ZATCA
+e-invoicing), else → no-tax (0% with audit note, ENG-152; the resolver passes
+that note through rather than the India GST export path). Tax posts via Code-6 (Revenue/Deferred → Tax Payable), so Revenue
 = taxable value, Tax Payable = tax, AR = gross.
 
 ## FX (`service/fx.go`)

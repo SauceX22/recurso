@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **KSA VAT.** A seller in Saudi Arabia (`SA`) now charges 15% VAT on domestic
+  supplies, B2C and B2B alike, and zero-rates exports of services to buyers
+  outside the Kingdom (`export_exempt`). Invoices present under the VAT regime,
+  and the VAT posts to Tax Payable like any other output tax. ZATCA (Fatoora)
+  e-invoicing is not included.
+
+### Fixed
+
+- **No India GST notes for non-Indian sellers.** A seller in an unsupported
+  jurisdiction got the India GST export path on non-INR invoices: `export`
+  with a "Zero-rated export (no LUT on file …)" note. It now gets the no-tax
+  engine's own 0% result and a "No tax configured for XX" note.
+
 ## [0.14.0] - 2026-09-04 — The hardening release
 
 0.13.0 made every object deep; 0.14.0 made the whole thing trustworthy under
