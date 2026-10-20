@@ -42,15 +42,23 @@ const moyasarBaseURL = "https://api.moyasar.com/v1"
 // id and let a replay charge the customer twice.
 var moyasarNamespace = uuid.MustParse("6f1c2a8e-3b7d-4e0a-9c51-2d8f4b6e7a90")
 
-// moyasarHardDeclines are ISO 8583 response codes after which retrying the
-// same card cannot succeed (lost, stolen, expired, invalid, fraud,
-// restricted). Moyasar does not classify codes itself; this grouping is
-// Recurso's (spec "Decline mapping").
-var moyasarHardDeclines = map[string]bool{
-	"04": true, "07": true, "14": true, "15": true, "33": true, "34": true,
-	"35": true, "36": true, "37": true, "38": true, "41": true, "43": true,
-	"54": true, "56": true, "57": true, "59": true, "62": true, "63": true,
-	"67": true, "79": true, "93": true,
+// classifyMoyasarDecline maps an ISO 8583 response code to a decline code and
+// whether retrying the same card can never succeed (lost, stolen, expired,
+// invalid, fraud, restricted). Moyasar doesn't classify codes itself. The code
+// keys the dunning bandit's context, so it is a small fixed vocabulary.
+func classifyMoyasarDecline(responseCode string) (code string, permanent bool) {
+	switch responseCode {
+	case "51", "61", "65":
+		return "insufficient_funds", false
+	case "33", "54":
+		return "expired_card", true
+	case "41", "43":
+		return "lost_or_stolen", true
+	case "04", "07", "14", "15", "34", "35", "36", "37", "38",
+		"56", "57", "59", "62", "63", "67", "79", "93":
+		return "card_declined", true
+	}
+	return "card_declined", false
 }
 
 // NewMoyasarGateway builds the gateway. The secret key alone selects test or
@@ -276,20 +284,17 @@ func moyasarRejected(status int) bool {
 	return status >= 400 && status < 500
 }
 
-// mapMoyasarCharge applies the spec's decline-mapping table.
+// mapMoyasarCharge maps a created or read-back token payment to a result.
 func mapMoyasarCharge(p *moyasarPayment) *port.PaymentResult {
 	switch p.Status {
 	case "paid":
 		return &port.PaymentResult{Success: true, PaymentID: p.ID}
 	case "failed":
-		code := ""
-		if p.Source.ResponseCode != nil {
-			code = *p.Source.ResponseCode
-		}
 		res := &port.PaymentResult{Success: false, PaymentID: p.ID, ErrorCode: "card_declined", ErrorMsg: p.Source.Message}
-		if code != "" {
-			res.ErrorCode = "card_declined_" + code
-			res.Permanent = moyasarHardDeclines[code]
+		if p.Source.ResponseCode != nil && *p.Source.ResponseCode != "" {
+			rc := *p.Source.ResponseCode
+			res.ErrorCode, res.Permanent = classifyMoyasarDecline(rc)
+			res.ErrorMsg = fmt.Sprintf("%s (response code %s)", p.Source.Message, rc)
 		}
 		return res
 	case "initiated":
@@ -305,8 +310,8 @@ func mapMoyasarCharge(p *moyasarPayment) *port.PaymentResult {
 		return &port.PaymentResult{
 			Success:   false,
 			PaymentID: p.ID,
-			ErrorCode: "unexpected_status_" + p.Status,
-			ErrorMsg:  p.Source.Message,
+			ErrorCode: "processing_error",
+			ErrorMsg:  fmt.Sprintf("unexpected payment status %q", p.Status),
 		}
 	}
 }

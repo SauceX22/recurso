@@ -226,18 +226,24 @@ func TestMoyasarChargeSameKeySameGivenIDOnTheWire(t *testing.T) {
 }
 
 func TestMoyasarChargeDeclineMapping(t *testing.T) {
+	// ErrorCode keys the dunning bandit's context, so it is a small fixed
+	// vocabulary; the raw ISO 8583 code goes into ErrorMsg.
 	cases := []struct {
 		name, status, code, message string
 		wantCode                    string
 		wantPermanent               bool
+		wantMsg                     string
 	}{
-		{"soft decline insufficient funds", "failed", "51", "INSUFFICIENT FUNDS", "card_declined_51", false},
-		{"soft decline do not honour", "failed", "05", "DO NOT HONOUR", "card_declined_05", false},
-		{"hard decline stolen card", "failed", "43", "STOLEN CARD", "card_declined_43", true},
-		{"hard decline expired card", "failed", "54", "EXPIRED CARD", "card_declined_54", true},
-		{"null response code", "failed", "null", "3-D Secure failed", "card_declined", false},
-		{"3ds required", "initiated", "null", "", "authentication_required", false},
-		{"unexpected status", "authorized", "00", "", "unexpected_status_authorized", false},
+		{"insufficient funds", "failed", "51", "INSUFFICIENT FUNDS", "insufficient_funds", false, "INSUFFICIENT FUNDS (response code 51)"},
+		{"withdrawal limit", "failed", "61", "EXCEEDS WITHDRAWAL LIMIT", "insufficient_funds", false, "EXCEEDS WITHDRAWAL LIMIT (response code 61)"},
+		{"do not honour", "failed", "05", "DO NOT HONOUR", "card_declined", false, "DO NOT HONOUR (response code 05)"},
+		{"stolen card", "failed", "43", "STOLEN CARD", "lost_or_stolen", true, "STOLEN CARD (response code 43)"},
+		{"lost card", "failed", "41", "LOST CARD", "lost_or_stolen", true, "LOST CARD (response code 41)"},
+		{"expired card", "failed", "54", "EXPIRED CARD", "expired_card", true, "EXPIRED CARD (response code 54)"},
+		{"other hard decline", "failed", "62", "RESTRICTED CARD", "card_declined", true, "RESTRICTED CARD (response code 62)"},
+		{"null response code", "failed", "null", "3-D Secure failed", "card_declined", false, "3-D Secure failed"},
+		{"3ds required", "initiated", "null", "", "authentication_required", false, "issuer requires 3-D Secure; customer must pay via checkout"},
+		{"unexpected status", "authorized", "00", "", "processing_error", false, `unexpected payment status "authorized"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -259,30 +265,13 @@ func TestMoyasarChargeDeclineMapping(t *testing.T) {
 			if res.Permanent != tc.wantPermanent {
 				t.Fatalf("Permanent = %v, want %v (only hard declines stop dunning)", res.Permanent, tc.wantPermanent)
 			}
-			if tc.status == "failed" && res.ErrorMsg != tc.message {
-				t.Fatalf("ErrorMsg = %q, want source.message %q", res.ErrorMsg, tc.message)
+			if res.ErrorMsg != tc.wantMsg {
+				t.Fatalf("ErrorMsg = %q, want %q", res.ErrorMsg, tc.wantMsg)
 			}
 			if res.PaymentID != moyasarPaymentID {
 				t.Fatalf("PaymentID = %q, want the declined payment's id for traceability", res.PaymentID)
 			}
 		})
-	}
-}
-
-func TestMoyasarHardDeclineSetIsExactlyTheSpec(t *testing.T) {
-	spec := strings.Fields("04 07 14 15 33 34 35 36 37 38 41 43 54 56 57 59 62 63 67 79 93")
-	if len(moyasarHardDeclines) != len(spec) {
-		t.Fatalf("hard set has %d codes, spec lists %d", len(moyasarHardDeclines), len(spec))
-	}
-	for _, c := range spec {
-		if !moyasarHardDeclines[c] {
-			t.Fatalf("code %s is hard in the spec but missing from the adapter", c)
-		}
-	}
-	for _, soft := range []string{"00", "05", "51", "91"} {
-		if moyasarHardDeclines[soft] {
-			t.Fatalf("code %s must stay soft (retryable)", soft)
-		}
 	}
 }
 

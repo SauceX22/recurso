@@ -319,6 +319,9 @@ func (w *RetryWorker) processInvoice(ctx context.Context, inv *domain.Invoice) {
 		errorCode = "GENERIC_FAILURE"
 	}
 	inv.LastPaymentError = errorCode
+	slog.Warn("retry worker: payment declined",
+		"invoice_id", inv.ID, "payment_id", result.PaymentID, "error_code", result.ErrorCode,
+		"permanent", result.Permanent, "message", result.ErrorMsg)
 
 	// Hard decline: retrying the same method cannot succeed, so stop charging
 	// it and let the email ladder (pay link, escalation) take over.

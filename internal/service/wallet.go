@@ -526,7 +526,7 @@ func (s *WalletService) chargeAndCredit(ctx context.Context, w *domain.Wallet, c
 		IdempotencyKey: idemKey,
 	})
 	if err != nil || result == nil || !result.Success {
-		slog.WarnContext(ctx, "wallet auto-recharge charge failed", "wallet_id", w.ID, "error", err)
+		logChargeFailure(ctx, "wallet auto-recharge charge failed", result, err, "wallet_id", w.ID, "provider", m.Provider)
 		s.notifyRechargeFailure(ctx, w, "payment failed")
 		return false
 	}

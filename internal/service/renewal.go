@@ -224,8 +224,8 @@ func (s *RenewalService) attemptPayment(ctx context.Context, inv *domain.Invoice
 		IdempotencyKey: fmt.Sprintf("renewal-%s", inv.ID),
 	})
 	if err != nil || result == nil || !result.Success {
-		slog.WarnContext(ctx, "renewal payment attempt failed; invoice left open for dunning",
-			"invoice_id", inv.ID, "error", err)
+		logChargeFailure(ctx, "renewal payment attempt failed; invoice left open for dunning", result, err,
+			"invoice_id", inv.ID, "provider", m.Provider)
 		return
 	}
 	if _, err := s.settler.MarkInvoicePaid(ctx, inv.ID); err != nil {

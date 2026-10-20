@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/google/uuid"
 	"github.com/recurso-dev/recurso/internal/core/domain"
@@ -135,6 +136,22 @@ func (r *SavedCardGatewayRouter) ChargerFor(ctx context.Context, m domain.SavedP
 		return nil, fmt.Errorf("open saved-card gateway secret for %s: %w", connID, err)
 	}
 	return build(secret), nil
+}
+
+// logChargeFailure logs a failed off-session charge with what an operator
+// needs: the error for an outage, or the decline itself (payment id, decline
+// code, hard or soft, the gateway's message).
+func logChargeFailure(ctx context.Context, msg string, result *port.PaymentResult, err error, attrs ...any) {
+	switch {
+	case err != nil:
+		attrs = append(attrs, "error", err)
+	case result == nil:
+		attrs = append(attrs, "error", "gateway returned no result")
+	default:
+		attrs = append(attrs, "payment_id", result.PaymentID, "error_code", result.ErrorCode,
+			"permanent", result.Permanent, "message", result.ErrorMsg)
+	}
+	slog.WarnContext(ctx, msg, attrs...)
 }
 
 // platformRouter is the router used when none is wired: platform Stripe
