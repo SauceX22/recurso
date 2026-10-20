@@ -207,3 +207,68 @@ func TestRetryWorker_UnchargeableMethodUsesInteractiveRetry(t *testing.T) {
 		t.Fatalf("stripe=%d interactive=%d amount=%d, want 0/1/10000", stripe.charges, gw.calls, gw.lastAmount)
 	}
 }
+
+// settlingRepo is mockInvoiceRepo plus the reads and writes of a settled
+// retry: the re-read after MarkInvoicePaid and the payment id record.
+type settlingRepo struct {
+	mockInvoiceRepo
+	paymentIDs []string
+}
+
+func (r *settlingRepo) GetByID(_ context.Context, id uuid.UUID) (*domain.Invoice, error) {
+	for _, inv := range r.invoices {
+		if inv.ID == id {
+			cp := *inv
+			cp.Status = domain.InvoiceStatusPaid
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *settlingRepo) SetGatewayPaymentID(_ context.Context, _, _ uuid.UUID, id string) error {
+	r.paymentIDs = append(r.paymentIDs, id)
+	return nil
+}
+
+type fakeSettler struct{ transitioned bool }
+
+func (f fakeSettler) MarkInvoicePaid(context.Context, uuid.UUID) (bool, error) {
+	return f.transitioned, nil
+}
+
+// The payment a retry settles with is the invoice's refund target, recorded
+// only when that payment settled the invoice and a real charge was made.
+func TestRetryWorker_RecordsSettlingPaymentID(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		transitioned bool
+		creditedAll  bool
+		want         []string
+	}{
+		{"settled by this charge", true, false, []string{"pay_moyasar"}},
+		{"already settled elsewhere", false, false, nil},
+		{"nothing was charged", true, true, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inv := pastDueSARInvoice(1)
+			if tc.creditedAll {
+				inv.CreditApplied = inv.Total
+			}
+			repo := &settlingRepo{mockInvoiceRepo: mockInvoiceRepo{invoices: []*domain.Invoice{inv}}}
+			moyasar := &fakeSavedCharger{name: "moyasar"}
+			router := service.NewSavedCardGatewayRouter(nil, nil, nil)
+			router.RegisterProvider(domain.GatewayMoyasar, moyasar)
+
+			w := NewRetryWorker(repo, newTestRetryService(), &mockGateway{}, &mockNotifier{})
+			w.SetSavedMethodCharging(nil, &fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_r"})
+			w.SetChargerRouter(router)
+			w.SetSettler(fakeSettler{transitioned: tc.transitioned})
+			w.processRetries(context.Background())
+
+			if len(repo.paymentIDs) != len(tc.want) || (len(tc.want) == 1 && repo.paymentIDs[0] != tc.want[0]) {
+				t.Fatalf("recorded payment ids = %v, want %v", repo.paymentIDs, tc.want)
+			}
+		})
+	}
+}

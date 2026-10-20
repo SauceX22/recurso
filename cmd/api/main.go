@@ -1068,6 +1068,7 @@ func main() {
 	// BILLING_CYCLE_INTERVAL=0 disables; default 5m.
 	renewalService := service.NewRenewalService(subscriptionRepo.(*db.SubscriptionRepository), planRepo, invoiceService)
 	renewalService.SetSavedMethodCharging(stripeCharger, customerRepo, subscriptionService)
+	renewalService.SetPaymentRecorder(invoiceRepo)
 	walletService.SetSavedMethodCharging(stripeCharger, customerRepo)
 	// One router for every off-session charge (renewal, wallet auto-recharge,
 	// dunning retry): each saved method charges on the gateway that issued it —

@@ -115,7 +115,7 @@ func (w *RetryWorker) chargeInvoice(ctx context.Context, inv *domain.Invoice) (*
 	if amountDue <= 0 {
 		// Fully covered by wallet/credit — nothing left to collect, so treat it as
 		// paid rather than charging the card for an amount that isn't owed.
-		return &port.PaymentResult{Success: true, PaymentID: "no_charge_due"}, nil
+		return &port.PaymentResult{Success: true, PaymentID: noChargeDue}, nil
 	}
 
 	if charger, m, ok := w.savedMethodCharger(ctx, inv); ok {
@@ -261,12 +261,14 @@ func (w *RetryWorker) processInvoice(ctx context.Context, inv *domain.Invoice) {
 			// an already-paid invoice. The worker's ctx carries no tenant, so
 			// inject the invoice's own (same as the webhook handlers).
 			tenantCtx := context.WithValue(ctx, domain.TenantIDKey, inv.TenantID)
-			if _, err := w.settler.MarkInvoicePaid(tenantCtx, inv.ID); err != nil {
+			transitioned, err := w.settler.MarkInvoicePaid(tenantCtx, inv.ID)
+			if err != nil {
 				// Leave dunning state untouched: the next poll retries and the
 				// settle is idempotent, so nothing is lost or double-posted.
 				slog.Error("retry worker: failed to settle invoice", "invoice_id", inv.ID, "error", err)
 				return
 			}
+			w.recordSettlingPayment(tenantCtx, inv, transitioned, result.PaymentID)
 			// Re-read the settled row before clearing dunning state — Update
 			// writes the full struct and would clobber paid_at/amount_paid.
 			settled, err := w.invoiceRepo.GetByID(tenantCtx, inv.ID)
@@ -347,6 +349,27 @@ func (w *RetryWorker) processInvoice(ctx context.Context, inv *domain.Invoice) {
 
 	if updateErr := w.invoiceRepo.Update(ctx, inv); updateErr != nil {
 		slog.Error("retry worker: failed to update invoice", "invoice_id", inv.ID, "error", updateErr)
+	}
+}
+
+// noChargeDue is the PaymentID of a "success" where nothing was charged.
+const noChargeDue = "no_charge_due"
+
+// recordSettlingPayment stores the payment that settled inv as its refund
+// target, so refunds don't depend on the payment webhook. A charge on an
+// already-settled invoice may be a second payment, which needs review.
+func (w *RetryWorker) recordSettlingPayment(ctx context.Context, inv *domain.Invoice, transitioned bool, paymentID string) {
+	if paymentID == "" || paymentID == noChargeDue {
+		return
+	}
+	if !transitioned {
+		slog.Warn("retry worker: charge succeeded on an invoice that was already settled; review for refund if it was another payment",
+			"invoice_id", inv.ID, "payment_id", paymentID)
+		return
+	}
+	if err := w.invoiceRepo.SetGatewayPaymentID(ctx, inv.TenantID, inv.ID, paymentID); err != nil {
+		slog.Error("retry worker: failed to record the settling payment id; refunds need it",
+			"invoice_id", inv.ID, "payment_id", paymentID, "error", err)
 	}
 }
 

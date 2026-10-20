@@ -35,6 +35,12 @@ type renewalInvoicer interface {
 	GenerateFinalUsageInvoice(ctx context.Context, sub *domain.Subscription, endedAt time.Time) (*domain.Invoice, error)
 }
 
+// gatewayPaymentRecorder records the gateway payment that settled an invoice;
+// *db.InvoiceRepository.
+type gatewayPaymentRecorder interface {
+	SetGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, gatewayPaymentID string) error
+}
+
 // renewalSettler settles a paid invoice through the ledger path;
 // *SubscriptionService.MarkInvoicePaid.
 type renewalSettler interface {
@@ -54,6 +60,9 @@ type RenewalService struct {
 	// chargerRouter routes each charge to the gateway the method was saved on.
 	// nil-safe: when unset, only platform Stripe methods charge, on `charger`.
 	chargerRouter savedChargerRouter
+	// payments records the settling payment id as the invoice's refund
+	// target. nil-safe.
+	payments gatewayPaymentRecorder
 
 	now func() time.Time // injectable for tests
 }
@@ -79,6 +88,12 @@ func (s *RenewalService) SetSavedMethodCharging(charger SavedCardCharger, lookup
 // methods charge, on the `charger` from SetSavedMethodCharging.
 func (s *RenewalService) SetChargerRouter(router savedChargerRouter) {
 	s.chargerRouter = router
+}
+
+// SetPaymentRecorder wires recording of the gateway payment that settles a
+// renewal invoice, so refunds don't depend on a webhook. nil-safe.
+func (s *RenewalService) SetPaymentRecorder(r gatewayPaymentRecorder) {
+	s.payments = r
 }
 
 // renewalClaimLease mirrors the mandate debitClaimWindow: shorter than the
@@ -228,8 +243,29 @@ func (s *RenewalService) attemptPayment(ctx context.Context, inv *domain.Invoice
 			"invoice_id", inv.ID, "provider", m.Provider)
 		return
 	}
-	if _, err := s.settler.MarkInvoicePaid(ctx, inv.ID); err != nil {
+	transitioned, err := s.settler.MarkInvoicePaid(ctx, inv.ID)
+	if err != nil {
 		slog.ErrorContext(ctx, "renewal charge succeeded but settlement failed (webhook will reconcile)",
-			"invoice_id", inv.ID, "error", err)
+			"invoice_id", inv.ID, "payment_id", result.PaymentID, "error", err)
+		return
+	}
+	recordSettlingPayment(ctx, s.payments, inv, transitioned, result.PaymentID)
+}
+
+// recordSettlingPayment stores paymentID as inv's refund target when that
+// payment settled it. If the invoice was already settled, the charge may be a
+// second payment for it, which an operator must review.
+func recordSettlingPayment(ctx context.Context, r gatewayPaymentRecorder, inv *domain.Invoice, transitioned bool, paymentID string) {
+	if !transitioned {
+		slog.WarnContext(ctx, "off-session charge succeeded on an invoice that was already settled; review for refund if it was another payment",
+			"invoice_id", inv.ID, "payment_id", paymentID)
+		return
+	}
+	if r == nil || paymentID == "" {
+		return
+	}
+	if err := r.SetGatewayPaymentID(ctx, inv.TenantID, inv.ID, paymentID); err != nil {
+		slog.ErrorContext(ctx, "failed to record the settling payment id; refunds need it",
+			"invoice_id", inv.ID, "payment_id", paymentID, "error", err)
 	}
 }

@@ -206,3 +206,57 @@ func TestRenewalSavedMethod_LookupErrorLeavesInvoiceOpen(t *testing.T) {
 		t.Fatalf("charges=%d settled=%d after a lookup error, want 0/0", moyasar.charges, len(settler.settled))
 	}
 }
+
+// fakePaymentRecorder records SetGatewayPaymentID calls.
+type fakePaymentRecorder struct {
+	calls []recordedPayment
+}
+
+type recordedPayment struct {
+	tenantID, invoiceID uuid.UUID
+	paymentID           string
+}
+
+func (f *fakePaymentRecorder) SetGatewayPaymentID(_ context.Context, tenantID, invoiceID uuid.UUID, paymentID string) error {
+	f.calls = append(f.calls, recordedPayment{tenantID, invoiceID, paymentID})
+	return nil
+}
+
+// The payment that settles a renewal is the invoice's refund target; without
+// recording it, refunds depend on a webhook arriving.
+func TestRenewalSavedMethod_RecordsSettlingPaymentID(t *testing.T) {
+	svc, invoicer, sub := sarRenewalFixture()
+	moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: "pay_renewal_1"}}
+	svc.SetSavedMethodCharging(nil, moyasarLookup(), &fakeRenewalSettler{})
+	svc.SetChargerRouter(moyasarRouter(moyasar))
+	rec := &fakePaymentRecorder{}
+	svc.SetPaymentRecorder(rec)
+
+	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
+		t.Fatal(err)
+	}
+	inv := invoicer.invoice
+	want := []recordedPayment{{inv.TenantID, inv.ID, "pay_renewal_1"}}
+	if len(rec.calls) != 1 || rec.calls[0] != want[0] {
+		t.Fatalf("recorded = %+v, want %+v", rec.calls, want)
+	}
+}
+
+// When something else already settled the invoice, this charge did not: its
+// id must not overwrite the refund target.
+func TestRenewalSavedMethod_DoesNotRecordPaymentThatDidNotSettle(t *testing.T) {
+	svc, _, sub := sarRenewalFixture()
+	moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: "pay_late"}}
+	already := false
+	svc.SetSavedMethodCharging(nil, moyasarLookup(), &fakeRenewalSettler{transitioned: &already})
+	svc.SetChargerRouter(moyasarRouter(moyasar))
+	rec := &fakePaymentRecorder{}
+	svc.SetPaymentRecorder(rec)
+
+	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("recorded = %+v, want nothing", rec.calls)
+	}
+}
