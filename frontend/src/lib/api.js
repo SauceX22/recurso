@@ -346,6 +346,10 @@ export const endpoints = {
   // Checkout (public, uses base URL without /v1)
   getCheckoutInvoice: (id) => axios.get(`${API_ROOT}/checkout/${id}`),
   initiateCheckoutPayment: (id) => axios.post(`${API_ROOT}/checkout/${id}/pay`),
+  // Server fetches the Moyasar payment and settles only if it's paid and bound
+  // to this invoice; body is { payment_id }.
+  verifyMoyasarCheckout: (id, body) =>
+    axios.post(`${API_ROOT}/checkout/${id}/moyasar/verify`, body),
 
   // Smart Dunning Analytics
   getDunningOverview: () => api.get('/analytics/dunning/overview'),

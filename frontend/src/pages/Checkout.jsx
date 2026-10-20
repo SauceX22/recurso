@@ -10,9 +10,37 @@ import {
   useElements,
 } from "@stripe/react-stripe-js";
 
-import { API_ROOT as API_BASE } from "../lib/api";
+import { API_ROOT as API_BASE, endpoints } from "../lib/api";
 import { formatCurrency } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+
+// Moyasar's embedded payment form, pinned (docs/spec_moyasar.md).
+const MOYASAR_FORM_BASE =
+  "https://cdn.jsdelivr.net/npm/moyasar-payment-form@2.3.0/dist";
+const MOYASAR_CSS = `${MOYASAR_FORM_BASE}/moyasar.css`;
+const MOYASAR_JS = `${MOYASAR_FORM_BASE}/moyasar.umd.min.js`;
+
+// Loads the Moyasar form CSS + script once; resolves true when
+// window.Moyasar is available.
+function loadMoyasarAssets() {
+  if (!document.querySelector(`link[href="${MOYASAR_CSS}"]`)) {
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = MOYASAR_CSS;
+    document.head.appendChild(link);
+  }
+  return new Promise((resolve) => {
+    if (window.Moyasar) return resolve(true);
+    let s = document.querySelector(`script[src="${MOYASAR_JS}"]`);
+    if (!s) {
+      s = document.createElement("script");
+      s.src = MOYASAR_JS;
+      document.body.appendChild(s);
+    }
+    s.addEventListener("load", () => resolve(!!window.Moyasar));
+    s.addEventListener("error", () => resolve(false));
+  });
+}
 
 // PaymentForm renders the Stripe Payment Element and confirms the intent. It
 // must live inside <Elements>. On a card success it settles inline; methods
@@ -115,6 +143,7 @@ export default function Checkout() {
   const [publishableKey, setPublishableKey] = useState(null);
   const [gateway, setGateway] = useState(null);
   const [rzpOrder, setRzpOrder] = useState(null); // Razorpay order details
+  const [moyOrder, setMoyOrder] = useState(null); // Moyasar form config
 
   // Load the invoice for display + paid check.
   useEffect(() => {
@@ -149,6 +178,57 @@ export default function Checkout() {
       .catch(() => {});
   }, [id]);
 
+  // Returning from the Moyasar form (or its 3DS redirect): Moyasar appends
+  // ?id=<payment_id>&status=…&message=… to our callback_url. The status param
+  // is never trusted — the server fetches the payment and decides.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const paymentId = params.get("id");
+    if (params.get("gateway") !== "moyasar" || !paymentId) return;
+    endpoints
+      .verifyMoyasarCheckout(id, { payment_id: paymentId })
+      .then((res) => {
+        const s = res.data?.data?.status;
+        if (s === "paid") setStatus("paid");
+        else if (s === "failed") setStatus("failed");
+        else setStatus("processing");
+      })
+      .catch((err) =>
+        setError(
+          err?.response?.data?.error?.message ||
+            "We couldn't confirm your payment. If you were charged, it will be reconciled shortly."
+        )
+      );
+  }, [id]);
+
+  // Mount the Moyasar form once the container is rendered.
+  useEffect(() => {
+    if (gateway !== "moyasar" || !moyOrder) return;
+    let cancelled = false;
+    loadMoyasarAssets().then((ok) => {
+      if (cancelled) return;
+      if (!ok || !window.Moyasar) {
+        setError("Could not load the payment form. Please try again.");
+        return;
+      }
+      window.Moyasar.init({
+        element: ".mysr-form",
+        amount: moyOrder.amount,
+        currency: moyOrder.currency,
+        description: moyOrder.description,
+        publishable_api_key: moyOrder.moyasar_publishable_key,
+        callback_url: `${window.location.origin}/checkout/${id}?gateway=moyasar`,
+        methods: ["creditcard"],
+        supported_networks: ["mada", "visa", "mastercard"],
+        metadata: { invoice_id: moyOrder.metadata?.invoice_id || id },
+        credit_card: { save_card: true },
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [gateway, moyOrder, id]);
+
   // Clear the redirect params and payment session for a fresh attempt.
   const handleRetryPayment = () => {
     window.history.replaceState(null, "", window.location.pathname);
@@ -156,6 +236,7 @@ export default function Checkout() {
     setClientSecret(null);
     setPublishableKey(null);
     setRzpOrder(null);
+    setMoyOrder(null);
     setError(null);
     setStatus("open");
   };
@@ -235,6 +316,8 @@ export default function Checkout() {
       if (data.data.gateway === "razorpay") {
         setRzpOrder(data.data);
         openRazorpay(data.data);
+      } else if (data.data.gateway === "moyasar") {
+        setMoyOrder(data.data);
       }
     } catch (err) {
       setError(err.message);
@@ -399,6 +482,13 @@ export default function Checkout() {
           <p className="text-center text-xs text-subtle">
             A secure Razorpay window opens to complete your payment (UPI, cards,
             netbanking).
+          </p>
+        </div>
+      ) : gateway === "moyasar" && moyOrder ? (
+        <div className="space-y-3">
+          <div className="mysr-form" />
+          <p className="text-center text-xs text-subtle">
+            Your card is saved securely for future renewals.
           </p>
         </div>
       ) : gateway && gateway !== "stripe" ? (
