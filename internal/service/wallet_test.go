@@ -20,6 +20,7 @@ type fakeWalletRepo struct {
 	drains     []int64 // maxAmount requested
 	drainGives int64   // amount the fake "drains"
 	dueList    []domain.Wallet
+	attempted  []uuid.UUID // MarkRechargeAttempted calls
 }
 
 func (f *fakeWalletRepo) Create(ctx context.Context, w *domain.Wallet) error {
@@ -64,6 +65,18 @@ func (f *fakeWalletRepo) Drain(ctx context.Context, tenantID, walletID uuid.UUID
 
 func (f *fakeWalletRepo) ListDueForRecharge(ctx context.Context, limit int) ([]domain.Wallet, error) {
 	return f.dueList, nil
+}
+
+// MarkRechargeAttempted records the call and, like the real row's
+// updated_at, moves the listed wallet's UpdatedAt forward.
+func (f *fakeWalletRepo) MarkRechargeAttempted(ctx context.Context, tenantID, walletID uuid.UUID) error {
+	f.attempted = append(f.attempted, walletID)
+	for i := range f.dueList {
+		if f.dueList[i].ID == walletID {
+			f.dueList[i].UpdatedAt = f.dueList[i].UpdatedAt.Add(time.Second)
+		}
+	}
+	return nil
 }
 
 type fakeWalletLedger struct {

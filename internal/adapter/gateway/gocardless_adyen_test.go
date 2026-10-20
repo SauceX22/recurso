@@ -207,6 +207,21 @@ func TestAdyenChargeSavedMethodAuthorised(t *testing.T) {
 	}
 }
 
+func TestAdyenChargeSavedMethodWalletTopUp(t *testing.T) {
+	srv, cap := gatewayTestServer(t, http.StatusOK, `{"pspReference":"886Z","resultCode":"Authorised"}`)
+	g := testAdyen(srv.URL)
+
+	if _, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{CustomerRef: "cus_1", MethodRef: "spm_9", Amount: 2900, Currency: "USD", WalletID: "w-9", IdempotencyKey: "k"}); err != nil {
+		t.Fatal(err)
+	}
+	if cap.body["reference"] != "wallet-w-9" {
+		t.Fatalf("reference = %v, want wallet-w-9", cap.body["reference"])
+	}
+	if md := cap.body["metadata"].(map[string]any); md["wallet_id"] != "w-9" || len(md) != 1 {
+		t.Fatalf("metadata = %v, want only wallet_id", md)
+	}
+}
+
 func TestAdyenChargeSavedMethodRefused(t *testing.T) {
 	srv, _ := gatewayTestServer(t, http.StatusOK,
 		`{"pspReference":"884Z","resultCode":"Refused","refusalReason":"NOT_ENOUGH_BALANCE"}`)

@@ -189,7 +189,7 @@ func TestMoyasarChargeSavedPaymentMethod(t *testing.T) {
 	if b["currency"] != "SAR" {
 		t.Fatalf("currency = %v, want upper-case SAR", b["currency"])
 	}
-	if b["description"] != "Recurso invoice inv-1" {
+	if b["description"] != "Invoice inv-1" {
 		t.Fatalf("description = %v", b["description"])
 	}
 	if b["callback_url"] != "https://app.recurso.dev/checkout/inv-1" {
@@ -404,6 +404,35 @@ func TestMoyasarChargeAlreadyCreatedOnlyOnBadRequest(t *testing.T) {
 	}
 	if n := len(rec.to(http.MethodGet, "/payments/"+moyasarGivenID("renewal-inv-1"))); n != 0 {
 		t.Fatalf("given_id read-backs = %d, want 0", n)
+	}
+}
+
+// A wallet top-up is not an invoice: it must not carry an invoice_id the
+// webhook would try to settle, nor a checkout callback that leads nowhere.
+func TestMoyasarChargeWalletTopUpIsLabelledAsWallet(t *testing.T) {
+	givenID := moyasarGivenID("wallet-recharge-w-1")
+	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+		"POST /payments": {http.StatusCreated, moyasarPaymentJSON(givenID, "paid", "00", "APPROVED")},
+	})
+	g := testMoyasar(srv.URL)
+
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", WalletID: "wallet-9", IdempotencyKey: "wallet-recharge-w-1"})
+	if err != nil || !res.Success {
+		t.Fatalf("res = %+v, err = %v", res, err)
+	}
+	posts := rec.to(http.MethodPost, "/payments")
+	if len(posts) != 1 || len(rec.all()) != 1 {
+		t.Fatalf("calls = %+v, want one POST and no invoice lookup", rec.all())
+	}
+	b := posts[0].body
+	if md := b["metadata"].(map[string]any); md["wallet_id"] != "wallet-9" || len(md) != 1 {
+		t.Fatalf("metadata = %v, want only wallet_id", md)
+	}
+	if b["description"] != "Wallet top-up wallet-9" {
+		t.Fatalf("description = %v", b["description"])
+	}
+	if b["callback_url"] != "https://app.recurso.dev" {
+		t.Fatalf("callback_url = %v, want the dashboard origin, not an invoice checkout", b["callback_url"])
 	}
 }
 

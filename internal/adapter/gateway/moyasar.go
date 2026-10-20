@@ -237,15 +237,27 @@ func (g *MoyasarGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.
 		}
 	}
 
+	// Moyasar requires a callback_url for token charges; only an invoice has a
+	// checkout page to return to. The webhook binds payments by metadata, so a
+	// wallet top-up must not carry an invoice_id.
+	description := "Invoice " + req.InvoiceID
+	callbackURL := g.checkoutBaseURL + "/checkout/" + req.InvoiceID
+	metadata := map[string]string{"invoice_id": req.InvoiceID}
+	if req.WalletID != "" {
+		description = "Wallet top-up " + req.WalletID
+		callbackURL = g.checkoutBaseURL
+		metadata = map[string]string{"wallet_id": req.WalletID}
+	}
+
 	givenID := moyasarGivenID(req.IdempotencyKey)
 	var out moyasarPayment
 	err := g.do(ctx, http.MethodPost, "/payments", map[string]any{
 		"given_id":     givenID,
 		"amount":       req.Amount,
 		"currency":     strings.ToUpper(req.Currency),
-		"description":  "Recurso invoice " + req.InvoiceID,
-		"callback_url": g.checkoutBaseURL + "/checkout/" + req.InvoiceID,
-		"metadata":     map[string]string{"invoice_id": req.InvoiceID},
+		"description":  description,
+		"callback_url": callbackURL,
+		"metadata":     metadata,
 		"source":       map[string]string{"type": "token", "token": req.MethodRef},
 	}, &out)
 

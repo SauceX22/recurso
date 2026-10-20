@@ -1828,6 +1828,10 @@ func (UnimplementedWalletRepository) ListDueForRecharge(context.Context, int) ([
 	panic("porttest: WalletRepository.ListDueForRecharge is not implemented")
 }
 
+func (UnimplementedWalletRepository) MarkRechargeAttempted(context.Context, uuid.UUID, uuid.UUID) error {
+	panic("porttest: WalletRepository.MarkRechargeAttempted is not implemented")
+}
+
 func (UnimplementedWalletRepository) ListTransactions(context.Context, uuid.UUID, uuid.UUID, int) ([]domain.WalletTransaction, error) {
 	panic("porttest: WalletRepository.ListTransactions is not implemented")
 }

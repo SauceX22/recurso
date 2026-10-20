@@ -129,10 +129,14 @@ func (g *AdyenGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.Sa
 		ResultCode    string `json:"resultCode"`
 		RefusalReason string `json:"refusalReason"`
 	}
+	reference, metadata := req.InvoiceID, map[string]string{"invoice_id": req.InvoiceID}
+	if req.WalletID != "" {
+		reference, metadata = "wallet-"+req.WalletID, map[string]string{"wallet_id": req.WalletID}
+	}
 	err := g.do(ctx, "/payments", map[string]any{
 		"amount":          adyenAmount{Value: req.Amount, Currency: strings.ToUpper(req.Currency)},
 		"merchantAccount": g.merchantAccount,
-		"reference":       req.InvoiceID,
+		"reference":       reference,
 		"paymentMethod": map[string]string{
 			"type":                  "scheme",
 			"storedPaymentMethodId": req.MethodRef,
@@ -140,7 +144,7 @@ func (g *AdyenGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.Sa
 		"shopperReference":         req.CustomerRef,
 		"shopperInteraction":       "ContAuth",
 		"recurringProcessingModel": "UnscheduledCardOnFile",
-		"metadata":                 map[string]string{"invoice_id": req.InvoiceID},
+		"metadata":                 metadata,
 	}, req.IdempotencyKey, &out)
 	if err != nil {
 		return &port.PaymentResult{Success: false, ErrorCode: "gateway_error", ErrorMsg: err.Error()}, err

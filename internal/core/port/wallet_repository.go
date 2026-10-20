@@ -69,6 +69,10 @@ type WalletRepository interface {
 	// ListDueForRecharge returns wallets whose auto-recharge is configured
 	// and whose balance sits below the threshold.
 	ListDueForRecharge(ctx context.Context, limit int) ([]domain.Wallet, error)
+	// MarkRechargeAttempted bumps the wallet's updated_at after a declined
+	// auto-recharge, so the next attempt gets a fresh idempotency key and the
+	// wallet moves to the back of the recharge queue.
+	MarkRechargeAttempted(ctx context.Context, tenantID, walletID uuid.UUID) error
 
 	ListTransactions(ctx context.Context, tenantID, walletID uuid.UUID, limit int) ([]domain.WalletTransaction, error)
 }

@@ -464,6 +464,16 @@ func (r *WalletRepository) ListDueForRecharge(ctx context.Context, limit int) ([
 	return wallets, rows.Err()
 }
 
+func (r *WalletRepository) MarkRechargeAttempted(ctx context.Context, tenantID, walletID uuid.UUID) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE wallets SET updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond') WHERE tenant_id = $1 AND id = $2`,
+		tenantID, walletID)
+	if err != nil {
+		return fmt.Errorf("failed to mark wallet recharge attempted: %w", err)
+	}
+	return nil
+}
+
 func (r *WalletRepository) ListTransactions(ctx context.Context, tenantID, walletID uuid.UUID, limit int) ([]domain.WalletTransaction, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100

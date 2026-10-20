@@ -513,20 +513,28 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 // success, credits the wallet and posts the top-up ledger legs.
 func (s *WalletService) chargeAndCredit(ctx context.Context, w *domain.Wallet, charger SavedCardCharger, m domain.SavedPaymentMethod) bool {
 	amount := *w.AutoRechargeAmount
-	// Key on wallet + current balance so a crashed sweep retried within the
-	// same balance state cannot double-charge, while a later legitimate
-	// recharge (post-drain, different balance) gets a fresh key.
-	idemKey := fmt.Sprintf("wallet-recharge-%s-%d", w.ID, w.Balance)
+	// Key on the wallet's last change: every balance movement, settings change
+	// and confirmed decline advances updated_at, so each legitimate recharge
+	// gets a fresh key, while sweeps (or a crash retry) reading the same row
+	// replay the same charge. Gateway keys can live forever (Moyasar's
+	// given_id does), so the balance alone would repeat.
+	idemKey := fmt.Sprintf("wallet-recharge-%s-%d", w.ID, w.UpdatedAt.UnixMicro())
 	result, err := charger.ChargeSavedPaymentMethod(ctx, port.SavedMethodCharge{
 		CustomerRef:    m.CustomerRef,
 		MethodRef:      m.PaymentMethodRef,
 		Amount:         amount,
 		Currency:       w.Currency,
-		InvoiceID:      w.ID.String(),
+		WalletID:       w.ID.String(),
 		IdempotencyKey: idemKey,
 	})
 	if err != nil || result == nil || !result.Success {
 		logChargeFailure(ctx, "wallet auto-recharge charge failed", result, err, "wallet_id", w.ID, "provider", m.Provider)
+		if err == nil && result != nil {
+			// A confirmed decline: the next attempt is a new charge.
+			if merr := s.wallets.MarkRechargeAttempted(ctx, w.TenantID, w.ID); merr != nil {
+				slog.ErrorContext(ctx, "wallet auto-recharge: failed to record the declined attempt", "wallet_id", w.ID, "error", merr)
+			}
+		}
 		s.notifyRechargeFailure(ctx, w, "payment failed")
 		return false
 	}

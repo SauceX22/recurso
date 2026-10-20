@@ -326,6 +326,12 @@ func (s *StripeGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.S
 	// off-session dunning retry of a foreign-currency invoice fails.
 	description := "Invoice " + req.InvoiceID
 	metadata := map[string]string{"invoice_id": req.InvoiceID, "retry_payment": "true"}
+	if req.WalletID != "" {
+		// No invoice_id: the payment webhook would try to settle an invoice
+		// with the wallet's id.
+		description = "Wallet top-up " + req.WalletID
+		metadata = map[string]string{"wallet_id": req.WalletID}
+	}
 	params := &stripe.PaymentIntentParams{
 		Amount:        stripe.Int64(req.Amount),
 		Currency:      stripe.String(req.Currency),
