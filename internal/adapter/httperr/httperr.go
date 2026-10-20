@@ -34,6 +34,12 @@ const (
 	CodeOverRefund         = "over_refund"
 	CodeInvoiceNotPaid     = "invoice_not_paid"
 	CodeInvoiceAlreadyPaid = "invoice_already_paid"
+
+	// Checkout and portal payment codes the hosted pages map to buyer copy.
+	CodePaymentMismatch       = "payment_mismatch"        // a genuine payment that is not for this invoice
+	CodeGatewayUnavailable    = "gateway_unavailable"     // the payment gateway could not be reached
+	CodeCheckoutUnavailable   = "checkout_unavailable"    // this deployment cannot take the payment
+	CodeCardUpdateUnsupported = "card_update_unsupported" // the customer's gateway has no self-serve card update
 )
 
 // APIError is the inner object of the canonical error envelope.

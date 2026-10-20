@@ -1,0 +1,222 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/recurso-dev/recurso/internal/core/domain"
+	"github.com/recurso-dev/recurso/internal/core/port"
+)
+
+// Binding failures: the fetched payment is genuine but must not settle this
+// invoice.
+var (
+	ErrPaymentWrongInvoice  = errors.New("payment does not belong to this invoice")
+	ErrPaymentWrongCurrency = errors.New("payment currency does not match invoice")
+	ErrPaymentShortAmount   = errors.New("payment amount is less than the amount due")
+)
+
+// BindPaymentToInvoice checks that a payment read back from the gateway was
+// made for inv: its metadata names the invoice, the currency matches, and the
+// amount (net of refunds) covers the balance due. inv must come from the
+// invoice repository, which derives AmountDue on every load.
+func BindPaymentToInvoice(p *port.GatewayPayment, inv *domain.Invoice) error {
+	if p.InvoiceID != inv.ID.String() {
+		return ErrPaymentWrongInvoice
+	}
+	if !strings.EqualFold(p.Currency, inv.Currency) {
+		return ErrPaymentWrongCurrency
+	}
+	if p.Amount-p.RefundedAmount < inv.AmountDue {
+		return ErrPaymentShortAmount
+	}
+	return nil
+}
+
+type paidInvoiceMarker interface {
+	MarkInvoicePaid(ctx context.Context, invoiceID uuid.UUID) (bool, error)
+}
+
+// gatewayPaymentClaimer records the payment that settled an invoice unless a
+// different one is already recorded. Satisfied by *db.InvoiceRepository.
+type gatewayPaymentClaimer interface {
+	ClaimGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (bool, error)
+}
+
+type settlementSubscriptionReader interface {
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.Subscription, error)
+}
+
+// gatewayMethodSaver stores a reusable gateway card as the customer's
+// off-session method. Satisfied by *db.CustomerRepository.
+type gatewayMethodSaver interface {
+	SetGatewayPaymentMethod(ctx context.Context, tenantID, customerID uuid.UUID, provider domain.GatewayProvider, ref, brand, last4 string, expMonth, expYear int) error
+}
+
+// cardTokenReader reads a saved card's expiry from the gateway, which the
+// payment read-back does not carry.
+type cardTokenReader interface {
+	FetchToken(ctx context.Context, tokenID string) (expMonth, expYear int, err error)
+}
+
+type dunningRecoveryMarker interface {
+	MarkRecovered(ctx context.Context, invoiceID uuid.UUID) error
+}
+
+type dunningOutcomeRecorder interface {
+	RecordOutcome(ctx context.Context, history domain.DunningHistory) error
+}
+
+// GatewaySettlementService settles an invoice from a server-side read-back of
+// a gateway payment. The checkout return and the gateway webhook both call it,
+// so the order of effects and the duplicate-payment rules are the same no
+// matter which arrives first.
+type GatewaySettlementService struct {
+	provider  domain.GatewayProvider
+	settler   paidInvoiceMarker
+	payments  gatewayPaymentClaimer
+	subs      settlementSubscriptionReader
+	cards     gatewayMethodSaver
+	tokens    cardTokenReader
+	campaigns dunningRecoveryMarker
+	outcomes  dunningOutcomeRecorder
+	logger    *slog.Logger
+}
+
+// NewGatewaySettlementService builds the settlement path for one gateway.
+// provider is recorded on any card the payments save.
+func NewGatewaySettlementService(provider domain.GatewayProvider, settler paidInvoiceMarker, payments gatewayPaymentClaimer, subs settlementSubscriptionReader) *GatewaySettlementService {
+	return &GatewaySettlementService{
+		provider: provider,
+		settler:  settler,
+		payments: payments,
+		subs:     subs,
+		logger:   slog.Default().With("component", "gateway_settlement", "provider", string(provider)),
+	}
+}
+
+// SetCardSaving wires saving the card a payment tokenized. tokens may be nil;
+// the card is then saved without an expiry.
+func (s *GatewaySettlementService) SetCardSaving(cards gatewayMethodSaver, tokens cardTokenReader) {
+	s.cards = cards
+	s.tokens = tokens
+}
+
+// SetDunningRecovery wires the once-per-settlement dunning outcome: the
+// campaign is closed as recovered and the retry bandit is rewarded.
+func (s *GatewaySettlementService) SetDunningRecovery(campaigns dunningRecoveryMarker, outcomes dunningOutcomeRecorder) {
+	s.campaigns = campaigns
+	s.outcomes = outcomes
+}
+
+// SavesCard reports whether paying inv may store the card for off-session
+// charges: only an invoice of a subscription that will renew again has
+// consented future charges. One-off invoices never save.
+func (s *GatewaySettlementService) SavesCard(ctx context.Context, inv *domain.Invoice) bool {
+	if s == nil || s.cards == nil || s.subs == nil || inv.SubscriptionID == nil {
+		return false
+	}
+	sub, err := s.subs.GetByID(context.WithValue(ctx, domain.TenantIDKey, inv.TenantID), *inv.SubscriptionID)
+	if err != nil || sub == nil {
+		return false
+	}
+	return sub.Status != domain.SubscriptionStatusCanceled && !sub.CancelAtPeriodEnd
+}
+
+// Settle marks inv paid by p. The caller has already confirmed with the
+// gateway that p is captured. It returns whether this call performed the paid
+// transition; an error means the invoice was not settled.
+func (s *GatewaySettlementService) Settle(ctx context.Context, inv *domain.Invoice, p *port.GatewayPayment) (bool, error) {
+	if err := BindPaymentToInvoice(p, inv); err != nil {
+		return false, err
+	}
+	tenantCtx := context.WithValue(ctx, domain.TenantIDKey, inv.TenantID)
+	transitioned, err := s.settler.MarkInvoicePaid(tenantCtx, inv.ID)
+	if err != nil {
+		return false, err
+	}
+	log := s.logger.With("invoice_id", inv.ID, "payment_id", p.ID)
+	log.InfoContext(ctx, "invoice settled from gateway payment", "transitioned", transitioned)
+
+	if excess := p.Amount - p.RefundedAmount - inv.AmountDue; transitioned && excess > 0 {
+		log.WarnContext(ctx, "payment exceeds the amount due; the excess is not booked — review for refund",
+			"excess", excess, "currency", inv.Currency)
+	}
+
+	// The invoice's recorded payment is its refund target. A second payment
+	// for an invoice another payment already settled is a duplicate charge.
+	owns := transitioned
+	if s.payments != nil {
+		claimed, err := s.payments.ClaimGatewayPaymentID(ctx, inv.TenantID, inv.ID, p.ID)
+		if err != nil {
+			log.ErrorContext(ctx, "failed to record gateway payment id", "error", err)
+		} else {
+			owns = claimed
+		}
+	}
+	if !owns {
+		log.WarnContext(ctx, "invoice already settled by another payment — duplicate charge, review for refund",
+			"amount", p.Amount, "currency", p.Currency)
+	} else {
+		s.saveCard(ctx, tenantCtx, inv, p)
+	}
+
+	if transitioned {
+		s.recordDunningRecovery(tenantCtx, inv)
+	}
+	return transitioned, nil
+}
+
+func (s *GatewaySettlementService) saveCard(ctx, tenantCtx context.Context, inv *domain.Invoice, p *port.GatewayPayment) {
+	if !s.SavesCard(ctx, inv) {
+		return
+	}
+	log := s.logger.With("invoice_id", inv.ID, "payment_id", p.ID)
+	if p.CardToken == "" {
+		// Renewals of this subscription cannot charge off-session; usually the
+		// gateway account has card tokenization disabled.
+		log.WarnContext(ctx, "paid payment carries no reusable card token; renewals will not auto-charge")
+		return
+	}
+	var expMonth, expYear int
+	if s.tokens != nil {
+		m, y, err := s.tokens.FetchToken(ctx, p.CardToken)
+		if err != nil {
+			log.WarnContext(ctx, "could not read card expiry; saving the card without it", "error", err)
+		} else {
+			expMonth, expYear = m, y
+		}
+	}
+	if err := s.cards.SetGatewayPaymentMethod(tenantCtx, inv.TenantID, inv.CustomerID, s.provider, p.CardToken, p.CardBrand, p.CardLast4, expMonth, expYear); err != nil {
+		log.ErrorContext(ctx, "failed to save card for off-session charges", "error", err)
+	}
+}
+
+func (s *GatewaySettlementService) recordDunningRecovery(ctx context.Context, inv *domain.Invoice) {
+	if s.campaigns != nil {
+		if err := s.campaigns.MarkRecovered(ctx, inv.ID); err != nil {
+			s.logger.ErrorContext(ctx, "failed to mark dunning campaign recovered", "invoice_id", inv.ID, "error", err)
+		}
+	}
+	if s.outcomes == nil || inv.DunningActionID == "" || inv.DunningContextKey == "" {
+		return
+	}
+	err := s.outcomes.RecordOutcome(ctx, domain.DunningHistory{
+		ID:            uuid.New(),
+		TenantID:      inv.TenantID,
+		InvoiceID:     inv.ID,
+		ContextKey:    inv.DunningContextKey,
+		ActionID:      inv.DunningActionID,
+		RetryInterval: int64(actionByID(inv.DunningActionID).Interval.Seconds()),
+		Outcome:       "success",
+		Reward:        1.0,
+		CreatedAt:     time.Now(),
+	})
+	if err != nil {
+		s.logger.ErrorContext(ctx, "failed to record dunning success outcome", "invoice_id", inv.ID, "error", err)
+	}
+}

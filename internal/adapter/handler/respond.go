@@ -31,6 +31,11 @@ const (
 	codeInternalError      = httperr.CodeInternalError
 	codeRateLimited        = httperr.CodeRateLimited
 	codeInvoiceAlreadyPaid = httperr.CodeInvoiceAlreadyPaid
+
+	codePaymentMismatch       = httperr.CodePaymentMismatch
+	codeGatewayUnavailable    = httperr.CodeGatewayUnavailable
+	codeCheckoutUnavailable   = httperr.CodeCheckoutUnavailable
+	codeCardUpdateUnsupported = httperr.CodeCardUpdateUnsupported
 )
 
 // respondError writes the canonical error envelope.

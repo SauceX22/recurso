@@ -3906,8 +3906,11 @@ paths:
         invoice. The response tells the frontend which flow to drive: `stripe`
         returns a PaymentIntent `client_secret` + `publishable_key` for the
         Payment Element; `razorpay` returns the order id + `razorpay_key_id`
-        for the Checkout.js modal. Settlement is always verified server-side —
-        see `/checkout/{id}/success` and `/checkout/{id}/razorpay/verify`.
+        for the Checkout.js modal; `moyasar` returns the embedded-form config
+        (`moyasar_publishable_key`, `amount` = the amount due, `description`,
+        `metadata`, `save_card`). Settlement is always verified server-side —
+        see `/checkout/{id}/success`, `/checkout/{id}/razorpay/verify` and
+        `/checkout/{id}/moyasar/verify`.
       security: []
       parameters:
         - $ref: '#/components/parameters/PathID'
@@ -3938,7 +3941,7 @@ paths:
                         type: string
                       gateway:
                         type: string
-                        enum: [stripe, razorpay, mock, other]
+                        enum: [stripe, razorpay, moyasar, mock, other]
                         description: Which client-side flow to use.
                       client_secret:
                         type: string
@@ -3949,12 +3952,32 @@ paths:
                       razorpay_key_id:
                         type: string
                         description: Razorpay public key id for Checkout.js.
+                      moyasar_publishable_key:
+                        type: string
+                        description: Moyasar publishable key for the embedded form (`moyasar` only).
+                      description:
+                        type: string
+                        description: Payment description for the embedded form (`moyasar` only).
+                      metadata:
+                        type: object
+                        description: Metadata the embedded form must attach to the payment (`moyasar` only).
+                        properties:
+                          invoice_id:
+                            type: string
+                            format: uuid
+                      save_card:
+                        type: boolean
+                        description: >
+                          `moyasar` only. True when the invoice belongs to a subscription
+                          that renews, so paying stores the card for future renewals. The
+                          page must show that disclosure before payment and pass this
+                          value to the form; false (one-off invoices) never saves.
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '503':
-          description: Checkout is not fully configured (e.g. the gateway's browser-side key is missing).
+          description: Checkout is not fully configured (e.g. the gateway's browser-side key is missing). `checkout_unavailable` for Moyasar.
           content:
             application/json:
               schema:
@@ -4078,10 +4101,11 @@ paths:
         the page (`?id=<payment_id>&status=...`). The server re-fetches the
         payment from Moyasar with the secret key and settles only when it is
         `paid` and bound to this invoice (metadata `invoice_id`, currency, and
-        an amount covering the balance due), then records the gateway payment
-        id and saves the card token. The browser alone can never mark an
-        invoice paid; the `payment_paid` webhook remains the authoritative
-        backstop.
+        an amount net of refunds covering the balance due), through the same
+        settlement path as the `payment_paid` webhook: the payment id is
+        recorded unless another payment already settled the invoice, and the
+        card is saved only for an invoice of a renewing subscription. The
+        browser alone can never mark an invoice paid.
       security: []
       parameters:
         - $ref: '#/components/parameters/PathID'
@@ -4098,7 +4122,11 @@ paths:
                   description: Moyasar payment id from the form's return URL.
       responses:
         '200':
-          description: Invoice settled (idempotent — already-paid invoices report paid).
+          description: >
+            Verification result. `paid` means the invoice is settled (idempotent —
+            already-paid invoices report paid). `failed` is a decline the buyer can
+            retry; `processing` means the payment is not complete yet (e.g. 3DS
+            pending, `payment_status: initiated`).
           content:
             application/json:
               schema:
@@ -4109,18 +4137,40 @@ paths:
                     properties:
                       status:
                         type: string
-                        const: paid
+                        enum: [paid, processing, failed]
+                      payment_status:
+                        type: string
+                        description: Moyasar's payment status; present when status is not `paid`.
                       invoice_id:
                         type: string
                         format: uuid
                       invoice_number:
                         type: string
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: >
+            `validation_failed` for a malformed invoice id or a missing `payment_id`;
+            `payment_mismatch` when the payment is not for this invoice (another
+            invoice, currency, or less than the amount due).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          description: The payment was confirmed but settlement failed (`internal_error`); the webhook retries it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: The payment could not be fetched from Moyasar (`gateway_unavailable`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
-          description: Moyasar checkout isn't available on this deployment.
+          description: Moyasar checkout isn't available on this deployment (`checkout_unavailable`).
           content:
             application/json:
               schema:
@@ -4405,9 +4455,12 @@ paths:
         constant time against `MOYASAR_WEBHOOK_SECRET` (503 when unset, 401 on
         mismatch). The body is never trusted for settlement: `payment_paid`
         re-fetches the payment from Moyasar and settles the invoice only when
-        that read-back is `paid` and bound to the invoice. `payment_failed`
-        and `payment_refunded` are acknowledged; other events are ignored.
-        Deliveries are deduplicated on the event `id`.
+        that read-back is `paid` and bound to the invoice; while it still reads
+        `initiated` the delivery gets 503 so Moyasar redelivers it.
+        `payment_failed` is acknowledged; `payment_refunded` and
+        `payment_voided` are acknowledged and flagged for reconciliation when
+        the invoice is settled; other events are ignored. Deliveries are
+        deduplicated on the event `id`.
         Called by Moyasar, not by API consumers.
       security: []
       requestBody:
@@ -4456,8 +4509,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '500':
+          description: The invoice could not be loaded or settled; the delivery is retried.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
-          description: Webhook secret not configured, or the dedup store is unavailable; the delivery is retried.
+          description: Webhook not configured, the dedup store is unavailable, or the payment still reads `initiated`; the delivery is retried.
           content:
             application/json:
               schema:
@@ -4694,11 +4753,26 @@ paths:
         - portalSession: []
       responses:
         '200':
-          description: The customer profile.
+          description: The customer profile, plus how the portal may update the customer's card.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Customer'
+                allOf:
+                  - $ref: '#/components/schemas/Customer'
+                  - type: object
+                    properties:
+                      payment_method_provider:
+                        type: string
+                        description: >
+                          Gateway governing the customer's card: the saved method's
+                          gateway, or the one the billing currency routes to.
+                        examples: [stripe, moyasar]
+                      card_update_supported:
+                        type: boolean
+                        description: >
+                          False when the portal's card-update flow would move the
+                          customer's renewals off their gateway; the card is then
+                          replaced by paying an open invoice on the hosted checkout.
         '401':
           $ref: '#/components/responses/Unauthorized'
 
@@ -4901,6 +4975,12 @@ paths:
                         type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: The customer's card can't be replaced here (`card_update_unsupported`); pay an open invoice on the hosted checkout instead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           description: Self-serve card update isn't available on this deployment.
           content:
@@ -4939,6 +5019,12 @@ paths:
                         type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: The customer's card can't be replaced here (`card_update_unsupported`); pay an open invoice on the hosted checkout instead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           description: Bank (ACH) payments aren't available on this deployment.
           content:
@@ -4998,6 +5084,12 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: The customer's card can't be replaced here (`card_update_unsupported`); pay an open invoice on the hosted checkout instead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           description: Self-serve card update isn't available on this deployment.
           content:
@@ -11123,7 +11215,7 @@ components:
             code:
               type: string
               description: Stable machine-readable error code.
-              examples: [validation_failed, unauthorized, forbidden, not_found, conflict, rate_limited, internal_error, invalid_api_key, key_mode_mismatch, over_refund, invoice_not_paid, invoice_already_paid]
+              examples: [validation_failed, unauthorized, forbidden, not_found, conflict, rate_limited, internal_error, invalid_api_key, key_mode_mismatch, over_refund, invoice_not_paid, invoice_already_paid, payment_mismatch, gateway_unavailable, checkout_unavailable, card_update_unsupported]
             message:
               type: string
               description: Human-readable explanation.
@@ -12163,6 +12255,21 @@ components:
         display_amount:
           type: string
           description: Human-readable major-unit amount (e.g. "118.00").
+        amount_paid:
+          type: integer
+          format: int64
+          description: Already paid toward the invoice (e.g. a prepaid wallet drain).
+        credit_applied:
+          type: integer
+          format: int64
+          description: Account credit applied to the invoice.
+        amount_due:
+          type: integer
+          format: int64
+          description: What the buyer still owes, `total - amount_paid - credit_applied`. Pay buttons show this.
+        display_amount_due:
+          type: string
+          description: Human-readable major-unit `amount_due`.
         due_date:
           type: string
           format: date

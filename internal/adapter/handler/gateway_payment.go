@@ -1,0 +1,22 @@
+package handler
+
+import (
+	"context"
+
+	"github.com/recurso-dev/recurso/internal/core/domain"
+	"github.com/recurso-dev/recurso/internal/core/port"
+)
+
+// paymentReader reads a gateway payment back with the secret key; checkout
+// returns and webhooks settle only on this read, never on what the browser or
+// the webhook body claims. Satisfied by *gateway.MoyasarGateway.
+type paymentReader interface {
+	FetchPayment(ctx context.Context, paymentID string) (*port.GatewayPayment, error)
+}
+
+// paymentSettler is the one settlement path shared by checkout verify and the
+// webhook. Satisfied by *service.GatewaySettlementService.
+type paymentSettler interface {
+	Settle(ctx context.Context, inv *domain.Invoice, p *port.GatewayPayment) (bool, error)
+	SavesCard(ctx context.Context, inv *domain.Invoice) bool
+}

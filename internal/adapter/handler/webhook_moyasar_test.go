@@ -2,138 +2,40 @@ package handler
 
 import (
 	"bytes"
-	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/recurso-dev/recurso/internal/core/domain"
-	"github.com/recurso-dev/recurso/internal/core/port"
-	"github.com/recurso-dev/recurso/internal/core/port/porttest"
 	"github.com/recurso-dev/recurso/internal/service"
 )
 
 const moyasarTestSecret = "mysr_whsec_test"
 
-// fakeMoyasarFetcher returns a canned payment read-back (or error) and counts
-// calls, so tests can prove the body is never trusted.
-type fakeMoyasarFetcher struct {
-	payment *port.GatewayPayment
-	err     error
-	calls   int
+type moyasarWebhookFixture struct {
+	*moyasarSettlementFixture
+	h     *WebhookHandler
+	dedup *mapDedup
+	logs  *bytes.Buffer
 }
 
-func (f *fakeMoyasarFetcher) FetchPayment(_ context.Context, id string) (*port.GatewayPayment, error) {
-	f.calls++
-	if f.err != nil {
-		return nil, f.err
-	}
-	if f.payment == nil || f.payment.ID != id {
-		return nil, fmt.Errorf("payment %s not found", id)
-	}
-	cp := *f.payment
-	return &cp, nil
-}
-
-type savedCard struct {
-	tenantID, customerID           uuid.UUID
-	provider, ref, brand, lastFour string
-}
-
-type fakeCardSaver struct{ saved []savedCard }
-
-func (f *fakeCardSaver) SetGatewayPaymentMethod(_ context.Context, tenantID, customerID uuid.UUID, provider domain.GatewayProvider, ref, brand, last4 string, _, _ int) error {
-	f.saved = append(f.saved, savedCard{tenantID, customerID, string(provider), ref, brand, last4})
-	return nil
-}
-
-// moyasarInvoiceRepo serves the unscoped webhook lookup plus the reads and
-// writes MarkInvoicePaid makes, recording the tenant each settlement ran under.
-type moyasarInvoiceRepo struct {
-	porttest.UnimplementedInvoiceRepository
-	inv            *domain.Invoice
-	markPaidCalls  int
-	markPaidTenant uuid.UUID
-	getByIDTenant  any
-	setPaymentIDs  []string
-}
-
-func (r *moyasarInvoiceRepo) GetByIDPublic(_ context.Context, id uuid.UUID) (*domain.Invoice, error) {
-	if r.inv != nil && r.inv.ID == id {
-		cp := *r.inv
-		return &cp, nil
-	}
-	return nil, nil
-}
-
-func (r *moyasarInvoiceRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.Invoice, error) {
-	r.getByIDTenant = ctx.Value(domain.TenantIDKey)
-	return r.GetByIDPublic(ctx, id)
-}
-
-func (r *moyasarInvoiceRepo) MarkPaid(_ context.Context, tenantID, _ uuid.UUID, paidAt time.Time) (bool, error) {
-	r.markPaidCalls++
-	r.markPaidTenant = tenantID
-	if r.inv.Status == domain.InvoiceStatusPaid {
-		return false, nil
-	}
-	r.inv.Status = domain.InvoiceStatusPaid
-	r.inv.PaidAt = &paidAt
-	r.inv.AmountPaid = r.inv.Total
-	return true, nil
-}
-
-func (r *moyasarInvoiceRepo) SetGatewayPaymentID(_ context.Context, _, _ uuid.UUID, id string) error {
-	r.setPaymentIDs = append(r.setPaymentIDs, id)
-	r.inv.GatewayPaymentID = id
-	return nil
-}
-
-type moyasarFixture struct {
-	h       *WebhookHandler
-	repo    *moyasarInvoiceRepo
-	fetcher *fakeMoyasarFetcher
-	cards   *fakeCardSaver
-	dedup   *mapDedup
-	inv     *domain.Invoice
-	payment *port.GatewayPayment
-}
-
-// newMoyasarFixture wires a handler whose fetcher returns a paid payment bound
-// to an open 100.00 SAR invoice.
-func newMoyasarFixture(t *testing.T) *moyasarFixture {
+func newMoyasarFixture(t *testing.T) *moyasarWebhookFixture {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	inv := &domain.Invoice{
-		ID: uuid.New(), TenantID: uuid.New(), CustomerID: uuid.New(),
-		Status: domain.InvoiceStatusOpen, Total: 10000, Currency: "SAR",
-	}
-	payment := &port.GatewayPayment{
-		ID: uuid.NewString(), Status: "paid", Amount: 10000, Currency: "SAR",
-		InvoiceID: inv.ID.String(), CardToken: "token_abc", CardBrand: "mada", CardLast4: "1010",
-	}
-	repo := &moyasarInvoiceRepo{inv: inv}
-	f := &moyasarFixture{
-		repo:    repo,
-		fetcher: &fakeMoyasarFetcher{payment: payment},
-		cards:   &fakeCardSaver{},
-		dedup:   &mapDedup{},
-		inv:     inv,
-		payment: payment,
-	}
+	f := &moyasarWebhookFixture{moyasarSettlementFixture: newMoyasarSettlementFixture(), dedup: &mapDedup{}, logs: &bytes.Buffer{}}
 	f.h = &WebhookHandler{
-		logger:       slog.Default(),
-		invoiceRepo:  repo,
+		logger:       slog.New(slog.NewTextHandler(f.logs, nil)),
+		invoiceRepo:  f.invoices,
 		inboundDedup: f.dedup,
-		subService:   service.NewSubscriptionService(nil, repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil),
 	}
-	f.h.SetMoyasar(f.fetcher, f.cards, moyasarTestSecret)
+	f.h.SetMoyasar(f.reader, f.settler, moyasarTestSecret)
 	return f
 }
 
@@ -143,39 +45,67 @@ func moyasarBody(eventID, typ, secret, paymentID string) []byte {
 		eventID, typ, secret, paymentID)
 }
 
-func postMoyasar(h *WebhookHandler, body []byte) *httptest.ResponseRecorder {
+func (f *moyasarWebhookFixture) post(body []byte) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest(http.MethodPost, "/webhooks/moyasar", bytes.NewReader(body))
-	h.HandleMoyasar(c)
+	f.h.HandleMoyasar(c)
 	return w
 }
 
-func TestMoyasarWebhook_NoSecretFailsClosed(t *testing.T) {
-	f := newMoyasarFixture(t)
-	f.h.SetMoyasar(f.fetcher, f.cards, "")
-	w := postMoyasar(f.h, moyasarBody("ev1", "payment_paid", "", f.payment.ID))
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("no secret: got %d want 503", w.Code)
+func (f *moyasarWebhookFixture) deliver(eventID, typ string) *httptest.ResponseRecorder {
+	return f.post(moyasarBody(eventID, typ, moyasarTestSecret, f.payment.ID))
+}
+
+func ackReason(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	var out struct{ Status, Reason string }
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode ack %q: %v", w.Body.String(), err)
 	}
-	if f.fetcher.calls != 0 || f.repo.markPaidCalls != 0 {
-		t.Fatalf("unconfigured webhook must not fetch or settle")
+	return out.Reason
+}
+
+func errorCode(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	var out struct {
+		Error struct{ Code string } `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode error %q: %v", w.Body.String(), err)
+	}
+	return out.Error.Code
+}
+
+func TestMoyasarWebhook_UnconfiguredFailsClosed(t *testing.T) {
+	cases := map[string]func(f *moyasarWebhookFixture){
+		"no secret":     func(f *moyasarWebhookFixture) { f.h.SetMoyasar(f.reader, f.settler, "") },
+		"no read-back":  func(f *moyasarWebhookFixture) { f.h.SetMoyasar(nil, f.settler, moyasarTestSecret) },
+		"no settlement": func(f *moyasarWebhookFixture) { f.h.SetMoyasar(f.reader, nil, moyasarTestSecret) },
+	}
+	for name, unset := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newMoyasarFixture(t)
+			unset(f)
+			if w := f.deliver("ev1", "payment_paid"); w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("got %d want 503", w.Code)
+			}
+			if len(f.reader.gotIDs) != 0 || f.invoices.markPaidCalls != 0 || f.dedup.marks != 0 {
+				t.Fatal("unconfigured webhook fetched, settled or was recorded")
+			}
+		})
 	}
 }
 
 func TestMoyasarWebhook_WrongSecretRejected(t *testing.T) {
-	for name, secret := range map[string]string{"wrong": "not-the-secret", "missing": ""} {
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct{ name, secret string }{{"wrong", "not-the-secret"}, {"missing", ""}} {
+		t.Run(tc.name, func(t *testing.T) {
 			f := newMoyasarFixture(t)
-			w := postMoyasar(f.h, moyasarBody("ev1", "payment_paid", secret, f.payment.ID))
-			if w.Code != http.StatusUnauthorized {
+			if w := f.post(moyasarBody("ev1", "payment_paid", tc.secret, f.payment.ID)); w.Code != http.StatusUnauthorized {
 				t.Fatalf("got %d want 401", w.Code)
 			}
-			if f.fetcher.calls != 0 {
-				t.Fatalf("fetcher called %d times on a rejected webhook", f.fetcher.calls)
-			}
-			if f.dedup.marks != 0 || f.repo.markPaidCalls != 0 {
-				t.Fatalf("rejected webhook must not be recorded or settle")
+			if len(f.reader.gotIDs) != 0 || f.dedup.marks != 0 || f.invoices.markPaidCalls != 0 {
+				t.Fatal("rejected webhook fetched, was recorded or settled")
 			}
 		})
 	}
@@ -183,172 +113,264 @@ func TestMoyasarWebhook_WrongSecretRejected(t *testing.T) {
 
 func TestMoyasarWebhook_InvalidJSON(t *testing.T) {
 	f := newMoyasarFixture(t)
-	if got := postMoyasar(f.h, []byte(`{not json`)).Code; got != http.StatusBadRequest {
+	if got := f.post([]byte(`{not json`)).Code; got != http.StatusBadRequest {
 		t.Fatalf("bad JSON: got %d want 400", got)
+	}
+}
+
+func TestMoyasarWebhook_OversizedBodyRejected(t *testing.T) {
+	f := newMoyasarFixture(t)
+	body := moyasarBody("ev_big", "payment_paid", moyasarTestSecret, f.payment.ID)
+	body = append(body[:len(body)-1], []byte(`,"pad":"`+strings.Repeat("x", maxMoyasarWebhookBytes)+`"}`)...)
+	if w := f.post(body); w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("got %d want 413", w.Code)
+	}
+	if len(f.reader.gotIDs) != 0 {
+		t.Fatal("oversized body was processed")
 	}
 }
 
 func TestMoyasarWebhook_PaymentPaidSettles(t *testing.T) {
 	f := newMoyasarFixture(t)
-	w := postMoyasar(f.h, moyasarBody("ev_paid", "payment_paid", moyasarTestSecret, f.payment.ID))
+	w := f.deliver("ev_paid", "payment_paid")
 	if w.Code != http.StatusOK {
 		t.Fatalf("payment_paid: got %d want 200 (body %s)", w.Code, w.Body.String())
 	}
-	if f.fetcher.calls != 1 {
-		t.Fatalf("fetch calls = %d, want 1", f.fetcher.calls)
+	if len(f.reader.gotIDs) != 1 || f.reader.gotIDs[0] != f.payment.ID {
+		t.Fatalf("fetched %v, want [%s]", f.reader.gotIDs, f.payment.ID)
 	}
-	if f.repo.markPaidCalls != 1 {
-		t.Fatalf("MarkPaid calls = %d, want 1", f.repo.markPaidCalls)
+	if f.invoices.markPaidCalls != 1 || f.invoices.markPaidTenant != f.inv.TenantID {
+		t.Fatalf("MarkPaid calls=%d tenant=%s, want 1 under %s", f.invoices.markPaidCalls, f.invoices.markPaidTenant, f.inv.TenantID)
 	}
-	if f.repo.markPaidTenant != f.inv.TenantID {
-		t.Fatalf("MarkPaid tenant = %s, want invoice tenant %s", f.repo.markPaidTenant, f.inv.TenantID)
+	if f.invoices.getByIDTenant != f.inv.TenantID {
+		t.Fatalf("MarkInvoicePaid ran under tenant %v, want %s", f.invoices.getByIDTenant, f.inv.TenantID)
 	}
-	if got, ok := f.repo.getByIDTenant.(uuid.UUID); !ok || got != f.inv.TenantID {
-		t.Fatalf("MarkInvoicePaid ran without the invoice's tenant in ctx: %v", f.repo.getByIDTenant)
+	if f.inv.Status != domain.InvoiceStatusPaid || f.inv.GatewayPaymentID != f.payment.ID || f.invoices.claimTenant != f.inv.TenantID {
+		t.Fatalf("invoice status=%s payment=%q claim tenant=%s", f.inv.Status, f.inv.GatewayPaymentID, f.invoices.claimTenant)
 	}
-	if f.inv.Status != domain.InvoiceStatusPaid {
-		t.Fatalf("invoice status = %s, want paid", f.inv.Status)
+	if len(f.cards.saved) != 1 || f.cards.saved[0] != f.wantSavedCard() {
+		t.Fatalf("saved cards = %+v, want [%+v]", f.cards.saved, f.wantSavedCard())
 	}
-	if len(f.repo.setPaymentIDs) != 1 || f.repo.setPaymentIDs[0] != f.payment.ID {
-		t.Fatalf("gateway payment ids recorded = %v, want [%s]", f.repo.setPaymentIDs, f.payment.ID)
-	}
-	want := savedCard{f.inv.TenantID, f.inv.CustomerID, string(domain.GatewayMoyasar), "token_abc", "mada", "1010"}
-	if len(f.cards.saved) != 1 || f.cards.saved[0] != want {
-		t.Fatalf("saved cards = %+v, want [%+v]", f.cards.saved, want)
+	if len(f.dunning.recovered) != 1 || f.dunning.recovered[0] != f.inv.ID || len(f.dunning.outcomes) != 1 || f.dunning.outcomes[0].Outcome != "success" {
+		t.Fatalf("dunning recovery = %v / %+v, want one success for %s", f.dunning.recovered, f.dunning.outcomes, f.inv.ID)
 	}
 	if f.dedup.marks != 1 {
 		t.Fatalf("dedup marks = %d, want 1", f.dedup.marks)
+	}
+}
+
+func TestMoyasarWebhook_LowerCaseCurrencySettles(t *testing.T) {
+	f := newMoyasarFixture(t)
+	f.payment.Currency = "sar"
+	if w := f.deliver("ev_lc", "payment_paid"); w.Code != http.StatusOK || f.inv.Status != domain.InvoiceStatusPaid {
+		t.Fatalf("got %d status %s, want settled", w.Code, f.inv.Status)
 	}
 }
 
 func TestMoyasarWebhook_DuplicateDeliverySettlesOnce(t *testing.T) {
 	f := newMoyasarFixture(t)
-	body := moyasarBody("ev_dup", "payment_paid", moyasarTestSecret, f.payment.ID)
 	for i := range 2 {
-		if w := postMoyasar(f.h, body); w.Code != http.StatusOK {
+		if w := f.deliver("ev_dup", "payment_paid"); w.Code != http.StatusOK {
 			t.Fatalf("delivery %d: got %d want 200", i+1, w.Code)
 		}
 	}
-	if f.fetcher.calls != 1 || f.repo.markPaidCalls != 1 {
-		t.Fatalf("duplicate reprocessed: fetch=%d markPaid=%d, want 1/1", f.fetcher.calls, f.repo.markPaidCalls)
-	}
-	if len(f.repo.setPaymentIDs) != 1 || len(f.cards.saved) != 1 {
-		t.Fatalf("duplicate re-recorded: payment ids=%v cards=%d", f.repo.setPaymentIDs, len(f.cards.saved))
+	if len(f.reader.gotIDs) != 1 || f.invoices.markPaidCalls != 1 || len(f.cards.saved) != 1 {
+		t.Fatalf("duplicate reprocessed: fetch=%d markPaid=%d cards=%d", len(f.reader.gotIDs), f.invoices.markPaidCalls, len(f.cards.saved))
 	}
 }
 
+// A redelivery under a new event id runs again but must not count the
+// recovery twice or move the recorded payment.
 func TestMoyasarWebhook_RedeliveryNewEventIDIsIdempotent(t *testing.T) {
 	f := newMoyasarFixture(t)
-	postMoyasar(f.h, moyasarBody("ev_a", "payment_paid", moyasarTestSecret, f.payment.ID))
-	if w := postMoyasar(f.h, moyasarBody("ev_b", "payment_paid", moyasarTestSecret, f.payment.ID)); w.Code != http.StatusOK {
+	f.deliver("ev_a", "payment_paid")
+	if w := f.deliver("ev_b", "payment_paid"); w.Code != http.StatusOK {
 		t.Fatalf("second event: got %d want 200 (body %s)", w.Code, w.Body.String())
 	}
-	// The paid guard stops a second transition; the already-recorded payment
-	// id is not rewritten.
-	if f.inv.Status != domain.InvoiceStatusPaid || len(f.repo.setPaymentIDs) != 1 {
-		t.Fatalf("status=%s payment ids=%v", f.inv.Status, f.repo.setPaymentIDs)
+	if f.inv.GatewayPaymentID != f.payment.ID {
+		t.Fatalf("recorded payment = %q, want %s", f.inv.GatewayPaymentID, f.payment.ID)
+	}
+	if len(f.dunning.recovered) != 1 || len(f.dunning.outcomes) != 1 {
+		t.Fatalf("dunning recovery counted %d/%d times, want once", len(f.dunning.recovered), len(f.dunning.outcomes))
 	}
 }
 
-func TestMoyasarWebhook_PaymentFailedDoesNotSettle(t *testing.T) {
+func TestMoyasarWebhook_SecondPaymentDoesNotOverwrite(t *testing.T) {
 	f := newMoyasarFixture(t)
-	f.payment.Status = "failed"
-	w := postMoyasar(f.h, moyasarBody("ev_fail", "payment_failed", moyasarTestSecret, f.payment.ID))
-	if w.Code != http.StatusOK {
-		t.Fatalf("payment_failed: got %d want 200", w.Code)
+	f.inv.Status = domain.InvoiceStatusPaid
+	f.inv.GatewayPaymentID = "pay-A"
+	if w := f.deliver("ev_b", "payment_paid"); w.Code != http.StatusOK {
+		t.Fatalf("got %d want 200 (body %s)", w.Code, w.Body.String())
 	}
-	if f.repo.markPaidCalls != 0 || f.inv.Status != domain.InvoiceStatusOpen {
-		t.Fatalf("payment_failed settled the invoice")
-	}
-	if f.dedup.marks != 1 {
-		t.Fatalf("dedup marks = %d, want 1", f.dedup.marks)
+	if f.inv.GatewayPaymentID != "pay-A" || len(f.cards.saved) != 0 || len(f.dunning.outcomes) != 0 {
+		t.Fatalf("second payment overwrote: payment=%q cards=%d outcomes=%d", f.inv.GatewayPaymentID, len(f.cards.saved), len(f.dunning.outcomes))
 	}
 }
 
-func TestMoyasarWebhook_UnhandledEventsAcked(t *testing.T) {
-	for _, typ := range []string{"payment_refunded", "payment_voided", "card_auth_failed"} {
-		t.Run(typ, func(t *testing.T) {
-			f := newMoyasarFixture(t)
-			if w := postMoyasar(f.h, moyasarBody("ev_"+typ, typ, moyasarTestSecret, f.payment.ID)); w.Code != http.StatusOK {
-				t.Fatalf("got %d want 200", w.Code)
-			}
-			if f.repo.markPaidCalls != 0 || f.fetcher.calls != 0 {
-				t.Fatalf("%s must not fetch or settle", typ)
-			}
-		})
+// An invoice settled before its payment id was recorded (a crash between the
+// two writes) still records it on redelivery.
+func TestMoyasarWebhook_PaidInvoiceWithoutRecordedPaymentRecordsIt(t *testing.T) {
+	f := newMoyasarFixture(t)
+	f.inv.Status = domain.InvoiceStatusPaid
+	if w := f.deliver("ev_r", "payment_paid"); w.Code != http.StatusOK {
+		t.Fatalf("got %d want 200", w.Code)
+	}
+	if f.inv.GatewayPaymentID != f.payment.ID || len(f.cards.saved) != 1 {
+		t.Fatalf("payment=%q cards=%d, want recorded and saved", f.inv.GatewayPaymentID, len(f.cards.saved))
+	}
+	if len(f.dunning.outcomes) != 0 {
+		t.Fatal("dunning recovery recorded without the paid transition")
 	}
 }
 
-// TestMoyasarWebhook_UntrustedPaymentDoesNotSettle: the body always claims a
-// paid payment; settlement depends only on the fetched read-back.
+func TestMoyasarWebhook_InitiatedPaymentIsRedelivered(t *testing.T) {
+	f := newMoyasarFixture(t)
+	f.payment.Status = "initiated"
+	w := f.deliver("ev_i", "payment_paid")
+	if w.Code != http.StatusServiceUnavailable || f.dedup.marks != 0 || f.invoices.markPaidCalls != 0 {
+		t.Fatalf("got %d marks=%d markPaid=%d, want 503, unrecorded, unsettled", w.Code, f.dedup.marks, f.invoices.markPaidCalls)
+	}
+	f.payment.Status = "paid"
+	if w := f.deliver("ev_i", "payment_paid"); w.Code != http.StatusOK || f.inv.Status != domain.InvoiceStatusPaid {
+		t.Fatalf("redelivery got %d status %s, want settled", w.Code, f.inv.Status)
+	}
+}
+
+func TestMoyasarWebhook_OneOffInvoiceSettlesWithoutSavingCard(t *testing.T) {
+	f := newMoyasarFixture(t)
+	f.inv.SubscriptionID = nil
+	if w := f.deliver("ev_o", "payment_paid"); w.Code != http.StatusOK || f.inv.Status != domain.InvoiceStatusPaid {
+		t.Fatalf("got %d status %s, want settled", w.Code, f.inv.Status)
+	}
+	if len(f.cards.saved) != 0 {
+		t.Fatalf("one-off invoice saved card %+v", f.cards.saved)
+	}
+}
+
+// The body always claims a paid payment; settlement depends only on the
+// fetched read-back, and the ack names the guard that refused it.
 func TestMoyasarWebhook_UntrustedPaymentDoesNotSettle(t *testing.T) {
-	cases := map[string]func(f *moyasarFixture){
-		"fetched status failed":    func(f *moyasarFixture) { f.payment.Status = "failed" },
-		"fetched status initiated": func(f *moyasarFixture) { f.payment.Status = "initiated" },
-		"bound to another invoice": func(f *moyasarFixture) { f.payment.InvoiceID = uuid.NewString() },
-		"no invoice metadata":      func(f *moyasarFixture) { f.payment.InvoiceID = "" },
-		"amount short":             func(f *moyasarFixture) { f.payment.Amount = 9999 },
-		"currency mismatch":        func(f *moyasarFixture) { f.payment.Currency = "USD" },
+	cases := []struct {
+		name   string
+		mutate func(f *moyasarWebhookFixture)
+		reason string
+	}{
+		{"fetched status failed", func(f *moyasarWebhookFixture) { f.payment.Status = "failed" }, "payment not paid"},
+		{"unknown invoice", func(f *moyasarWebhookFixture) { f.payment.InvoiceID = uuid.NewString() }, "unknown invoice_id"},
+		{"no invoice metadata", func(f *moyasarWebhookFixture) { f.payment.InvoiceID = "" }, "no invoice_id"},
+		{"amount short", func(f *moyasarWebhookFixture) { f.payment.Amount = 7999 }, service.ErrPaymentShortAmount.Error()},
+		{"currency mismatch", func(f *moyasarWebhookFixture) { f.payment.Currency = "USD" }, service.ErrPaymentWrongCurrency.Error()},
 	}
-	for name, mutate := range cases {
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			f := newMoyasarFixture(t)
-			mutate(f)
-			w := postMoyasar(f.h, moyasarBody("ev_forged", "payment_paid", moyasarTestSecret, f.payment.ID))
+			tc.mutate(f)
+			w := f.deliver("ev_forged", "payment_paid")
 			if w.Code != http.StatusOK {
 				t.Fatalf("got %d want 200 ack (body %s)", w.Code, w.Body.String())
 			}
-			if f.repo.markPaidCalls != 0 || f.inv.Status != domain.InvoiceStatusOpen {
-				t.Fatalf("untrusted payment settled the invoice")
+			if got := ackReason(t, w); got != tc.reason {
+				t.Fatalf("reason = %q, want %q", got, tc.reason)
 			}
-			if len(f.repo.setPaymentIDs) != 0 || len(f.cards.saved) != 0 {
-				t.Fatalf("untrusted payment recorded: ids=%v cards=%d", f.repo.setPaymentIDs, len(f.cards.saved))
+			if f.invoices.markPaidCalls != 0 || len(f.invoices.claims) != 0 || len(f.cards.saved) != 0 {
+				t.Fatal("untrusted payment had effects")
 			}
 		})
 	}
 }
 
-func TestMoyasarWebhook_FetchErrorIsRetried(t *testing.T) {
-	f := newMoyasarFixture(t)
-	f.fetcher.err = errors.New("moyasar: 503")
-	w := postMoyasar(f.h, moyasarBody("ev_retry", "payment_paid", moyasarTestSecret, f.payment.ID))
-	if w.Code < 500 {
-		t.Fatalf("fetch error: got %d want 5xx so Moyasar redelivers", w.Code)
+func TestMoyasarWebhook_TransientFailuresAreRetried(t *testing.T) {
+	cases := map[string]struct {
+		breakIt func(f *moyasarWebhookFixture)
+		status  int
+	}{
+		"gateway fetch fails":    {func(f *moyasarWebhookFixture) { f.reader.err = errors.New("moyasar: 503") }, http.StatusBadGateway},
+		"invoice lookup fails":   {func(f *moyasarWebhookFixture) { f.invoices.loadErr = errors.New("db down") }, http.StatusInternalServerError},
+		"settlement write fails": {func(f *moyasarWebhookFixture) { f.invoices.markPaidErr = errors.New("db down") }, http.StatusInternalServerError},
 	}
-	if f.dedup.marks != 0 {
-		t.Fatalf("fetch error marked the event processed")
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newMoyasarFixture(t)
+			tc.breakIt(f)
+			if w := f.deliver("ev_retry", "payment_paid"); w.Code != tc.status {
+				t.Fatalf("got %d want %d", w.Code, tc.status)
+			}
+			if f.dedup.marks != 0 || len(f.cards.saved) != 0 {
+				t.Fatalf("failed delivery recorded (marks=%d) or saved a card", f.dedup.marks)
+			}
+			f.reader.err, f.invoices.loadErr, f.invoices.markPaidErr = nil, nil, nil
+			if w := f.deliver("ev_retry", "payment_paid"); w.Code != http.StatusOK || f.inv.Status != domain.InvoiceStatusPaid || f.dedup.marks != 1 {
+				t.Fatalf("redelivery got %d status %s marks %d, want settled and recorded", w.Code, f.inv.Status, f.dedup.marks)
+			}
+		})
 	}
-	if f.repo.markPaidCalls != 0 {
-		t.Fatalf("fetch error settled the invoice")
-	}
+}
 
-	// The redelivery, once the gateway recovers, settles.
-	f.fetcher.err = nil
-	if w := postMoyasar(f.h, moyasarBody("ev_retry", "payment_paid", moyasarTestSecret, f.payment.ID)); w.Code != http.StatusOK {
-		t.Fatalf("redelivery: got %d want 200", w.Code)
-	}
-	if f.repo.markPaidCalls != 1 || f.dedup.marks != 1 {
-		t.Fatalf("redelivery: markPaid=%d marks=%d, want 1/1", f.repo.markPaidCalls, f.dedup.marks)
+func TestMoyasarWebhook_FetchErrorCode(t *testing.T) {
+	f := newMoyasarFixture(t)
+	f.reader.err = errors.New("timeout")
+	if got := errorCode(t, f.deliver("ev_x", "payment_paid")); got != codeGatewayUnavailable {
+		t.Fatalf("code = %q, want %q", got, codeGatewayUnavailable)
 	}
 }
 
 func TestMoyasarWebhook_DedupStoreDownFailsClosed(t *testing.T) {
 	f := newMoyasarFixture(t)
 	f.h.inboundDedup = &errDedup{}
-	w := postMoyasar(f.h, moyasarBody("ev_down", "payment_paid", moyasarTestSecret, f.payment.ID))
-	if w.Code != http.StatusServiceUnavailable {
+	if w := f.deliver("ev_down", "payment_paid"); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("dedup down: got %d want 503", w.Code)
 	}
-	if f.fetcher.calls != 0 || f.repo.markPaidCalls != 0 {
-		t.Fatalf("dedup outage must not process the event")
+	if len(f.reader.gotIDs) != 0 || f.invoices.markPaidCalls != 0 {
+		t.Fatal("dedup outage processed the event")
 	}
 }
 
-func TestMoyasarWebhook_NoFetcherIgnored(t *testing.T) {
+func TestMoyasarWebhook_PaymentFailedAcked(t *testing.T) {
 	f := newMoyasarFixture(t)
-	f.h.SetMoyasar(nil, nil, moyasarTestSecret)
-	w := postMoyasar(f.h, moyasarBody("ev_nf", "payment_paid", moyasarTestSecret, f.payment.ID))
-	if w.Code != http.StatusOK || f.repo.markPaidCalls != 0 {
-		t.Fatalf("no fetcher: got %d markPaid=%d, want 200/0", w.Code, f.repo.markPaidCalls)
+	if w := f.deliver("ev_fail", "payment_failed"); w.Code != http.StatusOK {
+		t.Fatalf("got %d want 200", w.Code)
+	}
+	if f.invoices.markPaidCalls != 0 || f.inv.Status != domain.InvoiceStatusOpen || f.dedup.marks != 1 {
+		t.Fatalf("payment_failed: markPaid=%d status=%s marks=%d", f.invoices.markPaidCalls, f.inv.Status, f.dedup.marks)
+	}
+}
+
+func TestMoyasarWebhook_ReversalOfSettledPaymentIsFlagged(t *testing.T) {
+	for _, typ := range []string{"payment_refunded", "payment_voided"} {
+		t.Run(typ, func(t *testing.T) {
+			f := newMoyasarFixture(t)
+			f.inv.Status = domain.InvoiceStatusPaid
+			f.payment.RefundedAmount = 8000
+			if w := f.deliver("ev_"+typ, typ); w.Code != http.StatusOK {
+				t.Fatalf("got %d want 200", w.Code)
+			}
+			if f.invoices.markPaidCalls != 0 || len(f.reader.gotIDs) != 1 {
+				t.Fatalf("markPaid=%d fetches=%d, want 0/1", f.invoices.markPaidCalls, len(f.reader.gotIDs))
+			}
+			logs := f.logs.String()
+			if !strings.Contains(logs, "level=WARN") || !strings.Contains(logs, "refunded_amount=8000") || !strings.Contains(logs, f.inv.ID.String()) {
+				t.Fatalf("reversal not flagged with invoice and amount; logs:\n%s", logs)
+			}
+		})
+	}
+}
+
+func TestMoyasarWebhook_ReversalOfOpenInvoiceIsNotFlagged(t *testing.T) {
+	f := newMoyasarFixture(t)
+	if w := f.deliver("ev_v", "payment_voided"); w.Code != http.StatusOK {
+		t.Fatalf("got %d want 200", w.Code)
+	}
+	if strings.Contains(f.logs.String(), "level=WARN") {
+		t.Fatalf("void of an unsettled payment flagged; logs:\n%s", f.logs.String())
+	}
+}
+
+func TestMoyasarWebhook_UnhandledEventsIgnored(t *testing.T) {
+	f := newMoyasarFixture(t)
+	if w := f.deliver("ev_cauth", "card_auth_failed"); w.Code != http.StatusOK {
+		t.Fatalf("got %d want 200", w.Code)
+	}
+	if f.invoices.markPaidCalls != 0 || len(f.reader.gotIDs) != 0 {
+		t.Fatal("unhandled event fetched or settled")
 	}
 }

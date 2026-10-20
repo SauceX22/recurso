@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"io"
@@ -10,6 +9,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/recurso-dev/recurso/internal/core/domain"
+	"github.com/recurso-dev/recurso/internal/core/port"
+	"github.com/recurso-dev/recurso/internal/service"
 )
 
 // maxMoyasarWebhookBytes caps an inbound Moyasar delivery. The envelope wraps
@@ -23,29 +24,26 @@ type moyasarWebhookEnvelope struct {
 	ID          string `json:"id"`
 	Type        string `json:"type"`
 	SecretToken string `json:"secret_token"`
-	Live        bool   `json:"live"`
 	Data        struct {
 		ID string `json:"id"`
 	} `json:"data"`
 }
 
-// SetMoyasar wires the Moyasar webhook: the payment read-back, the card-token
-// store and the shared secret Moyasar echoes as secret_token. Nil-safe: left
-// unset (or with an empty secret) the route fails closed with 503.
-func (h *WebhookHandler) SetMoyasar(fetcher moyasarPaymentFetcher, saver gatewayCardSaver, secret string) {
+// SetMoyasar wires the Moyasar webhook: the payment read-back, the shared
+// settlement path, and the secret Moyasar echoes as secret_token. Left unset
+// (or with an empty secret) the route fails closed with 503.
+func (h *WebhookHandler) SetMoyasar(fetcher paymentReader, settler paymentSettler, secret string) {
 	h.moyasarFetcher = fetcher
-	h.moyasarCards = saver
+	h.moyasarSettler = settler
 	h.moyasarWebhookSecret = secret
 }
 
 // HandleMoyasar processes Moyasar webhook deliveries (POST /webhooks/moyasar).
 //
-// Moyasar documents no signature header; authenticity is the shared secret it
-// echoes in the body as secret_token, compared here in constant time. The body
-// is still never trusted for settlement: payment_paid re-fetches the payment
-// with the secret key and settles only on that read-back, bound to the invoice
-// by its own metadata, currency and amount. A leaked secret therefore lets an
-// attacker replay real payments (idempotent) but never forge one.
+// Moyasar sends no signature header; the shared secret it echoes in the body
+// is compared in constant time. Settlement still trusts only the server-side
+// read-back, bound to the invoice by metadata, currency and amount, so a
+// leaked secret can replay real payments (idempotent) but never forge one.
 func (h *WebhookHandler) HandleMoyasar(c *gin.Context) {
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxMoyasarWebhookBytes+1))
 	if err != nil {
@@ -57,9 +55,10 @@ func (h *WebhookHandler) HandleMoyasar(c *gin.Context) {
 		return
 	}
 
-	// Fail CLOSED: without a configured secret nothing can be authenticated.
-	if h.moyasarWebhookSecret == "" {
-		h.logger.Error("MOYASAR_WEBHOOK_SECRET not set — rejecting webhook (fail closed)", "ip", c.ClientIP())
+	// Fail closed: without the secret and the read-back nothing can be
+	// authenticated or settled, and acknowledging would drop the event.
+	if h.moyasarWebhookSecret == "" || h.moyasarFetcher == nil || h.moyasarSettler == nil {
+		h.logger.Error("Moyasar webhook not configured — rejecting (fail closed)", "ip", c.ClientIP())
 		respondError(c, http.StatusServiceUnavailable, codeInternalError, "webhook verification not configured")
 		return
 	}
@@ -78,31 +77,19 @@ func (h *WebhookHandler) HandleMoyasar(c *gin.Context) {
 		return
 	}
 
-	if h.moyasarFetcher == nil {
-		h.logger.Info("Moyasar payment fetcher not configured, ignoring webhook", "event_id", ev.ID, "type", ev.Type)
-		c.JSON(http.StatusOK, gin.H{"status": "ignored"})
-		return
-	}
-
-	// Dedup on Moyasar's event id. A store outage answers 503 (Moyasar
-	// redelivers); a duplicate is acknowledged without reprocessing.
-	if h.alreadyProcessed(c, "moyasar", ev.ID) {
+	if h.alreadyProcessed(c, string(domain.GatewayMoyasar), ev.ID) {
 		return
 	}
 
 	switch ev.Type {
 	case "payment_paid":
 		h.handleMoyasarPaymentPaid(c, ev)
-	case "payment_failed", "payment_faild": // Moyasar's own docs misspell it in places
-		// Renewal and dunning record token-charge failures synchronously; a
-		// failed checkout attempt leaves the invoice open. Nothing to settle.
+	case "payment_failed":
+		// A failed checkout attempt leaves the invoice open; nothing to settle.
 		h.logger.Info("Moyasar payment failed", "event_id", ev.ID, "payment_id", ev.Data.ID)
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	case "payment_refunded":
-		// Refunds originate from Recurso credit notes, which already post the
-		// reversal when the gateway Refund call returns.
-		h.logger.Info("Moyasar payment refunded", "event_id", ev.ID, "payment_id", ev.Data.ID)
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	case "payment_refunded", "payment_voided":
+		h.handleMoyasarPaymentReversed(c, ev)
 	default:
 		h.logger.Info("Moyasar webhook event ignored", "event_id", ev.ID, "type", ev.Type)
 		c.JSON(http.StatusOK, gin.H{"status": "ignored"})
@@ -110,105 +97,105 @@ func (h *WebhookHandler) HandleMoyasar(c *gin.Context) {
 
 	// Record only on a 2xx, so a failed delivery is redelivered and retried.
 	if status := c.Writer.Status(); status >= 200 && status < 300 {
-		h.markProcessed(c.Request.Context(), "moyasar", ev.ID, ev.Type)
+		h.markProcessed(c.Request.Context(), string(domain.GatewayMoyasar), ev.ID, ev.Type)
 	}
 }
 
-// handleMoyasarPaymentPaid settles the invoice a paid Moyasar payment belongs
-// to and writes the HTTP response. Only the server-side read-back of the
-// payment is trusted; the webhook body contributes nothing but the payment id.
+// loadMoyasarInvoice fetches the event's payment and the invoice its metadata
+// names. It writes the response and returns ok=false when there is nothing to
+// act on.
 //
 // Cross-tenant lookup: the webhook carries no tenant, so the invoice is loaded
-// with the unscoped GetByIDPublic by the id in the FETCHED payment's metadata.
-// This is safe because (1) the payment is read from Moyasar with the platform
-// secret key, so its metadata is what Recurso itself set at checkout, (2)
-// checkMoyasarPaymentForInvoice binds the payment to exactly that invoice
-// (id, currency, amount), and (3) every write after the lookup runs under the
-// invoice's own TenantID.
-func (h *WebhookHandler) handleMoyasarPaymentPaid(c *gin.Context, ev moyasarWebhookEnvelope) {
-	ctx := c.Request.Context()
-
+// with the unscoped GetByIDPublic by the id in the fetched payment's metadata.
+// The browser sets that metadata, so it is only a lookup key: the payment is
+// then bound to the invoice by currency and amount, and every write runs
+// under the invoice's own tenant.
+func (h *WebhookHandler) loadMoyasarInvoice(c *gin.Context, ev moyasarWebhookEnvelope) (*port.GatewayPayment, *domain.Invoice, bool) {
 	if ev.Data.ID == "" {
-		h.logger.Info("Moyasar payment_paid ignored — no payment id", "event_id", ev.ID)
+		h.logger.Info("Moyasar event ignored — no payment id", "event_id", ev.ID, "type", ev.Type)
 		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "no payment id"})
-		return
+		return nil, nil, false
 	}
-
+	ctx := c.Request.Context()
 	p, err := h.moyasarFetcher.FetchPayment(ctx, ev.Data.ID)
 	if err != nil || p == nil {
 		// Transient: not marked processed, so Moyasar redelivers.
 		h.logger.Error("failed to fetch Moyasar payment", "event_id", ev.ID, "payment_id", ev.Data.ID, "error", err)
-		respondErrorStatus(c, http.StatusBadGateway, "failed to fetch payment from gateway; retry")
-		return
+		respondError(c, http.StatusBadGateway, codeGatewayUnavailable, "failed to fetch payment from gateway; retry")
+		return nil, nil, false
 	}
-	if p.Status != "paid" {
-		h.logger.Warn("Moyasar payment_paid but fetched payment is not paid — not settling",
-			"event_id", ev.ID, "payment_id", p.ID, "status", p.Status)
-		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "payment not paid"})
-		return
-	}
-
 	invoiceID, err := uuid.Parse(p.InvoiceID)
 	if err != nil {
-		h.logger.Warn("Moyasar payment carries no valid invoice_id — not settling", "event_id", ev.ID, "payment_id", p.ID)
+		h.logger.Warn("Moyasar payment carries no valid invoice_id — ignoring", "event_id", ev.ID, "payment_id", p.ID)
 		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "no invoice_id"})
-		return
+		return nil, nil, false
 	}
-
 	inv, err := h.invoiceRepo.GetByIDPublic(ctx, invoiceID)
 	if err != nil {
 		h.logger.Error("failed to load invoice for Moyasar payment", "invoice_id", invoiceID, "payment_id", p.ID, "error", err)
 		respondError(c, http.StatusInternalServerError, codeInternalError, "failed to load invoice")
-		return
+		return nil, nil, false
 	}
 	if inv == nil {
-		h.logger.Warn("Moyasar payment references unknown invoice — not settling", "invoice_id", invoiceID, "payment_id", p.ID)
+		h.logger.Warn("Moyasar payment references unknown invoice — ignoring", "invoice_id", invoiceID, "payment_id", p.ID)
 		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "unknown invoice_id"})
+		return nil, nil, false
+	}
+	return p, inv, true
+}
+
+// handleMoyasarPaymentPaid settles the invoice a paid Moyasar payment belongs
+// to and writes the HTTP response.
+func (h *WebhookHandler) handleMoyasarPaymentPaid(c *gin.Context, ev moyasarWebhookEnvelope) {
+	p, inv, ok := h.loadMoyasarInvoice(c, ev)
+	if !ok {
 		return
 	}
-	if err := checkMoyasarPaymentForInvoice(p, inv); err != nil {
+	if err := service.BindPaymentToInvoice(p, inv); err != nil {
 		h.logger.Warn("Moyasar payment not bound to invoice — not settling",
 			"invoice_id", inv.ID, "payment_id", p.ID, "reason", err.Error())
 		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": err.Error()})
 		return
 	}
-
-	if h.subService == nil {
-		h.logger.Info("subscription service not configured, ignoring Moyasar settlement", "invoice_id", inv.ID, "payment_id", p.ID)
-		c.JSON(http.StatusOK, gin.H{"status": "ignored"})
+	switch p.Status {
+	case "paid":
+	case "initiated":
+		// The read-back can lag the event; a 5xx keeps the event unprocessed so
+		// Moyasar redelivers it once the payment reads as paid.
+		h.logger.Warn("Moyasar payment_paid but the payment still reads initiated — asking for redelivery",
+			"event_id", ev.ID, "payment_id", p.ID, "invoice_id", inv.ID)
+		respondErrorStatus(c, http.StatusServiceUnavailable, "payment not yet confirmed by the gateway; retry")
+		return
+	default:
+		h.logger.Warn("Moyasar payment_paid but the payment is not paid — not settling",
+			"event_id", ev.ID, "payment_id", p.ID, "status", p.Status)
+		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "payment not paid"})
 		return
 	}
 
-	tenantCtx := context.WithValue(ctx, domain.TenantIDKey, inv.TenantID)
-	transitioned, err := h.subService.MarkInvoicePaid(tenantCtx, inv.ID)
+	transitioned, err := h.moyasarSettler.Settle(c.Request.Context(), inv, p)
 	if err != nil {
-		h.logger.Error("failed to mark invoice paid via Moyasar", "invoice_id", inv.ID, "payment_id", p.ID, "error", err)
+		h.logger.Error("failed to settle invoice from Moyasar payment", "invoice_id", inv.ID, "payment_id", p.ID, "error", err)
 		respondInternalError(c, err)
 		return
 	}
 	h.logger.Info("invoice settled via Moyasar webhook", "invoice_id", inv.ID, "payment_id", p.ID, "transitioned", transitioned)
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
 
-	// Record the payment (refund target) and its card token only when this
-	// payment is the invoice's payment: it settled it now, nothing was recorded
-	// yet, or it is a redelivery of the recorded one. A second payment against
-	// an invoice another payment already settled must not overwrite either.
-	if transitioned || inv.GatewayPaymentID == "" || inv.GatewayPaymentID == p.ID {
-		if inv.GatewayPaymentID != p.ID {
-			if err := h.invoiceRepo.SetGatewayPaymentID(ctx, inv.TenantID, inv.ID, p.ID); err != nil {
-				h.logger.Error("failed to record Moyasar payment id", "invoice_id", inv.ID, "payment_id", p.ID, "error", err)
-			}
-		}
-		if err := saveMoyasarCard(tenantCtx, h.moyasarCards, p, inv); err != nil {
-			h.logger.Error("failed to save Moyasar card token", "invoice_id", inv.ID, "payment_id", p.ID, "error", err)
-		}
-	} else {
-		h.logger.Warn("Moyasar payment for an invoice already settled by another payment — review for refund",
-			"invoice_id", inv.ID, "payment_id", p.ID)
+// handleMoyasarPaymentReversed flags a refund or void of a payment on a
+// settled invoice. Refunds issued from Recurso credit notes also arrive here;
+// one made in the Moyasar dashboard has no credit note and leaves the books
+// overstating cash until someone reconciles it.
+func (h *WebhookHandler) handleMoyasarPaymentReversed(c *gin.Context, ev moyasarWebhookEnvelope) {
+	p, inv, ok := h.loadMoyasarInvoice(c, ev)
+	if !ok {
+		return
 	}
-
-	if transitioned {
-		h.recordDunningSuccess(ctx, inv.ID)
+	if inv.Status == domain.InvoiceStatusPaid {
+		h.logger.Warn("Moyasar payment refunded or voided on a settled invoice — confirm a matching credit note exists",
+			"event_type", ev.Type, "invoice_id", inv.ID, "payment_id", p.ID, "recorded_payment_id", inv.GatewayPaymentID,
+			"payment_status", p.Status, "amount", p.Amount, "refunded_amount", p.RefundedAmount, "currency", p.Currency)
 	}
-
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }

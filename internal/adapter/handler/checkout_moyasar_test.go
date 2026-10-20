@@ -16,24 +16,6 @@ import (
 	"github.com/recurso-dev/recurso/internal/core/port/porttest"
 )
 
-type moyCheckoutInvoices struct {
-	porttest.UnimplementedInvoiceRepository
-	inv          *domain.Invoice
-	setPaymentID string
-}
-
-func (r *moyCheckoutInvoices) GetByIDPublic(_ context.Context, id uuid.UUID) (*domain.Invoice, error) {
-	if r.inv == nil || r.inv.ID != id {
-		return nil, nil
-	}
-	return r.inv, nil
-}
-
-func (r *moyCheckoutInvoices) SetGatewayPaymentID(_ context.Context, _, _ uuid.UUID, pid string) error {
-	r.setPaymentID = pid
-	return nil
-}
-
 type moyCheckoutGateway struct {
 	porttest.UnimplementedPaymentGateway
 	gateway      string
@@ -42,71 +24,6 @@ type moyCheckoutGateway struct {
 
 func (g *moyCheckoutGateway) CreateOrder(_ context.Context, amount int64, currency, receipt, _ string) (*port.PaymentOrder, error) {
 	return &port.PaymentOrder{ID: "ord_1", Amount: amount, Currency: currency, Receipt: receipt, Gateway: g.gateway, ClientSecret: g.clientSecret}, nil
-}
-
-type moyCheckoutSettler struct {
-	calls     int
-	hadTenant bool
-	err       error
-}
-
-func (s *moyCheckoutSettler) MarkInvoicePaid(ctx context.Context, _ uuid.UUID) (bool, error) {
-	s.calls++
-	_, s.hadTenant = ctx.Value(domain.TenantIDKey).(uuid.UUID)
-	return true, s.err
-}
-
-type moyCheckoutFetcher struct {
-	p     *port.GatewayPayment
-	err   error
-	calls int
-	gotID string
-}
-
-func (f *moyCheckoutFetcher) FetchPayment(_ context.Context, id string) (*port.GatewayPayment, error) {
-	f.calls++
-	f.gotID = id
-	return f.p, f.err
-}
-
-type moyCheckoutCards struct {
-	calls    int
-	provider string
-	ref      string
-	customer uuid.UUID
-}
-
-func (s *moyCheckoutCards) SetGatewayPaymentMethod(_ context.Context, _, customerID uuid.UUID, provider domain.GatewayProvider, ref, _, _ string, _, _ int) error {
-	s.calls++
-	s.provider, s.ref, s.customer = string(provider), ref, customerID
-	return nil
-}
-
-func moyTestInvoice() *domain.Invoice {
-	return &domain.Invoice{
-		ID:            uuid.New(),
-		TenantID:      uuid.New(),
-		CustomerID:    uuid.New(),
-		InvoiceNumber: "INV-42",
-		Status:        domain.InvoiceStatusOpen,
-		Currency:      "SAR",
-		Total:         10000,
-		AmountPaid:    1500,
-		CreditApplied: 500,
-	}
-}
-
-func moyPaidPayment(inv *domain.Invoice) *port.GatewayPayment {
-	return &port.GatewayPayment{
-		ID:        "7f1c0e6e-1111-4c2b-9d1a-000000000001",
-		Status:    "paid",
-		Amount:    moyasarAmountDue(inv),
-		Currency:  "SAR",
-		InvoiceID: inv.ID.String(),
-		CardToken: "token_abc",
-		CardBrand: "mada",
-		CardLast4: "1111",
-	}
 }
 
 func moyDo(t *testing.T, method, path string, handler gin.HandlerFunc, route string, body any) (int, map[string]any) {
@@ -138,54 +55,121 @@ func moyData(t *testing.T, out map[string]any) map[string]any {
 	return d
 }
 
-func TestCheckoutInitiate_MoyasarReturnsFormConfig(t *testing.T) {
-	inv := moyTestInvoice()
-	h := NewCheckoutHandler(&moyCheckoutInvoices{inv: inv}, &moyCheckoutGateway{gateway: "moyasar"}, nil, nil, "")
-	h.SetMoyasar(&moyCheckoutFetcher{}, nil, "pk_test_abc")
+func moyErrorCode(out map[string]any) string {
+	e, _ := out["error"].(map[string]any)
+	code, _ := e["code"].(string)
+	return code
+}
 
-	code, out := moyDo(t, http.MethodPost, "/checkout/"+inv.ID.String()+"/pay", h.InitiatePayment, "/checkout/:id/pay", nil)
+type moyCheckoutFixture struct {
+	*moyasarSettlementFixture
+	h *CheckoutHandler
+}
+
+// newMoyCheckoutFixture wires a checkout whose order gateway is gw and whose
+// Moyasar verify settles through the shared settlement path.
+func newMoyCheckoutFixture(gw string) *moyCheckoutFixture {
+	f := &moyCheckoutFixture{moyasarSettlementFixture: newMoyasarSettlementFixture()}
+	f.h = NewCheckoutHandler(f.invoices, &moyCheckoutGateway{gateway: gw, clientSecret: map[string]string{"stripe": "cs_1"}[gw]}, nil, nil, "pk_stripe")
+	f.h.SetMoyasar(f.reader, f.settler, "pk_test_abc")
+	return f
+}
+
+func (f *moyCheckoutFixture) pay(t *testing.T) (int, map[string]any) {
+	return moyDo(t, http.MethodPost, "/checkout/"+f.inv.ID.String()+"/pay", f.h.InitiatePayment, "/checkout/:id/pay", nil)
+}
+
+func (f *moyCheckoutFixture) verify(t *testing.T, body any) (int, map[string]any) {
+	return moyDo(t, http.MethodPost, "/checkout/"+f.inv.ID.String()+"/moyasar/verify", f.h.MoyasarVerify, "/checkout/:id/moyasar/verify", body)
+}
+
+func (f *moyCheckoutFixture) verifyPayment(t *testing.T) (int, map[string]any) {
+	return f.verify(t, map[string]string{"payment_id": f.payment.ID})
+}
+
+func TestShowCheckout_ReportsAmountDue(t *testing.T) {
+	f := newMoyCheckoutFixture("moyasar")
+	code, out := moyDo(t, http.MethodGet, "/checkout/"+f.inv.ID.String(), f.h.ShowCheckout, "/checkout/:id", nil)
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, body %v", code, out)
 	}
 	d := moyData(t, out)
-	if d["gateway"] != "moyasar" {
-		t.Errorf("gateway = %v", d["gateway"])
+	for k, want := range map[string]float64{"total": 10000, "amount_paid": 1500, "credit_applied": 500, "amount_due": 8000} {
+		if d[k] != want {
+			t.Errorf("%s = %v, want %v", k, d[k], want)
+		}
 	}
-	if d["moyasar_publishable_key"] != "pk_test_abc" {
-		t.Errorf("moyasar_publishable_key = %v", d["moyasar_publishable_key"])
+	if d["display_amount_due"] != "80.00" {
+		t.Errorf("display_amount_due = %v, want 80.00", d["display_amount_due"])
 	}
-	if got := d["amount"].(float64); int64(got) != 8000 {
-		t.Errorf("amount = %v, want amount due 8000", got)
+}
+
+func TestCheckoutInitiate_MoyasarReturnsFormConfig(t *testing.T) {
+	f := newMoyCheckoutFixture("moyasar")
+	code, out := f.pay(t)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, body %v", code, out)
 	}
-	if d["currency"] != "SAR" {
-		t.Errorf("currency = %v", d["currency"])
+	d := moyData(t, out)
+	if d["gateway"] != "moyasar" || d["moyasar_publishable_key"] != "pk_test_abc" || d["currency"] != "SAR" {
+		t.Errorf("gateway=%v key=%v currency=%v", d["gateway"], d["moyasar_publishable_key"], d["currency"])
+	}
+	if d["amount"] != float64(8000) {
+		t.Errorf("amount = %v, want the amount due 8000", d["amount"])
+	}
+	if d["save_card"] != true {
+		t.Errorf("save_card = %v, want true for a renewing subscription", d["save_card"])
 	}
 	if d["description"] != "Invoice INV-42" {
 		t.Errorf("description = %v", d["description"])
 	}
-	md, _ := d["metadata"].(map[string]any)
-	if md["invoice_id"] != inv.ID.String() {
+	if md, _ := d["metadata"].(map[string]any); md["invoice_id"] != f.inv.ID.String() {
 		t.Errorf("metadata = %v", d["metadata"])
 	}
 }
 
-func TestCheckoutInitiate_MoyasarMissingKey503(t *testing.T) {
-	inv := moyTestInvoice()
-	h := NewCheckoutHandler(&moyCheckoutInvoices{inv: inv}, &moyCheckoutGateway{gateway: "moyasar"}, nil, nil, "")
+func TestCheckoutInitiate_MoyasarSaveCardOnlyForRenewingSubscriptions(t *testing.T) {
+	cases := map[string]func(*moyCheckoutFixture){
+		"one-off invoice":       func(f *moyCheckoutFixture) { f.inv.SubscriptionID = nil },
+		"canceled subscription": func(f *moyCheckoutFixture) { f.sub.Status = domain.SubscriptionStatusCanceled },
+		"cancels at period end": func(f *moyCheckoutFixture) { f.sub.CancelAtPeriodEnd = true },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newMoyCheckoutFixture("moyasar")
+			mutate(f)
+			code, out := f.pay(t)
+			if code != http.StatusOK {
+				t.Fatalf("status = %d, body %v", code, out)
+			}
+			if got := moyData(t, out)["save_card"]; got != false {
+				t.Fatalf("save_card = %v, want false", got)
+			}
+		})
+	}
+}
 
-	code, out := moyDo(t, http.MethodPost, "/checkout/"+inv.ID.String()+"/pay", h.InitiatePayment, "/checkout/:id/pay", nil)
-	if code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503 (body %v)", code, out)
+func TestCheckoutInitiate_MoyasarUnconfigured503(t *testing.T) {
+	cases := map[string]func(*moyCheckoutFixture){
+		"no publishable key": func(f *moyCheckoutFixture) { f.h.SetMoyasar(f.reader, f.settler, "") },
+		"no settlement":      func(f *moyCheckoutFixture) { f.h.SetMoyasar(f.reader, nil, "pk_test_abc") },
+	}
+	for name, unset := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newMoyCheckoutFixture("moyasar")
+			unset(f)
+			code, out := f.pay(t)
+			if code != http.StatusServiceUnavailable || moyErrorCode(out) != codeCheckoutUnavailable {
+				t.Fatalf("status = %d code = %q, want 503 %s", code, moyErrorCode(out), codeCheckoutUnavailable)
+			}
+		})
 	}
 }
 
 func TestCheckoutInitiate_StripeResponseHasNoMoyasarKeys(t *testing.T) {
-	inv := moyTestInvoice()
-	inv.Currency = "USD"
-	h := NewCheckoutHandler(&moyCheckoutInvoices{inv: inv}, &moyCheckoutGateway{gateway: "stripe", clientSecret: "cs_1"}, nil, nil, "pk_stripe")
-	h.SetMoyasar(&moyCheckoutFetcher{}, nil, "pk_test_abc")
-
-	code, out := moyDo(t, http.MethodPost, "/checkout/"+inv.ID.String()+"/pay", h.InitiatePayment, "/checkout/:id/pay", nil)
+	f := newMoyCheckoutFixture("stripe")
+	f.inv.Currency = "USD"
+	code, out := f.pay(t)
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, body %v", code, out)
 	}
@@ -199,166 +183,170 @@ func TestCheckoutInitiate_StripeResponseHasNoMoyasarKeys(t *testing.T) {
 			t.Errorf("stripe response missing %q", k)
 		}
 	}
-	if int64(d["amount"].(float64)) != inv.Total {
-		t.Errorf("stripe amount = %v, want order amount %d", d["amount"], inv.Total)
+	if d["amount"] != float64(f.inv.Total) {
+		t.Errorf("stripe amount = %v, want order amount %d", d["amount"], f.inv.Total)
 	}
 }
 
-type moyVerifyFixture struct {
-	inv     *domain.Invoice
-	repo    *moyCheckoutInvoices
-	settler *moyCheckoutSettler
-	fetcher *moyCheckoutFetcher
-	cards   *moyCheckoutCards
-	h       *CheckoutHandler
+func TestMoyasarVerify_PaidSettlesRecordsAndRecovers(t *testing.T) {
+	f := newMoyCheckoutFixture("moyasar")
+	code, out := f.verifyPayment(t)
+	if code != http.StatusOK || moyData(t, out)["status"] != "paid" {
+		t.Fatalf("status = %d body %v, want 200 paid", code, out)
+	}
+	if len(f.reader.gotIDs) != 1 || f.reader.gotIDs[0] != f.payment.ID {
+		t.Errorf("fetched %v, want [%s]", f.reader.gotIDs, f.payment.ID)
+	}
+	if f.invoices.markPaidCalls != 1 || f.invoices.markPaidTenant != f.inv.TenantID || f.invoices.getByIDTenant != f.inv.TenantID {
+		t.Errorf("settled %d times under tenant %s / ctx %v, want once under %s",
+			f.invoices.markPaidCalls, f.invoices.markPaidTenant, f.invoices.getByIDTenant, f.inv.TenantID)
+	}
+	if f.inv.GatewayPaymentID != f.payment.ID || f.invoices.claimTenant != f.inv.TenantID {
+		t.Errorf("recorded payment = %q under %s", f.inv.GatewayPaymentID, f.invoices.claimTenant)
+	}
+	if len(f.cards.saved) != 1 || f.cards.saved[0] != f.wantSavedCard() {
+		t.Errorf("saved cards = %+v, want [%+v]", f.cards.saved, f.wantSavedCard())
+	}
+	if len(f.dunning.recovered) != 1 || f.dunning.recovered[0] != f.inv.ID || len(f.dunning.outcomes) != 1 {
+		t.Errorf("dunning recovery = %v / %d outcomes, want one for %s", f.dunning.recovered, len(f.dunning.outcomes), f.inv.ID)
+	}
 }
 
-func newMoyVerifyFixture(p func(*domain.Invoice) *port.GatewayPayment) *moyVerifyFixture {
-	f := &moyVerifyFixture{inv: moyTestInvoice(), settler: &moyCheckoutSettler{}, cards: &moyCheckoutCards{}}
-	f.repo = &moyCheckoutInvoices{inv: f.inv}
-	f.fetcher = &moyCheckoutFetcher{}
-	if p != nil {
-		f.fetcher.p = p(f.inv)
+// The webhook (or another tab) settled the invoice with a different payment
+// while this verify ran: report paid, but keep the recorded refund target and
+// card and count no second recovery.
+func TestMoyasarVerify_SecondPaymentDoesNotOverwrite(t *testing.T) {
+	f := newMoyCheckoutFixture("moyasar")
+	f.invoices.settledElsewhere = true
+	f.inv.GatewayPaymentID = "pay-A"
+	code, out := f.verifyPayment(t)
+	if code != http.StatusOK || moyData(t, out)["status"] != "paid" {
+		t.Fatalf("status = %d body %v", code, out)
 	}
-	f.h = NewCheckoutHandler(f.repo, &moyCheckoutGateway{}, nil, f.settler, "")
-	f.h.SetMoyasar(f.fetcher, f.cards, "pk_test_abc")
-	return f
-}
-
-func (f *moyVerifyFixture) verify(t *testing.T, body any) (int, map[string]any) {
-	return moyDo(t, http.MethodPost, "/checkout/"+f.inv.ID.String()+"/moyasar/verify", f.h.MoyasarVerify, "/checkout/:id/moyasar/verify", body)
-}
-
-func TestMoyasarVerify_PaidSettlesAndSavesCard(t *testing.T) {
-	f := newMoyVerifyFixture(moyPaidPayment)
-	code, out := f.verify(t, map[string]string{"payment_id": "pay-1"})
-	if code != http.StatusOK {
-		t.Fatalf("status = %d, body %v", code, out)
-	}
-	if moyData(t, out)["status"] != "paid" {
-		t.Errorf("status = %v, want paid", out)
-	}
-	if f.fetcher.gotID != "pay-1" {
-		t.Errorf("fetched %q, want pay-1", f.fetcher.gotID)
-	}
-	if f.settler.calls != 1 || !f.settler.hadTenant {
-		t.Errorf("settler calls = %d (tenant ctx %v), want 1 with tenant", f.settler.calls, f.settler.hadTenant)
-	}
-	if f.repo.setPaymentID != f.fetcher.p.ID {
-		t.Errorf("gateway payment id = %q, want %q", f.repo.setPaymentID, f.fetcher.p.ID)
-	}
-	if f.cards.calls != 1 || f.cards.provider != string(domain.GatewayMoyasar) || f.cards.ref != "token_abc" || f.cards.customer != f.inv.CustomerID {
-		t.Errorf("card save = %+v", f.cards)
+	if f.inv.GatewayPaymentID != "pay-A" || len(f.cards.saved) != 0 || len(f.dunning.outcomes) != 0 {
+		t.Fatalf("second payment overwrote: payment=%q cards=%d outcomes=%d", f.inv.GatewayPaymentID, len(f.cards.saved), len(f.dunning.outcomes))
 	}
 }
 
 func TestMoyasarVerify_NotPaidDoesNotSettle(t *testing.T) {
 	for _, tc := range []struct{ gw, want string }{{"failed", "failed"}, {"initiated", "processing"}} {
-		f := newMoyVerifyFixture(func(inv *domain.Invoice) *port.GatewayPayment {
-			p := moyPaidPayment(inv)
-			p.Status = tc.gw
-			return p
+		t.Run(tc.gw, func(t *testing.T) {
+			f := newMoyCheckoutFixture("moyasar")
+			f.payment.Status = tc.gw
+			code, out := f.verifyPayment(t)
+			if code != http.StatusOK {
+				t.Fatalf("status = %d, body %v", code, out)
+			}
+			if d := moyData(t, out); d["status"] != tc.want || d["payment_status"] != tc.gw {
+				t.Errorf("data = %v, want status %s", d, tc.want)
+			}
+			if f.invoices.markPaidCalls != 0 || len(f.invoices.claims) != 0 || len(f.cards.saved) != 0 {
+				t.Error("unpaid payment had effects")
+			}
 		})
-		code, out := f.verify(t, map[string]string{"payment_id": "pay-1"})
-		if code != http.StatusOK {
-			t.Fatalf("%s: status = %d, body %v", tc.gw, code, out)
-		}
-		d := moyData(t, out)
-		if d["status"] != tc.want || d["payment_status"] != tc.gw {
-			t.Errorf("%s: data = %v, want status %s", tc.gw, d, tc.want)
-		}
-		if f.settler.calls != 0 || f.cards.calls != 0 || f.repo.setPaymentID != "" {
-			t.Errorf("%s: must not settle/save (settle %d, cards %d, pid %q)", tc.gw, f.settler.calls, f.cards.calls, f.repo.setPaymentID)
-		}
 	}
 }
 
-func TestMoyasarVerify_BindingFailures400(t *testing.T) {
+func TestMoyasarVerify_BindingFailuresShareOneCode(t *testing.T) {
 	cases := map[string]func(*port.GatewayPayment){
 		"wrong invoice": func(p *port.GatewayPayment) { p.InvoiceID = uuid.NewString() },
 		"currency":      func(p *port.GatewayPayment) { p.Currency = "USD" },
 		"short amount":  func(p *port.GatewayPayment) { p.Amount-- },
+		"refunded":      func(p *port.GatewayPayment) { p.RefundedAmount = 1 },
 	}
 	for name, mutate := range cases {
-		f := newMoyVerifyFixture(func(inv *domain.Invoice) *port.GatewayPayment {
-			p := moyPaidPayment(inv)
-			mutate(p)
-			return p
+		t.Run(name, func(t *testing.T) {
+			f := newMoyCheckoutFixture("moyasar")
+			mutate(f.payment)
+			code, out := f.verifyPayment(t)
+			if code != http.StatusBadRequest || moyErrorCode(out) != codePaymentMismatch {
+				t.Fatalf("status = %d code = %q, want 400 %s", code, moyErrorCode(out), codePaymentMismatch)
+			}
+			if msg := out["error"].(map[string]any)["message"]; msg != "payment does not match this invoice" {
+				t.Errorf("message = %v, want the generic binding message", msg)
+			}
+			if f.invoices.markPaidCalls != 0 || len(f.cards.saved) != 0 {
+				t.Error("unbound payment settled or saved a card")
+			}
 		})
-		code, out := f.verify(t, map[string]string{"payment_id": "pay-1"})
-		if code != http.StatusBadRequest {
-			t.Errorf("%s: status = %d, want 400 (body %v)", name, code, out)
-		}
-		if f.settler.calls != 0 || f.cards.calls != 0 {
-			t.Errorf("%s: settled or saved card on a bad binding", name)
-		}
 	}
 }
 
 func TestMoyasarVerify_FetchError502(t *testing.T) {
-	f := newMoyVerifyFixture(nil)
-	f.fetcher.err = errors.New("boom")
-	code, _ := f.verify(t, map[string]string{"payment_id": "pay-1"})
-	if code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", code)
+	f := newMoyCheckoutFixture("moyasar")
+	f.reader.err = errors.New("boom")
+	code, out := f.verifyPayment(t)
+	if code != http.StatusBadGateway || moyErrorCode(out) != codeGatewayUnavailable {
+		t.Fatalf("status = %d code = %q, want 502 %s", code, moyErrorCode(out), codeGatewayUnavailable)
 	}
-	if f.settler.calls != 0 {
+	if f.invoices.markPaidCalls != 0 {
 		t.Error("settled on fetch error")
 	}
 }
 
-func TestMoyasarVerify_NoFetcher503(t *testing.T) {
-	f := newMoyVerifyFixture(moyPaidPayment)
-	f.h.SetMoyasar(nil, nil, "")
-	code, _ := f.verify(t, map[string]string{"payment_id": "pay-1"})
-	if code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", code)
+// Without the read-back or the settlement path, verify must not report paid.
+func TestMoyasarVerify_Unconfigured503(t *testing.T) {
+	cases := map[string]func(*moyCheckoutFixture){
+		"no read-back":  func(f *moyCheckoutFixture) { f.h.SetMoyasar(nil, f.settler, "pk_test_abc") },
+		"no settlement": func(f *moyCheckoutFixture) { f.h.SetMoyasar(f.reader, nil, "pk_test_abc") },
+	}
+	for name, unset := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newMoyCheckoutFixture("moyasar")
+			unset(f)
+			code, out := f.verifyPayment(t)
+			if code != http.StatusServiceUnavailable || moyErrorCode(out) != codeCheckoutUnavailable {
+				t.Fatalf("status = %d code = %q, want 503 %s", code, moyErrorCode(out), codeCheckoutUnavailable)
+			}
+			if f.invoices.markPaidCalls != 0 {
+				t.Error("settled without the settlement path")
+			}
+		})
 	}
 }
 
 func TestMoyasarVerify_AlreadyPaidSkipsFetch(t *testing.T) {
-	f := newMoyVerifyFixture(moyPaidPayment)
+	f := newMoyCheckoutFixture("moyasar")
 	f.inv.Status = domain.InvoiceStatusPaid
-	code, out := f.verify(t, map[string]string{"payment_id": "pay-1"})
+	code, out := f.verifyPayment(t)
 	if code != http.StatusOK || moyData(t, out)["status"] != "paid" {
 		t.Fatalf("status = %d body %v, want 200 paid", code, out)
 	}
-	if f.fetcher.calls != 0 || f.settler.calls != 0 {
-		t.Errorf("fetch %d settle %d, want none", f.fetcher.calls, f.settler.calls)
+	if len(f.reader.gotIDs) != 0 || f.invoices.markPaidCalls != 0 {
+		t.Errorf("fetch %d settle %d, want none", len(f.reader.gotIDs), f.invoices.markPaidCalls)
 	}
 }
 
 func TestMoyasarVerify_MissingPaymentID400(t *testing.T) {
-	f := newMoyVerifyFixture(moyPaidPayment)
-	code, _ := f.verify(t, map[string]string{})
-	if code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", code)
+	f := newMoyCheckoutFixture("moyasar")
+	code, out := f.verify(t, map[string]string{})
+	if code != http.StatusBadRequest || moyErrorCode(out) != codeValidationFailed {
+		t.Fatalf("status = %d code = %q, want 400 validation_failed", code, moyErrorCode(out))
 	}
-	if f.fetcher.calls != 0 {
+	if len(f.reader.gotIDs) != 0 {
 		t.Error("fetched without a payment id")
 	}
 }
 
 func TestMoyasarVerify_SettleError500(t *testing.T) {
-	f := newMoyVerifyFixture(moyPaidPayment)
-	f.settler.err = errors.New("db down")
-	code, _ := f.verify(t, map[string]string{"payment_id": "pay-1"})
-	if code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", code)
+	f := newMoyCheckoutFixture("moyasar")
+	f.invoices.markPaidErr = errors.New("db down")
+	code, out := f.verifyPayment(t)
+	if code != http.StatusInternalServerError || moyErrorCode(out) != codeInternalError {
+		t.Fatalf("status = %d code = %q, want 500", code, moyErrorCode(out))
 	}
-	if f.cards.calls != 0 {
-		t.Error("saved card despite failed settlement")
+	if len(f.cards.saved) != 0 || len(f.invoices.claims) != 0 {
+		t.Error("recorded or saved despite failed settlement")
 	}
 }
 
 func TestMoyasarVerify_InvalidAndUnknownInvoice(t *testing.T) {
-	f := newMoyVerifyFixture(moyPaidPayment)
-	code, _ := moyDo(t, http.MethodPost, "/checkout/nope/moyasar/verify", f.h.MoyasarVerify, "/checkout/:id/moyasar/verify", map[string]string{"payment_id": "x"})
-	if code != http.StatusBadRequest {
+	f := newMoyCheckoutFixture("moyasar")
+	body := map[string]string{"payment_id": f.payment.ID}
+	if code, _ := moyDo(t, http.MethodPost, "/checkout/nope/moyasar/verify", f.h.MoyasarVerify, "/checkout/:id/moyasar/verify", body); code != http.StatusBadRequest {
 		t.Errorf("invalid id status = %d, want 400", code)
 	}
-	code, _ = moyDo(t, http.MethodPost, "/checkout/"+uuid.NewString()+"/moyasar/verify", f.h.MoyasarVerify, "/checkout/:id/moyasar/verify", map[string]string{"payment_id": "x"})
-	if code != http.StatusNotFound {
+	if code, _ := moyDo(t, http.MethodPost, "/checkout/"+uuid.NewString()+"/moyasar/verify", f.h.MoyasarVerify, "/checkout/:id/moyasar/verify", body); code != http.StatusNotFound {
 		t.Errorf("unknown invoice status = %d, want 404", code)
 	}
 }

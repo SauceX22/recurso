@@ -1033,6 +1033,18 @@ func main() {
 	preChargeScheduler.Start()
 	defer preChargeScheduler.Stop()
 
+	// Moyasar (EXPERIMENTAL) settles checkout verifies and webhooks through one
+	// path; its customers update their card by paying an open invoice, so the
+	// dunning and card-expiry emails link there instead of the Stripe portal.
+	var moyasarSettlement *service.GatewaySettlementService
+	var cardUpdatePolicy *service.PaymentMethodUpdatePolicy
+	if moyasarGateway != nil {
+		moyasarSettlement = service.NewGatewaySettlementService(domain.GatewayMoyasar, subscriptionService, invoiceRepo.(*db.InvoiceRepository), subscriptionRepo)
+		moyasarSettlement.SetCardSaving(customerRepo, moyasarGateway)
+		moyasarSettlement.SetDunningRecovery(dunningCampaignService, retryService)
+		cardUpdatePolicy = service.NewPaymentMethodUpdatePolicy(customerRepo, invoiceRepo.(*db.InvoiceRepository), paymentGateway.ProviderFor, domain.GatewayMoyasar)
+	}
+
 	// Dunning Scheduler (P30 - payment retry and escalation)
 	dunningScheduler := scheduler.NewDunningScheduler(
 		invoiceRepo.(*db.InvoiceRepository),
@@ -1043,6 +1055,9 @@ func main() {
 	)
 	dunningScheduler.SetPaymentAttempts(db.NewPaymentAttemptRepository(database))          // skip dunning for a settling ACH (Inc 3b)
 	dunningScheduler.SetWriteOffLedger(ledgerService, invoiceRepo.(*db.InvoiceRepository)) // auto-write-off posts its ledger reversal (#466 follow-up)
+	if cardUpdatePolicy != nil {
+		dunningScheduler.SetPaymentMethodLinks(cardUpdatePolicy)
+	}
 	dunningScheduler.Start()
 	defer dunningScheduler.Stop()
 
@@ -1065,6 +1080,9 @@ func main() {
 		locker,
 		baseURL,
 	)
+	if cardUpdatePolicy != nil {
+		cardExpiryScheduler.SetPaymentMethodLinks(cardUpdatePolicy)
+	}
 	cardExpiryScheduler.Start()
 	defer cardExpiryScheduler.Stop()
 
@@ -1408,6 +1426,9 @@ func main() {
 	notificationService.SetAppBaseURL(getEnvDefault("DASHBOARD_URL", portalBaseURL))
 	portalService := service.NewPortalService(customerRepo, invoiceRepo, magicLinkRepo, portalSessionRepo, disputeRepo, giftService, emailSender, portalBaseURL)
 	portalAPIHandler := handler.NewPortalAPIHandler(portalService)
+	if cardUpdatePolicy != nil {
+		portalAPIHandler.SetCardUpdatePolicy(cardUpdatePolicy)
+	}
 	// ENG-5: wire the Stripe SetupIntent card-update flow. The mock gateway
 	// doesn't implement these methods, so the endpoints stay disabled until real
 	// Stripe keys are set. customerRepo (concrete) provides the PM persistence.
@@ -1560,8 +1581,8 @@ func main() {
 	// the webhook. Guarded so an unconfigured gateway stays a nil interface,
 	// not a typed nil.
 	if moyasarGateway != nil {
-		checkoutHandler.SetMoyasar(moyasarGateway, customerRepo, os.Getenv("MOYASAR_PUBLISHABLE_KEY"))
-		webhookHandler.SetMoyasar(moyasarGateway, customerRepo, os.Getenv("MOYASAR_WEBHOOK_SECRET"))
+		checkoutHandler.SetMoyasar(moyasarGateway, moyasarSettlement, os.Getenv("MOYASAR_PUBLISHABLE_KEY"))
+		webhookHandler.SetMoyasar(moyasarGateway, moyasarSettlement, os.Getenv("MOYASAR_WEBHOOK_SECRET"))
 	}
 
 	// Revenue Recognition Handler
