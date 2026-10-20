@@ -53,6 +53,27 @@ type PaymentResult struct {
 	PaymentID string
 	ErrorCode string // "insufficient_funds", "card_expired", "network_error", etc.
 	ErrorMsg  string
+	// Permanent marks a hard decline (lost/stolen/expired card, invalid
+	// account): retrying the same saved method cannot succeed, so dunning
+	// stops auto-retrying it. Only gateways that classify declines set it
+	// (Moyasar); false keeps the historical retry-everything behavior.
+	Permanent bool
+}
+
+// GatewayPayment is a server-side read-back of one gateway payment, used to
+// verify a checkout or webhook before settling and to capture the reusable
+// card token the payment created. Moyasar only, today.
+type GatewayPayment struct {
+	ID             string // gateway payment id
+	Status         string // gateway-reported, e.g. "paid", "failed", "initiated"
+	Amount         int64  // minor units
+	RefundedAmount int64  // minor units refunded so far
+	Currency       string // upper-case ISO 4217
+	InvoiceID      string // metadata invoice_id set by Recurso
+	CardToken      string // reusable token created with this payment ("" if none)
+	CardBrand      string // e.g. "mada", "visa"
+	CardLast4      string
+	Message        string // gateway result message (decline reason)
 }
 
 // RefundResult represents the outcome of a gateway refund call.
