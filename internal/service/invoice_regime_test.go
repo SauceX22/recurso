@@ -52,6 +52,8 @@ func TestRegimeForCountry(t *testing.T) {
 		"us": domain.TaxRegimeSalesTax,
 		"DE": domain.TaxRegimeVAT,
 		"GB": domain.TaxRegimeVAT,
+		"SA": domain.TaxRegimeVAT,
+		"AE": domain.TaxRegimePlain,
 		"JP": domain.TaxRegimePlain,
 		"CA": domain.TaxRegimePlain,
 		"AU": domain.TaxRegimePlain,

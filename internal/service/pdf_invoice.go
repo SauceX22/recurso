@@ -331,18 +331,20 @@ func taxLineLabel(country string) string {
 	switch {
 	case strings.EqualFold(country, "US"):
 		return "Sales Tax"
-	case isEUCountry(country):
+	case isVATCountry(country):
 		return "VAT"
 	default:
 		return "Tax"
 	}
 }
 
-func isEUCountry(country string) bool {
+// isVATCountry reports whether a seller country presents invoices under the VAT
+// regime: the EU-27, GB, and SA (KSA VAT).
+func isVATCountry(country string) bool {
 	switch strings.ToUpper(country) {
 	case "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
 		"HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK",
-		"SI", "ES", "SE", "GB":
+		"SI", "ES", "SE", "GB", "SA":
 		return true
 	default:
 		return false
