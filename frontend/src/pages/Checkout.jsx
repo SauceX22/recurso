@@ -19,6 +19,8 @@ const MOYASAR_FORM_BASE =
   "https://cdn.jsdelivr.net/npm/moyasar-payment-form@2.3.0/dist";
 const MOYASAR_CSS = `${MOYASAR_FORM_BASE}/moyasar.css`;
 const MOYASAR_JS = `${MOYASAR_FORM_BASE}/moyasar.umd.min.js`;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Loads the Moyasar form CSS + script once; resolves true when
 // window.Moyasar is available.
@@ -184,7 +186,12 @@ export default function Checkout() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const paymentId = params.get("id");
-    if (params.get("gateway") !== "moyasar" || !paymentId) return;
+    // Our ?gateway=moyasar marker may not survive Moyasar appending its own
+    // params, so also accept the documented redirect shape: a UUID payment id
+    // plus a status.
+    const looksLikeMoyasarReturn =
+      UUID_RE.test(paymentId || "") && params.has("status");
+    if (!paymentId || (params.get("gateway") !== "moyasar" && !looksLikeMoyasarReturn)) return;
     endpoints
       .verifyMoyasarCheckout(id, { payment_id: paymentId })
       .then((res) => {

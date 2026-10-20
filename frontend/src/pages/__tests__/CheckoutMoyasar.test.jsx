@@ -140,6 +140,18 @@ describe("Checkout — Moyasar embedded form", () => {
         expect(verify).toHaveBeenCalledWith(INVOICE_ID, { payment_id: "pay-123" });
     });
 
+    it("recognizes Moyasar's documented redirect even if our gateway marker is dropped", async () => {
+        mockFetch(payResponse());
+        const verify = vi
+            .spyOn(endpoints, "verifyMoyasarCheckout")
+            .mockResolvedValue({ data: { data: { status: "paid" } } });
+        const paymentId = "79cced57-9deb-4c4b-8f48-59c124f79688";
+        renderAt(`?id=${paymentId}&status=paid&message=Succeeded`);
+
+        expect(await screen.findByText(/payment successful/i)).toBeInTheDocument();
+        expect(verify).toHaveBeenCalledWith(INVOICE_ID, { payment_id: paymentId });
+    });
+
     it("never shows paid from the status query param when the server says failed", async () => {
         mockFetch(payResponse());
         vi.spyOn(endpoints, "verifyMoyasarCheckout").mockResolvedValue({
