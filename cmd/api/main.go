@@ -274,6 +274,15 @@ func main() {
 			os.Getenv("ADYEN_MERCHANT_ACCOUNT"), os.Getenv("ADYEN_ENV"), os.Getenv("ADYEN_LIVE_URL_PREFIX")))
 		log.Println("Adyen gateway configured (EXPERIMENTAL — sandbox verification pending)")
 	}
+	// Moyasar (SAR, docs/spec_moyasar.md; EXPERIMENTAL until sandbox-verified):
+	// reachable via GATEWAY_CURRENCY_OVERRIDES="SAR=moyasar". nil when not
+	// configured; every Moyasar wiring below is guarded on it.
+	var moyasarGateway *gateway.MoyasarGateway
+	if key := os.Getenv("MOYASAR_SECRET_KEY"); key != "" && !demo.Enabled() {
+		moyasarGateway = gateway.NewMoyasarGateway(key, getEnvDefault("DASHBOARD_URL", baseURL))
+		paymentGateway.RegisterGateway("moyasar", moyasarGateway)
+		log.Println("Moyasar gateway configured (EXPERIMENTAL — sandbox verification pending)")
+	}
 	if err := paymentGateway.SetCurrencyOverrides(os.Getenv("GATEWAY_CURRENCY_OVERRIDES")); err != nil && !demo.Enabled() {
 		log.Fatalf("Invalid GATEWAY_CURRENCY_OVERRIDES: %v", err)
 	}
@@ -1079,6 +1088,17 @@ func main() {
 		renewalService.SetChargerRouter(savedCardRouter)
 		walletService.SetChargerRouter(savedCardRouter)
 		retryWorker.SetChargerRouter(savedCardRouter)
+	}
+	// Provider-neutral saved methods (Moyasar tokens): consulted before the
+	// Stripe path above and independent of it, so a Stripe-mocked deployment
+	// still autopays SAR renewals, retries and wallet recharges. Renewal needs
+	// only the settler wired by SetSavedMethodCharging (always set above).
+	if moyasarGateway != nil {
+		providerMethods := service.NewProviderSavedMethods(customerRepo)
+		providerMethods.Register(domain.SavedMethodMoyasar, moyasarGateway)
+		renewalService.SetProviderSavedMethods(providerMethods)
+		walletService.SetProviderSavedMethods(providerMethods)
+		retryWorker.SetProviderSavedMethods(providerMethods)
 	}
 	var billingCycleScheduler *scheduler.BillingCycleScheduler
 	billingCycleInterval := 5 * time.Minute
