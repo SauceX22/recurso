@@ -20,6 +20,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { CARD_UPDATE_VIA_INVOICE } from "./cardUpdate";
 
 // finalize posts the confirmed SetupIntent id to the server, which saves the
 // method as the customer's default. Shared by the card and bank flows.
@@ -197,6 +198,7 @@ export default function PortalPaymentMethod({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [unavailable, setUnavailable] = useState(false);
+  const [viaInvoice, setViaInvoice] = useState(false);
   const [done, setDone] = useState(false);
   const [mandateLoading, setMandateLoading] = useState(false);
   const [mandateError, setMandateError] = useState(null);
@@ -239,6 +241,7 @@ export default function PortalPaymentMethod({
     setDone(false);
     setError(null);
     setUnavailable(false);
+    setViaInvoice(false);
     setLoading(true);
     const path = mode === "bank" ? "bank-setup-intent" : "setup-intent";
     fetch(`${apiBase}/portal/api/payment-method/${path}`, {
@@ -250,6 +253,10 @@ export default function PortalPaymentMethod({
         const body = await res.json().catch(() => ({}));
         if (res.status === 503) {
           setUnavailable(true);
+          return null;
+        }
+        if (body?.error?.code === "card_update_unsupported") {
+          if (!cancelled) setViaInvoice(true);
           return null;
         }
         if (!res.ok) throw new Error(body?.error?.message || "Could not start setup");
@@ -281,7 +288,7 @@ export default function PortalPaymentMethod({
         </DialogHeader>
 
         {/* Method selector (hidden once done / on the mandate-only fallback). */}
-        {!done && !unavailable && (
+        {!done && !unavailable && !viaInvoice && (
           <div className="grid grid-cols-2 gap-2">
             <button
               type="button"
@@ -312,6 +319,10 @@ export default function PortalPaymentMethod({
           <div className="flex flex-col items-center py-6 text-center">
             <CheckCircle2 className="mb-2 h-10 w-10 text-success" />
             <p className="text-sm text-muted-foreground">{savedMessage}</p>
+          </div>
+        ) : viaInvoice ? (
+          <div className="mt-4 rounded-md border border-border bg-muted px-3 py-3 text-sm text-foreground">
+            {CARD_UPDATE_VIA_INVOICE}
           </div>
         ) : unavailable ? (
           <div className="mt-4 space-y-3">
