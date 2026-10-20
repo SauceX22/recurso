@@ -1300,6 +1300,11 @@ func main() {
 		GetOrderInvoiceID(ctx context.Context, orderID string) (string, error)
 	})
 	checkoutHandler.SetRazorpay(razorpayVerifier, os.Getenv("RAZORPAY_KEY_ID"))
+	// Moyasar (EXPERIMENTAL): embedded-form checkout, verified server-side.
+	// Guarded so an unconfigured gateway stays a nil interface, not a typed nil.
+	if moyasarGateway != nil {
+		checkoutHandler.SetMoyasar(moyasarGateway, customerRepo, os.Getenv("MOYASAR_PUBLISHABLE_KEY"))
+	}
 	// Buyer name/address on Stripe intents — required by India-region accounts
 	// for foreign-currency (export) charges; harmless elsewhere.
 	checkoutBuyer, _ := stripeGateway.(interface {
@@ -1557,6 +1562,9 @@ func main() {
 	webhookHandler.SetInboundWebhookDedup(db.NewInboundWebhookRepository(database)) // skip redelivered gateway webhooks (ENG-162)
 	webhookHandler.SetGatewayConnections(gatewayConnService)                        // BYO increment 3: per-connection webhook secrets
 	webhookHandler.SetPaymentAttempts(db.NewPaymentAttemptRepository(database))     // ACH async settlement (Inc 3b)
+	if moyasarGateway != nil {
+		webhookHandler.SetMoyasar(moyasarGateway, customerRepo, os.Getenv("MOYASAR_WEBHOOK_SECRET")) // EXPERIMENTAL
+	}
 
 	// Revenue Recognition Handler
 	revrecHandler := handler.NewRevRecHandler(revrecService)
