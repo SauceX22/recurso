@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -777,10 +778,70 @@ func TestMoyasarVerifyPayment(t *testing.T) {
 
 // --- Refund ---
 
+// moyasarRefundJSON is the payment object Moyasar returns for a fetch or a
+// refund, with refunded set.
+func moyasarRefundJSON(refunded int64) string {
+	return fmt.Sprintf(`{"id":%q,"status":"paid","amount":10000,"refunded":%d,"currency":"SAR"}`, moyasarPaymentID, refunded)
+}
+
+// refundServer answers GET /payments/{id} with the refunded total, which the
+// refund POST raises by its amount when applied; refundReply decides the
+// POST's answer (hangUp closes the connection, as a timeout would).
+type refundServer struct {
+	mu       sync.Mutex
+	refunded int64
+	posts    int
+	gets     int
+	getFails bool
+	apply    bool
+	reply    int
+	hangUp   bool
+}
+
+func (s *refundServer) start(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/payments/"+moyasarPaymentID:
+			s.gets++
+			if s.getFails {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			_, _ = w.Write([]byte(moyasarRefundJSON(s.refunded)))
+		case r.Method == http.MethodPost && r.URL.Path == "/payments/"+moyasarPaymentID+"/refund":
+			s.posts++
+			var body struct {
+				Amount int64 `json:"amount"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if s.apply {
+				s.refunded += body.Amount
+			}
+			if s.hangUp {
+				conn, _, _ := w.(http.Hijacker).Hijack()
+				_ = conn.Close()
+				return
+			}
+			w.WriteHeader(s.reply)
+			if s.reply == http.StatusOK {
+				_, _ = w.Write([]byte(moyasarRefundJSON(s.refunded)))
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 func TestMoyasarRefund(t *testing.T) {
 	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
-		"POST /payments/" + moyasarPaymentID + "/refund": {http.StatusOK,
-			`{"id":"` + moyasarPaymentID + `","status":"refunded","amount":10000,"refunded":2500,"currency":"SAR"}`},
+		"GET /payments/" + moyasarPaymentID:              {http.StatusOK, moyasarRefundJSON(1000)},
+		"POST /payments/" + moyasarPaymentID + "/refund": {http.StatusOK, moyasarRefundJSON(3500)},
 	})
 	g := testMoyasar(srv.URL)
 
@@ -788,29 +849,91 @@ func TestMoyasarRefund(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if res.RefundID != moyasarPaymentID || res.Status != "refunded" {
-		t.Fatalf("res = %+v, want RefundID = payment id, Status refunded", res)
+	// Moyasar refunds have no id of their own; payment id + refunded total
+	// after this refund is unique per partial refund of the payment.
+	if res.RefundID != moyasarPaymentID+":3500" || res.Status != "refunded" {
+		t.Fatalf("res = %+v, want RefundID %s:3500, Status refunded", res, moyasarPaymentID)
 	}
-	calls := rec.all()
-	if len(calls) != 1 {
-		t.Fatalf("calls = %d, want exactly 1 (no refund idempotency key: never retry)", len(calls))
+	posts := rec.to(http.MethodPost, "/payments/"+moyasarPaymentID+"/refund")
+	if len(posts) != 1 {
+		t.Fatalf("refund POSTs = %d, want exactly 1 (no refund idempotency key: never retry)", len(posts))
 	}
-	if b := calls[0].body; b["amount"].(float64) != 2500 || len(b) != 1 {
+	if b := posts[0].body; b["amount"].(float64) != 2500 || len(b) != 1 {
 		t.Fatalf("refund body = %v, want exactly {amount: 2500}", b)
 	}
 }
 
 func TestMoyasarRefundFailureMakesOneCall(t *testing.T) {
-	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
-		"POST /payments/" + moyasarPaymentID + "/refund": {http.StatusInternalServerError, ``},
-	})
-	g := testMoyasar(srv.URL)
+	s := &refundServer{reply: http.StatusInternalServerError}
+	g := testMoyasar(s.start(t).URL)
 
 	if _, err := g.Refund(context.Background(), moyasarPaymentID, 2500, "SAR"); err == nil {
-		t.Fatal("a 500 must be an error")
+		t.Fatal("a 500 that applied nothing must be an error")
 	}
-	if n := len(rec.all()); n != 1 {
-		t.Fatalf("calls = %d, want 1: a blind refund retry could refund twice", n)
+	if s.posts != 1 {
+		t.Fatalf("refund POSTs = %d, want 1: a blind refund retry could refund twice", s.posts)
+	}
+}
+
+// A refund whose answer was lost may still have been applied. Reporting it as
+// failed invites a re-issue that refunds the customer twice, so the outcome
+// is read from the payment's refunded total.
+func TestMoyasarRefundLostAnswerReadBack(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		hangUp  bool
+		reply   int
+		apply   bool
+		wantErr bool
+	}{
+		{"timeout, applied", true, 0, true, false},
+		{"5xx, applied", false, http.StatusBadGateway, true, false},
+		{"timeout, not applied", true, 0, false, true},
+		{"5xx, not applied", false, http.StatusBadGateway, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &refundServer{refunded: 1000, hangUp: tc.hangUp, reply: tc.reply, apply: tc.apply}
+			g := testMoyasar(s.start(t).URL)
+
+			res, err := g.Refund(context.Background(), moyasarPaymentID, 2500, "SAR")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("res = %+v, want an error when the refund didn't apply", res)
+				}
+			} else if err != nil || res.RefundID != moyasarPaymentID+":3500" || res.Status != "refunded" {
+				t.Fatalf("res = %+v, err = %v; want the applied refund", res, err)
+			}
+			if s.posts != 1 || s.gets != 2 {
+				t.Fatalf("POSTs=%d GETs=%d, want 1 refund, a baseline and one read-back", s.posts, s.gets)
+			}
+		})
+	}
+}
+
+// Without a baseline the outcome of a lost answer can't be told, so no
+// refund is attempted.
+func TestMoyasarRefundBaselineFailureRefundsNothing(t *testing.T) {
+	s := &refundServer{getFails: true, reply: http.StatusOK}
+	g := testMoyasar(s.start(t).URL)
+
+	if _, err := g.Refund(context.Background(), moyasarPaymentID, 2500, "SAR"); err == nil {
+		t.Fatal("want an error when the payment can't be read")
+	}
+	if s.posts != 0 {
+		t.Fatalf("refund POSTs = %d, want 0", s.posts)
+	}
+}
+
+// Moyasar refusing the refund (e.g. more than is left) is definitive.
+func TestMoyasarRefundRejectedNoReadBack(t *testing.T) {
+	s := &refundServer{refunded: 9000, reply: http.StatusBadRequest}
+	g := testMoyasar(s.start(t).URL)
+
+	if _, err := g.Refund(context.Background(), moyasarPaymentID, 2500, "SAR"); err == nil {
+		t.Fatal("a rejected refund must be an error")
+	}
+	if s.posts != 1 || s.gets != 1 {
+		t.Fatalf("POSTs=%d GETs=%d, want the baseline and one refund only", s.posts, s.gets)
 	}
 }
 

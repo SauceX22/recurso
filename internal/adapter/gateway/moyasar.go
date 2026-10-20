@@ -400,9 +400,12 @@ func (g *MoyasarGateway) VerifyPayment(ctx context.Context, orderID, paymentID, 
 }
 
 // Refund refunds (part of) a payment. Moyasar has no refund idempotency key,
-// so the adapter makes exactly one call and never retries: a blind retry after
-// a timeout could refund twice. The refund has no id of its own; the payment
-// id is returned.
+// so the adapter makes exactly one refund call and never retries: a blind
+// retry after a timeout could refund twice. Instead, when the answer is lost
+// (transport error or 5xx) it compares the payment's refunded total with the
+// one read before the call. Moyasar refunds have no id of their own, so
+// RefundID is "<payment id>:<refunded total after this refund>", which is
+// unique per partial refund of a payment.
 func (g *MoyasarGateway) Refund(ctx context.Context, paymentID string, amount int64, currency string) (*port.RefundResult, error) {
 	if paymentID == "" {
 		return nil, errors.New("moyasar refund: payment id is required")
@@ -410,12 +413,30 @@ func (g *MoyasarGateway) Refund(ctx context.Context, paymentID string, amount in
 	if amount <= 0 {
 		return nil, fmt.Errorf("moyasar refund: amount must be positive, got %d", amount)
 	}
-	var out moyasarPayment
-	if err := g.do(ctx, http.MethodPost, "/payments/"+url.PathEscape(paymentID)+"/refund",
-		map[string]any{"amount": amount}, &out); err != nil {
-		return nil, err
+	before, err := g.fetch(ctx, paymentID)
+	if err != nil {
+		return nil, fmt.Errorf("moyasar refund: read payment before refunding: %w", err)
 	}
-	return &port.RefundResult{RefundID: paymentID, Status: "refunded"}, nil
+	var out moyasarPayment
+	err = g.do(ctx, http.MethodPost, "/payments/"+url.PathEscape(paymentID)+"/refund",
+		map[string]any{"amount": amount}, &out)
+	var apiErr *moyasarAPIError
+	if err != nil && errors.As(err, &apiErr) && apiErr.StatusCode < http.StatusInternalServerError {
+		return nil, err // Moyasar answered: the refund was refused.
+	}
+	if err != nil {
+		// The answer was lost; the refund may still have been applied. Read
+		// the payment back even if ctx has expired.
+		after, ferr := g.fetch(context.WithoutCancel(ctx), paymentID)
+		if ferr != nil {
+			return nil, fmt.Errorf("moyasar refund outcome unknown (do not retry before checking the payment): %w; read-back: %w", err, ferr)
+		}
+		if after.Refunded < before.Refunded+amount {
+			return nil, fmt.Errorf("moyasar refund not applied: %w", err)
+		}
+		out = *after
+	}
+	return &port.RefundResult{RefundID: fmt.Sprintf("%s:%d", paymentID, out.Refunded), Status: "refunded"}, nil
 }
 
 // OwnsPaymentID reports whether id looks like a Moyasar payment id (a bare
