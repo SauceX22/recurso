@@ -17,6 +17,9 @@ const (
 	GatewayStripe     GatewayProvider = "stripe"
 	GatewayRazorpay   GatewayProvider = "razorpay"
 	GatewayGoCardless GatewayProvider = "gocardless"
+	// GatewayMoyasar is env-configured only for now: not connectable (BYO),
+	// so it is deliberately absent from ValidGatewayProvider.
+	GatewayMoyasar GatewayProvider = "moyasar"
 )
 
 // ValidGatewayProvider reports whether p is a connectable provider.
