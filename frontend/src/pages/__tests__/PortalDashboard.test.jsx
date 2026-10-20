@@ -8,7 +8,7 @@ import PortalDashboard from "../portal/PortalDashboard";
 // per-URL. jsdom lacks localStorage in this config; some transitive imports
 // touch it.
 const store = {};
-vi.stubGlobal("localStorage", {
+const fakeLocalStorage = {
   getItem: (k) => (k in store ? store[k] : null),
   setItem: (k, v) => {
     store[k] = String(v);
@@ -19,7 +19,7 @@ vi.stubGlobal("localStorage", {
   clear: () => {
     for (const k in store) delete store[k];
   },
-});
+};
 
 const json = (data) =>
   Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(data) });
@@ -36,19 +36,51 @@ const invoices = [
   { id: "i4", status: "open", total: 3000, amount_paid: 0, credit_applied: 3000, currency: "USD", invoice_number: "INV-4", created_at: "2026-08-01T00:00:00Z" },
 ];
 
+const stubPortal = (profile = { name: "Test Cust", email: "t@t.com" }) =>
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((url) => {
+      const u = String(url);
+      if (u.includes("/portal/api/profile")) return json(profile);
+      if (u.includes("/portal/api/invoices")) return json({ data: invoices });
+      if (u.includes("/portal/api/disputes")) return json({ data: [] });
+      return json({});
+    })
+  );
+
 beforeEach(() => {
-  global.fetch = vi.fn((url) => {
-    const u = String(url);
-    if (u.includes("/portal/api/profile")) return json({ name: "Test Cust", email: "t@t.com" });
-    if (u.includes("/portal/api/invoices")) return json({ data: invoices });
-    if (u.includes("/portal/api/disputes")) return json({ data: [] });
-    return json({});
-  });
+  vi.stubGlobal("localStorage", fakeLocalStorage);
+  stubPortal();
 });
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+describe("PortalDashboard payment-method update", () => {
+  const renderDashboard = () =>
+    render(
+      <MemoryRouter>
+        <PortalDashboard />
+      </MemoryRouter>
+    );
+
+  it("offers the card-update dialog for a Stripe-saved card", async () => {
+    stubPortal({ name: "Test Cust", payment_method: { provider: "stripe" } });
+    renderDashboard();
+    expect(await screen.findByRole("button", { name: /update payment method/i })).toBeInTheDocument();
+    expect(screen.queryByText(/pay your next open invoice/i)).toBeNull();
+  });
+
+  it("replaces the update button with pay-an-invoice guidance for a Moyasar card", async () => {
+    stubPortal({ name: "Test Cust", payment_method: { provider: "moyasar" } });
+    renderDashboard();
+    expect(await screen.findByText(/pay your next open invoice/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /update payment method/i })).toBeNull();
+    expect(screen.getByRole("link", { name: /pay INV-3/i })).toHaveAttribute("href", "/checkout/i3");
+  });
 });
 
 // Regression lock for the portal money bug: Total Paid / Outstanding used to
