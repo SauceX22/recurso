@@ -4068,6 +4068,64 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /checkout/{id}/moyasar/verify:
+    post:
+      operationId: checkoutMoyasarVerify
+      tags: [Checkout]
+      summary: Verify a Moyasar checkout payment and settle the invoice
+      description: >
+        Called by the hosted checkout when the Moyasar embedded form returns to
+        the page (`?id=<payment_id>&status=...`). The server re-fetches the
+        payment from Moyasar with the secret key and settles only when it is
+        `paid` and bound to this invoice (metadata `invoice_id`, currency, and
+        an amount covering the balance due), then records the gateway payment
+        id and saves the card token. The browser alone can never mark an
+        invoice paid; the `payment_paid` webhook remains the authoritative
+        backstop.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/PathID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [payment_id]
+              properties:
+                payment_id:
+                  type: string
+                  description: Moyasar payment id from the form's return URL.
+      responses:
+        '200':
+          description: Invoice settled (idempotent — already-paid invoices report paid).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      status:
+                        type: string
+                        const: paid
+                      invoice_id:
+                        type: string
+                        format: uuid
+                      invoice_number:
+                        type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          description: Moyasar checkout isn't available on this deployment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /payments/order:
     post:
       operationId: createPaymentOrder
@@ -4334,6 +4392,76 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+
+  /webhooks/moyasar:
+    post:
+      operationId: handleMoyasarWebhook
+      tags: [Inbound Webhooks]
+      summary: Moyasar webhook receiver (platform account)
+      description: |
+        Receives Moyasar webhook deliveries for the platform's Moyasar account.
+        Moyasar sends no signature header; the delivery is authenticated by
+        the shared secret it echoes in the body as `secret_token`, compared in
+        constant time against `MOYASAR_WEBHOOK_SECRET` (503 when unset, 401 on
+        mismatch). The body is never trusted for settlement: `payment_paid`
+        re-fetches the payment from Moyasar and settles the invoice only when
+        that read-back is `paid` and bound to the invoice. `payment_failed`
+        and `payment_refunded` are acknowledged; other events are ignored.
+        Deliveries are deduplicated on the event `id`.
+        Called by Moyasar, not by API consumers.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, type, secret_token, data]
+              properties:
+                id:
+                  type: string
+                  description: Moyasar event id (dedup key).
+                type:
+                  type: string
+                  description: Event type, e.g. `payment_paid`.
+                secret_token:
+                  type: string
+                  description: Shared secret configured on the Moyasar webhook.
+                live:
+                  type: boolean
+                data:
+                  type: object
+                  description: Moyasar payment object; only `id` is read.
+      responses:
+        '200':
+          description: Event processed, acknowledged, or ignored.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok, ignored, duplicate ignored]
+                  reason:
+                    type: string
+                    description: Present when the event was ignored.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: The payment could not be fetched from Moyasar; the delivery is retried.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Webhook secret not configured, or the dedup store is unavailable; the delivery is retried.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /webhooks/razorpay/{connID}:
     post:
