@@ -145,7 +145,7 @@ func (w *RetryWorker) savedMethodCharger(ctx context.Context, inv *domain.Invoic
 	if err != nil || !m.Chargeable() {
 		return nil, domain.SavedPaymentMethod{}, false
 	}
-	var router savedCardChargerRouter = w.chargerRouter
+	router := w.chargerRouter
 	if router == nil {
 		router = service.NewSavedCardGatewayRouter(nil, nil, w.savedCharger)
 	}
