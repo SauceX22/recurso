@@ -61,7 +61,7 @@ them — including ones its own authors introduced. That is the point.
 - Automatic and one-off invoicing with jurisdiction-aware tax and printable/e-invoice-ready PDFs
 - Hosted checkout — real card + ACH collection via the Stripe Payment Element, and UPI/cards/netbanking via Razorpay, with server-verified settlement
 - Customer self-service portal — magic-link login (httpOnly-cookie session), card update (Stripe SetupIntent), UPI mandate re-authorization, invoice history
-- Payments — multi-currency routing (INR → Razorpay, EUR/GBP mandates → GoCardless bank debit, US ACH → Stripe, others → Stripe or Adyen), prepaid wallets with auto-recharge, and **bring-your-own-gateway**: connect your own Stripe/Razorpay/GoCardless so recurring autopay (renewal, dunning, wallet) settles in *your* account
+- Payments — multi-currency routing (INR → Razorpay, EUR/GBP mandates → GoCardless bank debit, US ACH → Stripe, SAR → Moyasar (experimental), others → Stripe or Adyen), prepaid wallets with auto-recharge, and **bring-your-own-gateway**: connect your own Stripe/Razorpay/GoCardless so recurring autopay (renewal, dunning, wallet) settles in *your* account
 - Smart dunning — a multi-armed-bandit retry engine plus multi-channel recovery campaigns and recovery attribution, with a **Collections Intelligence** operator layer (worklist, analytics, manual controls, timing) on top
 - Disputes & chargebacks — customer-raised invoice disputes with an accept/reject review workflow (accepting can issue a resolution credit note in one step), plus provider-webhook-driven gateway chargebacks with automatic ledger reversal
 - Tax & e-invoicing — India GST (Place of Supply, HSN, TDS, IRN e-invoicing via GSP), EU VAT (reverse charge + VIES) with **EN 16931 / UBL e-invoice export**, US sales tax (TaxJar/Avalara/Ziptax) with economic-nexus threshold tracking
@@ -117,7 +117,7 @@ not feature checkboxes both sides can tick.
 ```
 Go (Gin) API  -->  PostgreSQL (state + authoritative double-entry ledger)
       |
-      +--> Stripe / Razorpay / GoCardless / Adyen (payments)
+      +--> Stripe / Razorpay / GoCardless / Adyen / Moyasar (payments)
       +--> Accounting sync (QuickBooks / Xero / NetSuite / Tally) + HubSpot CRM
       +--> Email notifications
       +--> Webhooks (inbound provider events + outbound delivery tracking)
