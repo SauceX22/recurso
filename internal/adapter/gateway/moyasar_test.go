@@ -606,7 +606,7 @@ func TestMoyasarCreateOrderNoHTTP(t *testing.T) {
 	}
 }
 
-func TestMoyasarRetryPaymentIsPermanent(t *testing.T) {
+func TestMoyasarRetryPaymentReportsNoSavedMethod(t *testing.T) {
 	srv, rec := moyasarTestServer(t, nil)
 	g := testMoyasar(srv.URL)
 
@@ -614,8 +614,10 @@ func TestMoyasarRetryPaymentIsPermanent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if res.Success || !res.Permanent || res.ErrorCode != "no_saved_payment_method" {
-		t.Fatalf("res = %+v, want permanent no_saved_payment_method so dunning stops retrying", res)
+	// Not a decline: the customer may still save a card or pay the link, so
+	// dunning must keep emailing rather than stop.
+	if res.Success || res.Permanent || res.ErrorCode != port.ErrCodeNoSavedMethod {
+		t.Fatalf("res = %+v, want a non-permanent %s failure", res, port.ErrCodeNoSavedMethod)
 	}
 	if len(rec.all()) != 0 {
 		t.Fatal("RetryPayment must not call Moyasar")

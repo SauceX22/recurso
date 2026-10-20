@@ -463,7 +463,7 @@ func (s *StripeGateway) CancelSubscription(ctx context.Context, subscriptionID s
 func (s *StripeGateway) RetryPayment(ctx context.Context, invoiceID string, amount int64, currency string) (*port.PaymentResult, error) {
 	return &port.PaymentResult{
 		Success:   false,
-		ErrorCode: "no_saved_payment_method",
+		ErrorCode: port.ErrCodeNoSavedMethod,
 		ErrorMsg:  "off-session retry requires a saved payment method; none on file for this customer",
 	}, nil
 }

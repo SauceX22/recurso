@@ -38,9 +38,16 @@ type savedCardChargerRouter interface {
 	ChargerFor(ctx context.Context, m domain.SavedPaymentMethod, currency string) (service.SavedCardCharger, error)
 }
 
+// retryDecider schedules the next retry and learns from outcomes. Implemented
+// by *service.SmartRetryService.
+type retryDecider interface {
+	DecideRetry(ctx context.Context, inv *domain.Invoice, errorCode string) *service.RetryDecision
+	RecordOutcome(ctx context.Context, history domain.DunningHistory) error
+}
+
 type RetryWorker struct {
 	invoiceRepo            port.InvoiceRepository
-	retryService           *service.SmartRetryService
+	retryService           retryDecider
 	gateway                port.PaymentGateway
 	notifier               port.Notifier
 	dunningCampaignService *service.DunningCampaignService
@@ -53,7 +60,7 @@ type RetryWorker struct {
 
 func NewRetryWorker(
 	invoiceRepo port.InvoiceRepository,
-	retryService *service.SmartRetryService,
+	retryService retryDecider,
 	gateway port.PaymentGateway,
 	notifier port.Notifier,
 ) *RetryWorker {
@@ -206,6 +213,16 @@ func (w *RetryWorker) processInvoice(ctx context.Context, inv *domain.Invoice) {
 		return
 	}
 
+	// Nothing chargeable off-session: a retry can't collect, so neither
+	// schedule one nor stop dunning — the email ladder and pay link take over.
+	// The bandit learns nothing about retry timing from this, so no outcome.
+	if !result.Success && result.ErrorCode == port.ErrCodeNoSavedMethod {
+		slog.Info("retry worker: no saved payment method, handing invoice to email dunning", "invoice_number", inv.InvoiceNumber)
+		inv.LastPaymentError = result.ErrorCode
+		w.stopRetries(ctx, inv, domain.InvoiceStatusPastDue, dunningManagedByScheduler)
+		return
+	}
+
 	// 2. Record outcome for the PREVIOUS action (if one was tracked)
 	if inv.DunningActionID != "" && inv.DunningContextKey != "" {
 		outcome := "failure"
@@ -303,34 +320,18 @@ func (w *RetryWorker) processInvoice(ctx context.Context, inv *domain.Invoice) {
 	}
 	inv.LastPaymentError = errorCode
 
-	// Hard decline (lost/stolen/expired card, no saved method): retrying the
-	// same method cannot succeed, so stop auto-retries. The invoice stays
-	// past_due with no next retry; dunning emails and the checkout link are the
-	// recovery path. Only gateways that classify declines set Permanent
-	// (Moyasar); Stripe never does, so its flow below is unchanged.
+	// Hard decline: retrying the same method cannot succeed, so stop charging
+	// it and let the email ladder (pay link, escalation) take over.
 	if result.Permanent {
-		slog.Warn("retry worker: hard decline, stopping auto-retries", "invoice_number", inv.InvoiceNumber, "error_code", errorCode)
-		inv.Status = domain.InvoiceStatusPastDue
-		inv.NextRetryAt = nil
-		inv.DunningActionID = ""
-		inv.DunningContextKey = ""
-		if updateErr := w.invoiceRepo.Update(ctx, inv); updateErr != nil {
-			slog.Error("retry worker: failed to update invoice", "invoice_id", inv.ID, "error", updateErr)
-		}
+		slog.Warn("retry worker: hard decline, handing invoice to email dunning", "invoice_number", inv.InvoiceNumber, "error_code", errorCode)
+		w.stopRetries(ctx, inv, domain.InvoiceStatusPastDue, dunningManagedByScheduler)
 		return
 	}
 
 	decision := w.retryService.DecideRetry(ctx, inv, errorCode)
 	if decision == nil {
-		// Max retries reached
 		slog.Warn("retry worker: max retries reached, marking uncollectible", "invoice_number", inv.InvoiceNumber)
-		inv.Status = domain.InvoiceStatusUncollectible
-		inv.NextRetryAt = nil
-		inv.DunningActionID = ""
-		inv.DunningContextKey = ""
-		if updateErr := w.invoiceRepo.Update(ctx, inv); updateErr != nil {
-			slog.Error("retry worker: failed to mark invoice uncollectible", "invoice_id", inv.ID, "error", updateErr)
-		}
+		w.stopRetries(ctx, inv, domain.InvoiceStatusUncollectible, "")
 		return
 	}
 
@@ -343,6 +344,27 @@ func (w *RetryWorker) processInvoice(ctx context.Context, inv *domain.Invoice) {
 
 	if updateErr := w.invoiceRepo.Update(ctx, inv); updateErr != nil {
 		slog.Error("retry worker: failed to update invoice", "invoice_id", inv.ID, "error", updateErr)
+	}
+}
+
+// dunningManagedByScheduler puts an invoice on the dunning scheduler's email
+// ladder (ClaimOverdueForDunning) instead of the worker's retry claim.
+const dunningManagedByScheduler = "scheduler"
+
+// stopRetries ends worker-driven retries of inv: no next retry and no pending
+// dunning action. A non-empty managedBy hands the invoice to that dunning
+// owner; the scheduler then keeps emailing and escalates it to uncollectible
+// on schedule.
+func (w *RetryWorker) stopRetries(ctx context.Context, inv *domain.Invoice, status domain.InvoiceStatus, managedBy string) {
+	inv.Status = status
+	inv.NextRetryAt = nil
+	inv.DunningActionID = ""
+	inv.DunningContextKey = ""
+	if managedBy != "" {
+		inv.DunningManagedBy = managedBy
+	}
+	if err := w.invoiceRepo.Update(ctx, inv); err != nil {
+		slog.Error("retry worker: failed to stop retries", "invoice_id", inv.ID, "status", status, "error", err)
 	}
 }
 

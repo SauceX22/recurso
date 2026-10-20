@@ -284,14 +284,13 @@ func mapMoyasarCharge(p *moyasarPayment) *port.PaymentResult {
 }
 
 // RetryPayment cannot charge anything: without a saved token there is no
-// off-session payment, so the result is permanent and the customer pays via
-// the checkout link instead of being retried every tick. No HTTP call.
+// off-session payment, so it reports the missing method and dunning keeps
+// emailing the pay link. No HTTP call.
 func (g *MoyasarGateway) RetryPayment(ctx context.Context, invoiceID string, amount int64, currency string) (*port.PaymentResult, error) {
 	return &port.PaymentResult{
 		Success:   false,
-		ErrorCode: "no_saved_payment_method",
+		ErrorCode: port.ErrCodeNoSavedMethod,
 		ErrorMsg:  "moyasar charges need a saved card token",
-		Permanent: true,
 	}, nil
 }
 

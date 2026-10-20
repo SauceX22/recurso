@@ -32,34 +32,65 @@ func newTestRetryService() *service.SmartRetryService {
 	return service.NewSmartRetryService(&mockDunningRepo{weights: map[string]domain.DunningWeight{}})
 }
 
-// TestRetryWorker_PermanentDeclineStopsRetries: a hard decline leaves the
-// invoice past_due with no next retry and never consults DecideRetry. The
-// worker runs with a nil SmartRetryService, so reaching DecideRetry would
-// panic.
-func TestRetryWorker_PermanentDeclineStopsRetries(t *testing.T) {
+// countingDecider is a retry decider that counts calls and never schedules.
+type countingDecider struct {
+	decides  int
+	outcomes []domain.DunningHistory
+}
+
+func (d *countingDecider) DecideRetry(context.Context, *domain.Invoice, string) *service.RetryDecision {
+	d.decides++
+	return nil
+}
+
+func (d *countingDecider) RecordOutcome(_ context.Context, h domain.DunningHistory) error {
+	d.outcomes = append(d.outcomes, h)
+	return nil
+}
+
+// assertHandedToEmailDunning checks the invoice is back on the dunning
+// scheduler's email ladder: no worker retry pending and managed by the
+// scheduler, so ClaimOverdueForDunning picks it up and it can still escalate
+// to uncollectible.
+func assertHandedToEmailDunning(t *testing.T, got *domain.Invoice) {
+	t.Helper()
+	if got.Status != domain.InvoiceStatusPastDue {
+		t.Fatalf("status = %s, want past_due", got.Status)
+	}
+	if got.NextRetryAt != nil {
+		t.Fatalf("NextRetryAt = %v, want nil (no auto-retry pending)", got.NextRetryAt)
+	}
+	if got.DunningManagedBy != "scheduler" {
+		t.Fatalf("DunningManagedBy = %q, want scheduler (else neither claim ever picks it up again)", got.DunningManagedBy)
+	}
+	if got.DunningActionID != "" || got.DunningContextKey != "" {
+		t.Fatalf("dunning action not cleared: %q/%q", got.DunningActionID, got.DunningContextKey)
+	}
+}
+
+// TestRetryWorker_PermanentDeclineHandsInvoiceToEmailDunning: a hard decline
+// stops auto-retries without deciding a next one, and hands the invoice back
+// to email dunning instead of orphaning it.
+func TestRetryWorker_PermanentDeclineHandsInvoiceToEmailDunning(t *testing.T) {
 	inv := pastDueSARInvoice(1)
 	inv.DunningActionID = "" // no previous action → RecordOutcome is skipped too
 	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
 	gw := &mockGateway{result: &port.PaymentResult{Success: false, ErrorCode: "expired_card", Permanent: true}}
+	decider := &countingDecider{}
 
-	w := NewRetryWorker(repo, nil, gw, &mockNotifier{})
+	w := NewRetryWorker(repo, decider, gw, &mockNotifier{})
 	w.processRetries(context.Background())
 
 	if len(repo.updated) != 1 {
 		t.Fatalf("updates = %d, want 1", len(repo.updated))
 	}
 	got := repo.updated[0]
-	if got.Status != domain.InvoiceStatusPastDue {
-		t.Fatalf("status = %s, want past_due", got.Status)
-	}
-	if got.NextRetryAt != nil {
-		t.Fatalf("NextRetryAt = %v, want nil (auto-retries stopped)", got.NextRetryAt)
-	}
+	assertHandedToEmailDunning(t, got)
 	if got.LastPaymentError != "expired_card" || got.RetryCount != 2 {
 		t.Fatalf("LastPaymentError=%q RetryCount=%d, want expired_card/2", got.LastPaymentError, got.RetryCount)
 	}
-	if got.DunningActionID != "" || got.DunningContextKey != "" {
-		t.Fatalf("dunning action not cleared: %q/%q", got.DunningActionID, got.DunningContextKey)
+	if decider.decides != 0 {
+		t.Fatalf("DecideRetry called %d times after a hard decline, want 0", decider.decides)
 	}
 }
 
@@ -79,9 +110,34 @@ func TestRetryWorker_PermanentDeclineStillRecordsPreviousOutcome(t *testing.T) {
 	if len(dunningRepo.history) != 1 || dunningRepo.history[0].Outcome != "failure" {
 		t.Fatalf("history = %+v, want one failure outcome", dunningRepo.history)
 	}
+	assertHandedToEmailDunning(t, repo.updated[0])
+}
+
+// TestRetryWorker_NoSavedMethodHandsInvoiceToEmailDunning: with nothing to
+// charge off-session, the worker neither reschedules a pointless retry nor
+// stops dunning; the invoice goes back to the email ladder, and the bandit is
+// not fed an outcome that says nothing about the retry timing.
+func TestRetryWorker_NoSavedMethodHandsInvoiceToEmailDunning(t *testing.T) {
+	inv := pastDueSARInvoice(1)
+	inv.DunningActionID = "24h"
+	inv.DunningContextKey = "SAR:insufficient_funds"
+	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
+	gw := &mockGateway{result: &port.PaymentResult{Success: false, ErrorCode: port.ErrCodeNoSavedMethod}}
+	decider := &countingDecider{}
+
+	w := NewRetryWorker(repo, decider, gw, &mockNotifier{})
+	w.processRetries(context.Background())
+
+	if len(repo.updated) != 1 {
+		t.Fatalf("updates = %d, want 1", len(repo.updated))
+	}
 	got := repo.updated[0]
-	if got.NextRetryAt != nil || got.Status != domain.InvoiceStatusPastDue || got.DunningActionID != "" {
-		t.Fatalf("invoice = %+v, want past_due, no retry, action cleared", got)
+	assertHandedToEmailDunning(t, got)
+	if got.RetryCount != 1 {
+		t.Fatalf("RetryCount = %d, want 1 (no charge was attempted)", got.RetryCount)
+	}
+	if decider.decides != 0 || len(decider.outcomes) != 0 {
+		t.Fatalf("decides=%d outcomes=%d, want 0/0", decider.decides, len(decider.outcomes))
 	}
 }
 
