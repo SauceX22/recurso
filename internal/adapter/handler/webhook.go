@@ -29,7 +29,10 @@ type WebhookHandler struct {
 	inboundDedup           InboundWebhookDedup // nil-safe; when unset, dedup is skipped
 	paymentAttempts        paymentAttemptStore // nil-safe; ACH async settlement state (Inc 3b)
 	stripeWebhookSecret    string
-	gatewayConns           gatewayConnResolver // nil-safe; per-connection (BYO) webhook secrets
+	gatewayConns           gatewayConnResolver   // nil-safe; per-connection (BYO) webhook secrets
+	moyasarFetcher         moyasarPaymentFetcher // nil-safe; Moyasar payment read-back (SetMoyasar)
+	moyasarCards           gatewayCardSaver      // nil-safe; saves the Moyasar card token
+	moyasarWebhookSecret   string                // shared secret echoed as secret_token
 	logger                 *slog.Logger
 }
 
