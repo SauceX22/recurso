@@ -226,9 +226,11 @@ func (s *DunningScheduler) processInvoice(ctx context.Context, invoice domain.Ov
 		} else {
 			slog.Info("marked invoice as uncollectible", "invoice_number", invoice.InvoiceNumber, "days_overdue", daysOverdue)
 			if s.writeOffLedger != nil && s.writeOffReader != nil {
-				if full, ferr := s.writeOffReader.GetByID(ctx, invoice.ID); ferr != nil || full == nil {
+				// The sweep runs on a background ctx; the tenant-scoped invoice read fails closed without the claimed row's tenant.
+				tctx := context.WithValue(ctx, domain.TenantIDKey, invoice.TenantID)
+				if full, ferr := s.writeOffReader.GetByID(tctx, invoice.ID); ferr != nil || full == nil {
 					slog.Error("write-off ledger reversal skipped: invoice lookup failed", "invoice_number", invoice.InvoiceNumber, "error", ferr)
-				} else if lerr := s.writeOffLedger.RecordInvoiceWriteOff(ctx, full); lerr != nil {
+				} else if lerr := s.writeOffLedger.RecordInvoiceWriteOff(tctx, full); lerr != nil {
 					slog.Error("write-off ledger reversal failed", "invoice_number", invoice.InvoiceNumber, "error", lerr)
 				}
 			}
