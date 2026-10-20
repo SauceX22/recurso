@@ -381,12 +381,15 @@ func (r *CustomerRepository) SetStripeCustomerID(ctx context.Context, customerID
 // for future invoices, and refreshes the card display fields in one write.
 // gatewayConnectionID records which gateway connection the card was saved on
 // (B1 autopay): nil means the platform gateway; a value means that BYO
-// connection, so off-session charges route to the same gateway.
+// connection, so off-session charges route to the same gateway. It also resets
+// pm_provider to NULL (Stripe): a customer who previously saved a Moyasar token
+// and now saves a Stripe card routes back to Stripe.
 func (r *CustomerRepository) SetDefaultPaymentMethod(ctx context.Context, customerID uuid.UUID, paymentMethodID, brand, last4 string, expMonth, expYear int, gatewayConnectionID *uuid.UUID) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE customers
 		    SET default_payment_method = $1, card_brand = $2, card_last4 = $3,
-		        card_exp_month = $4, card_exp_year = $5, pm_gateway_connection_id = $6
+		        card_exp_month = $4, card_exp_year = $5, pm_gateway_connection_id = $6,
+		        pm_provider = NULL
 		  WHERE id = $7`,
 		paymentMethodID, brand, last4, expMonth, expYear, gatewayConnectionID, customerID)
 	return err
@@ -401,6 +404,61 @@ func (r *CustomerRepository) GetSavedPaymentMethod(ctx context.Context, customer
 		`SELECT COALESCE(stripe_customer_id, ''), COALESCE(default_payment_method, ''), pm_gateway_connection_id
 		   FROM customers WHERE id = $1`, customerID).Scan(&stripeCustomerID, &paymentMethodID, &gatewayConnectionID)
 	return
+}
+
+// GetSavedGatewayMethod returns the customer's saved off-session method with
+// the gateway that issued it (pm_provider; "" = Stripe). Provider-neutral
+// sibling of GetSavedPaymentMethod.
+//
+// Tenant scoping: when ctx carries a tenant the lookup filters by it. The
+// renewal, dunning and wallet sweeps run without a tenant in ctx and pass the
+// customer_id of a row they already claimed under its tenant, so for them the
+// lookup is by primary key only (same as GetSavedPaymentMethod).
+func (r *CustomerRepository) GetSavedGatewayMethod(ctx context.Context, customerID uuid.UUID) (domain.SavedPaymentMethod, error) {
+	query := `SELECT pm_provider, stripe_customer_id, default_payment_method, pm_gateway_connection_id
+		   FROM customers WHERE id = $1`
+	args := []interface{}{customerID}
+	if tenantID, ok := ctx.Value(domain.TenantIDKey).(uuid.UUID); ok {
+		query += ` AND tenant_id = $2`
+		args = append(args, tenantID)
+	}
+	var provider, customerRef, methodRef sql.NullString
+	var m domain.SavedPaymentMethod
+	if err := r.db.QueryRowContext(ctx, query, args...).Scan(&provider, &customerRef, &methodRef, &m.GatewayConnectionID); err != nil {
+		return domain.SavedPaymentMethod{}, err
+	}
+	m.Provider = provider.String
+	m.CustomerRef = customerRef.String
+	m.PaymentMethodRef = methodRef.String
+	return m, nil
+}
+
+// SetGatewayPaymentMethod records a non-Stripe reusable method (e.g. a Moyasar
+// token_*) as the customer's default: the reference, the card display fields
+// and the issuing provider. The expiry is cleared (the stored one belonged to
+// the previous card, and the card-expiry notifier must not mail about it), and
+// pm_gateway_connection_id is cleared because the method lives on the platform
+// gateway. stripe_customer_id is left untouched. Scoped by tenant_id; returns
+// sql.ErrNoRows when no row matched.
+func (r *CustomerRepository) SetGatewayPaymentMethod(ctx context.Context, tenantID, customerID uuid.UUID, provider, paymentMethodRef, brand, last4 string) error {
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE customers
+		    SET default_payment_method = $1, card_brand = $2, card_last4 = $3,
+		        card_exp_month = NULL, card_exp_year = NULL,
+		        pm_provider = $4, pm_gateway_connection_id = NULL
+		  WHERE id = $5 AND tenant_id = $6`,
+		paymentMethodRef, brand, last4, provider, customerID, tenantID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // CustomerWithExpiringCard holds customer info for card expiry notifications
