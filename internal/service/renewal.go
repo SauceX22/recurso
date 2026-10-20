@@ -140,6 +140,9 @@ func (s *RenewalService) ProcessDueRenewals(ctx context.Context) (int, error) {
 //     elapsed period's usage, the period advances via the anchor-preserving
 //     CalculateNextBillingDate, and payment is attempted best-effort.
 func (s *RenewalService) RenewSubscription(ctx context.Context, sub *domain.Subscription) error {
+	// The billing-cycle sweep runs on a tenantless background context, but the
+	// plan lookup, invoice generation and settlement are all tenant-scoped.
+	ctx = context.WithValue(ctx, domain.TenantIDKey, sub.TenantID)
 	now := s.now()
 
 	if sub.CancelAtPeriodEnd {
@@ -233,10 +236,7 @@ func (s *RenewalService) attemptPayment(ctx context.Context, inv *domain.Invoice
 			"invoice_id", inv.ID, "error", err)
 		return
 	}
-	// The billing-cycle sweep's context carries no tenant; settle under the
-	// invoice's own so the tenant-scoped invoice lookup succeeds.
-	tenantCtx := context.WithValue(ctx, domain.TenantIDKey, inv.TenantID)
-	if _, err := s.settler.MarkInvoicePaid(tenantCtx, inv.ID); err != nil {
+	if _, err := s.settler.MarkInvoicePaid(ctx, inv.ID); err != nil {
 		slog.ErrorContext(ctx, "renewal charge succeeded but settlement failed (webhook will reconcile)",
 			"invoice_id", inv.ID, "error", err)
 	}

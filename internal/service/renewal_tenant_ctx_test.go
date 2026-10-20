@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/recurso-dev/recurso/internal/core/domain"
 	"github.com/recurso-dev/recurso/internal/core/port"
+	"github.com/recurso-dev/recurso/internal/core/port/porttest"
 )
 
 // tenantCheckingSettler mimics *SubscriptionService.MarkInvoicePaid's real
@@ -48,5 +50,40 @@ func TestRenewSubscription_SettlesWithInvoiceTenant(t *testing.T) {
 	}
 	if settler.gotTenant != sub.TenantID {
 		t.Fatalf("settled under tenant %v, want the invoice's tenant %v", settler.gotTenant, sub.TenantID)
+	}
+}
+
+// tenantScopedPlans mimics db.PlanRepository.GetByID, which refuses a
+// context without a tenant.
+type tenantScopedPlans struct {
+	porttest.UnimplementedPlanRepository
+	plan *domain.Plan
+}
+
+func (p *tenantScopedPlans) GetByID(ctx context.Context, id uuid.UUID) (*domain.Plan, error) {
+	if _, ok := ctx.Value(domain.TenantIDKey).(uuid.UUID); !ok {
+		return nil, errTenantMissingForTest
+	}
+	return p.plan, nil
+}
+
+// The scheduler calls ProcessDueRenewals on context.Background(), so every
+// tenant-scoped lookup inside a renewal (plan, invoice generation,
+// settlement) must run under the claimed subscription's tenant.
+func TestProcessDueRenewals_RunsUnderSubscriptionTenant(t *testing.T) {
+	_, subRepo, invoicer, sub := renewalFixture()
+	plans := &tenantScopedPlans{plan: &domain.Plan{
+		ID: sub.PlanID, IntervalUnit: domain.IntervalMonth, IntervalCount: 1,
+		Prices: []domain.Price{{Amount: 100000, Currency: "INR"}},
+	}}
+	svc := NewRenewalService(subRepo, plans, invoicer)
+	svc.now = func() time.Time { return time.Date(2026, 7, 1, 0, 5, 0, 0, time.UTC) }
+
+	renewed, err := svc.ProcessDueRenewals(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if renewed != 1 || invoicer.generated != 1 {
+		t.Fatalf("renewed=%d generated=%d, want 1/1 (plan lookup must see the tenant)", renewed, invoicer.generated)
 	}
 }
