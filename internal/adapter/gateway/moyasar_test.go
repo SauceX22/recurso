@@ -1032,3 +1032,46 @@ func TestMoyasarOwnsPaymentID(t *testing.T) {
 		}
 	}
 }
+
+// --- Tokens ---
+
+func TestMoyasarFetchTokenExpiry(t *testing.T) {
+	for _, tc := range []struct {
+		name, year string
+		wantYear   int
+	}{
+		{"four-digit year", "2029", 2029},
+		{"two-digit year", "29", 2029},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+				"GET /tokens/token_abc": {http.StatusOK, `{"id":"token_abc","status":"active","brand":"mada","funding":"debit",
+					"country":"SA","month":7,"year":` + tc.year + `,"name":"Saleh Ali","last_four":"1010"}`},
+			})
+			g := testMoyasar(srv.URL)
+
+			month, year, err := g.FetchToken(context.Background(), "token_abc")
+			if err != nil || month != 7 || year != tc.wantYear {
+				t.Fatalf("FetchToken = %d/%d, %v; want 7/%d", month, year, err, tc.wantYear)
+			}
+			if c := rec.all()[0]; c.method != http.MethodGet || c.auth == "" {
+				t.Fatalf("request = %+v, want an authenticated GET", c)
+			}
+		})
+	}
+}
+
+func TestMoyasarFetchTokenErrors(t *testing.T) {
+	srv, rec := moyasarTestServer(t, nil)
+	g := testMoyasar(srv.URL)
+
+	if _, _, err := g.FetchToken(context.Background(), ""); err == nil || len(rec.all()) != 0 {
+		t.Fatalf("empty id: err = %v, calls = %d; want an error and no request", err, len(rec.all()))
+	}
+	if _, _, err := g.FetchToken(context.Background(), "token_gone"); err == nil {
+		t.Fatal("an unknown token must be an error")
+	}
+	if _, _, err := g.FetchToken(context.Background(), "../payments"); err == nil || rec.all()[1].rawPath != "/tokens/..%2Fpayments" {
+		t.Fatalf("token id must be path-escaped, got %q", rec.all()[1].rawPath)
+	}
+}

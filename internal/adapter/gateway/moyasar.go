@@ -201,6 +201,28 @@ func (g *MoyasarGateway) FetchPayment(ctx context.Context, paymentID string) (*p
 	return p.toGatewayPayment(), nil
 }
 
+// FetchToken reads a saved card token's expiry. Moyasar has no card updater
+// and invalidates a token when its card expires, so the expiry is what lets
+// the card-expiry notice reach the customer before renewals start failing.
+func (g *MoyasarGateway) FetchToken(ctx context.Context, tokenID string) (expMonth, expYear int, err error) {
+	if tokenID == "" {
+		return 0, 0, errors.New("moyasar: token id is required")
+	}
+	var out struct {
+		Month int `json:"month"`
+		Year  int `json:"year"`
+	}
+	if err := g.do(ctx, http.MethodGet, "/tokens/"+url.PathEscape(tokenID), nil, &out); err != nil {
+		return 0, 0, err
+	}
+	// Moyasar takes two-digit years when creating tokens; normalise in case it
+	// returns them that way.
+	if out.Year > 0 && out.Year < 100 {
+		out.Year += 2000
+	}
+	return out.Month, out.Year, nil
+}
+
 // moyasarGivenID derives the payment id Moyasar dedupes on from Recurso's
 // idempotency key, so every replay of the same key targets the same payment.
 func moyasarGivenID(idempotencyKey string) string {
