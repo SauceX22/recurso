@@ -1077,6 +1077,11 @@ func main() {
 		func(secret string) service.SavedCardCharger { return gateway.NewStripeGateway(secret, "") },
 		stripeCharger,
 	)
+	// A customer has one saved slot; charge it only when it lives on the
+	// gateway the charge's currency routes to (never a Moyasar token on
+	// Stripe, or a Stripe card for a SAR invoice). Otherwise dunning and the
+	// pay link collect.
+	savedCardRouter.SetCurrencyRouting(paymentGateway)
 	if moyasarGateway != nil {
 		savedCardRouter.RegisterProvider(domain.GatewayMoyasar, moyasarGateway)
 	}

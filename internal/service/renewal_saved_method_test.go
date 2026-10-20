@@ -113,6 +113,25 @@ func TestRenewalSavedMethod_UnregisteredProviderNeverChargesStripe(t *testing.T)
 	}
 }
 
+// The customer's one saved slot holds a Stripe card, but SAR routes to
+// Moyasar: the renewal skips the charge and leaves the invoice to dunning.
+func TestRenewalSavedMethod_MethodOnAnotherGatewayIsSkipped(t *testing.T) {
+	svc, _, sub := sarRenewalFixture()
+	stripe := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
+	settler := &fakeRenewalSettler{}
+	svc.SetSavedMethodCharging(stripe, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, settler)
+	router := NewSavedCardGatewayRouter(nil, nil, stripe)
+	router.SetCurrencyRouting(fixedRoutes{"SAR": domain.GatewayMoyasar})
+	svc.SetChargerRouter(router)
+
+	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
+		t.Fatal(err)
+	}
+	if stripe.charges != 0 || len(settler.settled) != 0 {
+		t.Fatalf("stripe charged %d times / settled %v for a SAR invoice", stripe.charges, settler.settled)
+	}
+}
+
 func TestRenewalSavedMethod_ChargeFailureLeavesInvoiceUnsettled(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

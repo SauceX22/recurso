@@ -147,6 +147,64 @@ func TestSavedCardGatewayRouter_UnregisteredProviderRefused(t *testing.T) {
 	}
 }
 
+// fixedRoutes routes every currency in the map to its gateway, and anything
+// else to Stripe.
+type fixedRoutes map[string]domain.GatewayProvider
+
+func (f fixedRoutes) ProviderFor(currency string) domain.GatewayProvider {
+	if p, ok := f[currency]; ok {
+		return p
+	}
+	return domain.GatewayStripe
+}
+
+// A saved method is charged only on the gateway its charge's currency routes
+// to: a customer with one slot can't have their USD renewal sent to Moyasar,
+// or their SAR renewal sent to Stripe.
+func TestSavedCardGatewayRouter_CurrencyGuard(t *testing.T) {
+	stripe := &namedCharger{name: "stripe"}
+	moyasar := &namedCharger{name: "moyasar"}
+	r := NewSavedCardGatewayRouter(nil, nil, stripe)
+	r.RegisterProvider(domain.GatewayMoyasar, moyasar)
+	r.SetCurrencyRouting(fixedRoutes{"SAR": domain.GatewayMoyasar})
+
+	for _, tc := range []struct {
+		name     string
+		m        domain.SavedPaymentMethod
+		currency string
+		want     SavedCardCharger
+	}{
+		{"moyasar token for SAR", moyasarMethod(), "SAR", moyasar},
+		{"stripe card for USD", stripeMethod(nil), "USD", stripe},
+		{"stripe card for SAR", stripeMethod(nil), "SAR", nil},
+		{"moyasar token for USD", moyasarMethod(), "USD", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := r.ChargerFor(context.Background(), tc.m, tc.currency)
+			if tc.want == nil {
+				if !errors.Is(err, ErrSavedMethodNotRoutable) || got != nil {
+					t.Fatalf("got (%#v, %v), want ErrSavedMethodNotRoutable", got, err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("got (%#v, %v), want %#v", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// The guard runs before any BYO connection is loaded or decrypted.
+func TestSavedCardGatewayRouter_CurrencyGuardBeforeConnection(t *testing.T) {
+	connID := uuid.New()
+	opener := &fakeConnOpener{getErr: errors.New("must not be called")}
+	r := NewSavedCardGatewayRouter(opener, func(string) SavedCardCharger { return &namedCharger{} }, nil)
+	r.SetCurrencyRouting(fixedRoutes{"SAR": domain.GatewayMoyasar})
+	if _, err := r.ChargerFor(context.Background(), stripeMethod(&connID), "SAR"); !errors.Is(err, ErrSavedMethodNotRoutable) {
+		t.Fatalf("err = %v, want ErrSavedMethodNotRoutable", err)
+	}
+}
+
 func TestSavedCardGatewayRouter_NilChargerNotRegistered(t *testing.T) {
 	r := NewSavedCardGatewayRouter(nil, nil, nil)
 	r.RegisterProvider(domain.GatewayMoyasar, nil)
