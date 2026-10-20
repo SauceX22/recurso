@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -78,6 +79,19 @@ type CheckoutHandler struct {
 	// Per-tenant (BYO) resolution; nil => env values above (backward compat).
 	gwResolver checkoutGatewayResolver
 	connLookup checkoutConnLookup
+	// Moyasar (SAR) embedded-form checkout; a nil fetcher disables verify.
+	moyasar               moyasarPaymentFetcher
+	moyasarCards          gatewayCardSaver
+	moyasarPublishableKey string
+}
+
+// SetMoyasar wires the Moyasar embedded-form checkout. fetcher reads payments
+// back with the secret key for verification; saver stores the card token a
+// paid payment created; publishableKey is handed to the browser form.
+func (h *CheckoutHandler) SetMoyasar(fetcher moyasarPaymentFetcher, saver gatewayCardSaver, publishableKey string) {
+	h.moyasar = fetcher
+	h.moyasarCards = saver
+	h.moyasarPublishableKey = publishableKey
 }
 
 // SetTenantGateways wires per-tenant (BYO) resolution for the checkout verify,
@@ -266,6 +280,10 @@ func (h *CheckoutHandler) InitiatePayment(c *gin.Context) {
 		respondError(c, http.StatusServiceUnavailable, codeInternalError, "checkout is not fully configured (missing Razorpay key id)")
 		return
 	}
+	if gatewayName == "moyasar" && h.moyasarPublishableKey == "" {
+		respondError(c, http.StatusServiceUnavailable, codeInternalError, "checkout is not fully configured (missing Moyasar publishable key)")
+		return
+	}
 
 	// India-region Stripe accounts reject foreign-currency confirmation unless
 	// the intent carries the buyer's name and address (india-exports rules) —
@@ -278,19 +296,28 @@ func (h *CheckoutHandler) InitiatePayment(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"data": gin.H{
-			"order_id":        order.ID,
-			"amount":          order.Amount,
-			"currency":        order.Currency,
-			"invoice_id":      invoice.ID,
-			"invoice_number":  invoice.InvoiceNumber,
-			"gateway":         gatewayName,
-			"client_secret":   order.ClientSecret,
-			"publishable_key": stripePubKey,
-			"razorpay_key_id": razorpayKeyID,
-		},
-	})
+	data := gin.H{
+		"order_id":        order.ID,
+		"amount":          order.Amount,
+		"currency":        order.Currency,
+		"invoice_id":      invoice.ID,
+		"invoice_number":  invoice.InvoiceNumber,
+		"gateway":         gatewayName,
+		"client_secret":   order.ClientSecret,
+		"publishable_key": stripePubKey,
+		"razorpay_key_id": razorpayKeyID,
+	}
+	if gatewayName == "moyasar" {
+		// The embedded form creates the payment in the browser, so it needs the
+		// outstanding balance (verify requires amount >= due), a description,
+		// and the invoice_id metadata the server-side read-back binds on.
+		data["amount"] = moyasarAmountDue(invoice)
+		data["moyasar_publishable_key"] = h.moyasarPublishableKey
+		data["description"] = "Invoice " + invoice.InvoiceNumber
+		data["metadata"] = gin.H{"invoice_id": invoice.ID.String()}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": data})
 }
 
 // CheckoutSuccess verifies a completed payment and reports the invoice's
@@ -481,6 +508,96 @@ func (h *CheckoutHandler) RazorpayVerify(c *gin.Context) {
 	}
 	if req.PaymentID != "" {
 		_ = h.invoiceRepo.SetGatewayPaymentID(ctx, invoice.TenantID, invoice.ID, req.PaymentID)
+	}
+
+	respondCheckoutStatus(c, invoice, "paid")
+}
+
+// MoyasarVerify settles an invoice after a Moyasar embedded-form payment. The
+// browser supplies only the payment id (from the callback redirect); the
+// server fetches the payment with the secret key and settles only when Moyasar
+// reports it paid AND it is bound to this invoice (metadata, currency, amount
+// >= due). The redirect's own status param is never trusted. The webhook
+// (payment_paid) remains the authoritative backstop.
+func (h *CheckoutHandler) MoyasarVerify(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		respondError(c, http.StatusBadRequest, codeValidationFailed, "invalid invoice ID")
+		return
+	}
+
+	ctx := c.Request.Context()
+	invoice, err := h.invoiceRepo.GetByIDPublic(ctx, id)
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, codeInternalError, "failed to fetch invoice")
+		return
+	}
+	if invoice == nil {
+		respondError(c, http.StatusNotFound, codeNotFound, "invoice not found")
+		return
+	}
+	if invoice.Status == domain.InvoiceStatusPaid {
+		respondCheckoutStatus(c, invoice, "paid")
+		return
+	}
+	if h.moyasar == nil {
+		respondError(c, http.StatusServiceUnavailable, codeInternalError, "moyasar checkout isn't available on this deployment")
+		return
+	}
+
+	var req struct {
+		PaymentID string `json:"payment_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, codeValidationFailed, "payment_id is required")
+		return
+	}
+
+	p, err := h.moyasar.FetchPayment(ctx, req.PaymentID)
+	if err != nil {
+		respondError(c, http.StatusBadGateway, codeInternalError, "could not confirm the payment")
+		return
+	}
+
+	// Bind before reporting anything: a payment for another invoice, in another
+	// currency, or for less than is owed must never settle this one.
+	if err := checkMoyasarPaymentForInvoice(p, invoice); err != nil {
+		respondError(c, http.StatusBadRequest, codeValidationFailed, err.Error())
+		return
+	}
+
+	if p.Status != "paid" {
+		// "failed" is a decline the buyer can retry; anything else (initiated,
+		// e.g. 3DS not completed yet) is reported as in flight.
+		checkoutStatus := "processing"
+		if p.Status == "failed" {
+			checkoutStatus = "failed"
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"data": gin.H{
+				"status":         checkoutStatus,
+				"payment_status": p.Status,
+				"invoice_id":     invoice.ID,
+				"invoice_number": invoice.InvoiceNumber,
+			},
+		})
+		return
+	}
+
+	// Verified paid and bound — settle through the ledger path (idempotent
+	// with the webhook).
+	tenantCtx := context.WithValue(ctx, domain.TenantIDKey, invoice.TenantID)
+	if h.settler != nil {
+		if _, err := h.settler.MarkInvoicePaid(tenantCtx, invoice.ID); err != nil {
+			respondError(c, http.StatusInternalServerError, codeInternalError, "failed to settle invoice")
+			return
+		}
+	}
+	// Best-effort: record the refundable payment id and keep the card for
+	// off-session renewals (the webhook does both too).
+	_ = h.invoiceRepo.SetGatewayPaymentID(ctx, invoice.TenantID, invoice.ID, p.ID)
+	if err := saveMoyasarCard(tenantCtx, h.moyasarCards, p, invoice); err != nil {
+		slog.WarnContext(ctx, "moyasar checkout: saving card failed", "invoice_id", invoice.ID, "error", err)
 	}
 
 	respondCheckoutStatus(c, invoice, "paid")
