@@ -36,6 +36,39 @@ func TestGatewayModeFromEnv(t *testing.T) {
 	}
 }
 
+// The misconfigurations that silently break SAR payments must surface at boot:
+// a key of the wrong kind or a test/live mix (the browser pays in one mode,
+// the server reads back in the other and never settles) is fatal; a missing
+// publishable key or webhook secret is a loud warning.
+func TestValidateMoyasarConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		secret, publishable, wh string
+		wantErr                 bool
+		wantWarnings            int
+	}{
+		{"complete test config", "sk_test_a", "pk_test_b", "s", false, 0},
+		{"complete live config", "sk_live_a", "pk_live_b", "s", false, 0},
+		{"publishable key pasted as secret", "pk_test_a", "pk_test_b", "s", true, 0},
+		{"live secret, test publishable", "sk_live_a", "pk_test_b", "s", true, 0},
+		{"test secret, live publishable", "sk_test_a", "pk_live_b", "s", true, 0},
+		{"publishable key of the wrong kind", "sk_test_a", "sk_test_b", "s", true, 0},
+		{"no publishable key", "sk_test_a", "", "s", false, 1},
+		{"no webhook secret", "sk_live_a", "pk_live_b", "", false, 1},
+		{"neither", "sk_live_a", "", "", false, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			warnings, err := validateMoyasarConfig(tc.secret, tc.publishable, tc.wh)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && len(warnings) != tc.wantWarnings {
+				t.Fatalf("warnings = %q, want %d", warnings, tc.wantWarnings)
+			}
+		})
+	}
+}
+
 // In demo mode the override gateways aren't registered, so their keys don't
 // make the server live.
 func TestGatewayModeFromEnvIgnoresUnregisteredGateways(t *testing.T) {

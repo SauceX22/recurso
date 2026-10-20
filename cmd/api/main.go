@@ -275,10 +275,19 @@ func main() {
 		log.Println("Adyen gateway configured (EXPERIMENTAL — sandbox verification pending)")
 	}
 	// Moyasar (SAR, docs/spec_moyasar.md; EXPERIMENTAL until sandbox-verified):
-	// reachable via GATEWAY_CURRENCY_OVERRIDES="SAR=moyasar". nil when not
-	// configured; every Moyasar wiring below is guarded on it.
+	// reachable via GATEWAY_CURRENCY_OVERRIDES="SAR=moyasar". It is registered
+	// here so the override can name it; it joins the saved-card router with
+	// the retry worker, and its handlers are wired once they exist. nil when
+	// not configured.
 	var moyasarGateway *gateway.MoyasarGateway
 	if key := os.Getenv("MOYASAR_SECRET_KEY"); key != "" && !demo.Enabled() {
+		warnings, err := validateMoyasarConfig(key, os.Getenv("MOYASAR_PUBLISHABLE_KEY"), os.Getenv("MOYASAR_WEBHOOK_SECRET"))
+		if err != nil {
+			log.Fatalf("Invalid Moyasar configuration: %v", err)
+		}
+		for _, w := range warnings {
+			slog.Warn("Moyasar configuration incomplete", "problem", w)
+		}
 		moyasarGateway = gateway.NewMoyasarGateway(key, getEnvDefault("DASHBOARD_URL", baseURL))
 		paymentGateway.RegisterGateway("moyasar", moyasarGateway)
 		log.Println("Moyasar gateway configured (EXPERIMENTAL — sandbox verification pending)")
@@ -827,6 +836,24 @@ func main() {
 	// interactive fallback until real Stripe keys are set.
 	stripeCharger, _ := stripeGateway.(service.SavedCardCharger)
 	retryWorker.SetSavedMethodCharging(stripeCharger, customerRepo)
+	// One router for every off-session charge (dunning retry, renewal, wallet
+	// auto-recharge): each saved method charges on the gateway that issued it —
+	// a BYO connection, or the platform account of its provider. Built in full
+	// before the retry worker starts.
+	savedCardRouter := service.NewSavedCardGatewayRouter(
+		gatewayConnService,
+		func(secret string) service.SavedCardCharger { return gateway.NewStripeGateway(secret, "") },
+		stripeCharger,
+	)
+	if moyasarGateway != nil {
+		savedCardRouter.RegisterProvider(domain.GatewayMoyasar, moyasarGateway)
+	}
+	// A customer has one saved slot; charge it only when it lives on the
+	// gateway the charge's currency routes to (never a Moyasar token on
+	// Stripe, or a Stripe card for a SAR invoice). Otherwise dunning and the
+	// pay link collect.
+	savedCardRouter.SetCurrencyRouting(paymentGateway)
+	retryWorker.SetChargerRouter(savedCardRouter)
 	retryWorker.SetDunningCampaignService(dunningCampaignService)
 	retryWorker.SetRecoveryRecorder(dunningRecoveryService)
 	// Successful retries settle through the same ledger-posting MarkInvoicePaid
@@ -1070,25 +1097,8 @@ func main() {
 	renewalService.SetSavedMethodCharging(stripeCharger, customerRepo, subscriptionService)
 	renewalService.SetPaymentRecorder(invoiceRepo)
 	walletService.SetSavedMethodCharging(stripeCharger, customerRepo)
-	// One router for every off-session charge (renewal, wallet auto-recharge,
-	// dunning retry): each saved method charges on the gateway that issued it —
-	// a BYO connection, or the platform account of its provider.
-	savedCardRouter := service.NewSavedCardGatewayRouter(
-		gatewayConnService,
-		func(secret string) service.SavedCardCharger { return gateway.NewStripeGateway(secret, "") },
-		stripeCharger,
-	)
-	// A customer has one saved slot; charge it only when it lives on the
-	// gateway the charge's currency routes to (never a Moyasar token on
-	// Stripe, or a Stripe card for a SAR invoice). Otherwise dunning and the
-	// pay link collect.
-	savedCardRouter.SetCurrencyRouting(paymentGateway)
-	if moyasarGateway != nil {
-		savedCardRouter.RegisterProvider(domain.GatewayMoyasar, moyasarGateway)
-	}
 	renewalService.SetChargerRouter(savedCardRouter)
 	walletService.SetChargerRouter(savedCardRouter)
-	retryWorker.SetChargerRouter(savedCardRouter)
 	var billingCycleScheduler *scheduler.BillingCycleScheduler
 	billingCycleInterval := 5 * time.Minute
 	if raw := os.Getenv("BILLING_CYCLE_INTERVAL"); raw != "" {
@@ -1289,11 +1299,6 @@ func main() {
 		GetOrderInvoiceID(ctx context.Context, orderID string) (string, error)
 	})
 	checkoutHandler.SetRazorpay(razorpayVerifier, os.Getenv("RAZORPAY_KEY_ID"))
-	// Moyasar (EXPERIMENTAL): embedded-form checkout, verified server-side.
-	// Guarded so an unconfigured gateway stays a nil interface, not a typed nil.
-	if moyasarGateway != nil {
-		checkoutHandler.SetMoyasar(moyasarGateway, customerRepo, os.Getenv("MOYASAR_PUBLISHABLE_KEY"))
-	}
 	// Buyer name/address on Stripe intents — required by India-region accounts
 	// for foreign-currency (export) charges; harmless elsewhere.
 	checkoutBuyer, _ := stripeGateway.(interface {
@@ -1551,8 +1556,12 @@ func main() {
 	webhookHandler.SetInboundWebhookDedup(db.NewInboundWebhookRepository(database)) // skip redelivered gateway webhooks (ENG-162)
 	webhookHandler.SetGatewayConnections(gatewayConnService)                        // BYO increment 3: per-connection webhook secrets
 	webhookHandler.SetPaymentAttempts(db.NewPaymentAttemptRepository(database))     // ACH async settlement (Inc 3b)
+	// Moyasar (EXPERIMENTAL): embedded-form checkout verified server-side, and
+	// the webhook. Guarded so an unconfigured gateway stays a nil interface,
+	// not a typed nil.
 	if moyasarGateway != nil {
-		webhookHandler.SetMoyasar(moyasarGateway, customerRepo, os.Getenv("MOYASAR_WEBHOOK_SECRET")) // EXPERIMENTAL
+		checkoutHandler.SetMoyasar(moyasarGateway, customerRepo, os.Getenv("MOYASAR_PUBLISHABLE_KEY"))
+		webhookHandler.SetMoyasar(moyasarGateway, customerRepo, os.Getenv("MOYASAR_WEBHOOK_SECRET"))
 	}
 
 	// Revenue Recognition Handler
