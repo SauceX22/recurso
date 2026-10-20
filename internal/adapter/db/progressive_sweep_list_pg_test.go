@@ -39,9 +39,17 @@ func TestListActiveProgressiveSubscriptionIDs_Postgres(t *testing.T) {
 	mkSub("canceled", int64(50000))         // has threshold but canceled -> excluded
 	mkSub("paused", int64(50000))           // has threshold but not active -> excluded
 
-	ids, err := repo.ListActiveProgressiveSubscriptionIDs(ctx)
+	refs, err := repo.ListActiveProgressiveSubscriptionIDs(ctx)
 	if err != nil {
 		t.Fatalf("list: %v", err)
+	}
+	ids := make([]uuid.UUID, 0, len(refs))
+	for _, ref := range refs {
+		ids = append(ids, ref.ID)
+		// Each candidate carries its own tenant so the sweep can inject it.
+		if ref.ID == wantIn && ref.TenantID != tenantID {
+			t.Fatalf("sweep candidate %s tenant = %s, want %s", ref.ID, ref.TenantID, tenantID)
+		}
 	}
 
 	// Filter to the ones this test created (the shared DB may hold others).

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/recurso-dev/recurso/internal/core/domain"
 )
 
 // ProgressiveBillingRepository backs interim (progressive) billing (A5). The
@@ -17,11 +18,13 @@ type ProgressiveBillingRepository interface {
 	// minor units, or nil when progressive billing is off for it.
 	GetThreshold(ctx context.Context, subscriptionID uuid.UUID) (*int64, error)
 
-	// ListActiveProgressiveSubscriptionIDs returns the IDs of active
-	// subscriptions that have a progressive_billing_threshold set — the set the
-	// interim-billing sweep considers each tick. Non-progressive and
-	// non-active subscriptions are excluded.
-	ListActiveProgressiveSubscriptionIDs(ctx context.Context) ([]uuid.UUID, error)
+	// ListActiveProgressiveSubscriptionIDs returns the IDs (with their owning
+	// tenant) of active subscriptions that have a progressive_billing_threshold
+	// set — the set the interim-billing sweep considers each tick.
+	// Non-progressive and non-active subscriptions are excluded. Cross-tenant by
+	// design: the sweep is a platform job and injects each row's tenant before
+	// billing it.
+	ListActiveProgressiveSubscriptionIDs(ctx context.Context) ([]domain.TenantScopedID, error)
 
 	// GetWatermark returns the amount already invoiced for (subscription,
 	// charge, period); 0 when no watermark row exists yet.

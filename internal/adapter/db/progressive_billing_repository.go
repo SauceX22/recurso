@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/recurso-dev/recurso/internal/core/domain"
 	"github.com/recurso-dev/recurso/internal/core/port"
 )
 
@@ -42,12 +43,17 @@ func (r *ProgressiveBillingRepository) GetThreshold(ctx context.Context, subscri
 }
 
 // ListActiveProgressiveSubscriptionIDs returns active subscriptions with a
-// progressive_billing_threshold set — the sweep's candidate set. The threshold
-// gate and watermark CAS inside billing decide whether each actually bills, so
-// this query only needs to narrow the scan, not be exact.
-func (r *ProgressiveBillingRepository) ListActiveProgressiveSubscriptionIDs(ctx context.Context) ([]uuid.UUID, error) {
+// progressive_billing_threshold set — the sweep's candidate set — each paired
+// with its tenant. The threshold gate and watermark CAS inside billing decide
+// whether each actually bills, so this query only needs to narrow the scan,
+// not be exact.
+//
+// Cross-tenant by design (no tenant_id filter): the progressive sweep is a
+// platform-wide background job. It returns tenant_id so the sweep can inject
+// each subscription's own tenant before calling tenant-scoped repositories.
+func (r *ProgressiveBillingRepository) ListActiveProgressiveSubscriptionIDs(ctx context.Context) ([]domain.TenantScopedID, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id FROM subscriptions
+		`SELECT id, tenant_id FROM subscriptions
 		 WHERE progressive_billing_threshold IS NOT NULL AND status = 'active'
 		 ORDER BY id`,
 	)
@@ -55,13 +61,13 @@ func (r *ProgressiveBillingRepository) ListActiveProgressiveSubscriptionIDs(ctx 
 		return nil, fmt.Errorf("failed to list progressive subscriptions: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var ids []uuid.UUID
+	var ids []domain.TenantScopedID
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		var ref domain.TenantScopedID
+		if err := rows.Scan(&ref.ID, &ref.TenantID); err != nil {
 			return nil, fmt.Errorf("failed to scan progressive subscription id: %w", err)
 		}
-		ids = append(ids, id)
+		ids = append(ids, ref)
 	}
 	return ids, rows.Err()
 }

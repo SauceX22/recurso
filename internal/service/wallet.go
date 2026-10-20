@@ -586,6 +586,8 @@ func (s *WalletService) notifyRechargeFailure(ctx context.Context, w *domain.Wal
 	if s.notifier == nil {
 		return
 	}
+	// The recharge sweep runs on a background ctx; the tenant-scoped customer lookup fails closed without the wallet's tenant.
+	ctx = context.WithValue(ctx, domain.TenantIDKey, w.TenantID)
 	customer, err := s.customers.GetByID(ctx, w.CustomerID)
 	if err != nil || customer == nil {
 		return

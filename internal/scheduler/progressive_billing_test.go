@@ -15,8 +15,12 @@ type fakeSweepRepo struct {
 	err error
 }
 
-func (f *fakeSweepRepo) ListActiveProgressiveSubscriptionIDs(context.Context) ([]uuid.UUID, error) {
-	return f.ids, f.err
+func (f *fakeSweepRepo) ListActiveProgressiveSubscriptionIDs(context.Context) ([]domain.TenantScopedID, error) {
+	refs := make([]domain.TenantScopedID, 0, len(f.ids))
+	for _, id := range f.ids {
+		refs = append(refs, domain.TenantScopedID{ID: id, TenantID: uuid.New()})
+	}
+	return refs, f.err
 }
 
 type fakeBiller struct {

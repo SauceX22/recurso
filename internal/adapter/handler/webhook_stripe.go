@@ -355,6 +355,8 @@ func (h *WebhookHandler) handleInvoicePaymentFailed(ctx context.Context, event s
 
 	// Send payment failed notification
 	if h.notificationService != nil && h.customerRepo != nil {
+		// Public webhook ctx is tenantless; the tenant-scoped customer lookup fails closed without the invoice's tenant.
+		ctx := context.WithValue(ctx, domain.TenantIDKey, inv.TenantID)
 		customer, custErr := h.customerRepo.GetByID(ctx, inv.CustomerID)
 		if custErr != nil {
 			h.logger.Error("failed to fetch customer for payment failed notification", "error", custErr, "customer_id", inv.CustomerID)
