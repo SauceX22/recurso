@@ -26,6 +26,7 @@ type CardExpiringScheduler struct {
 	notificationSvc *service.NotificationService
 	locker          port.Locker
 	portalBaseURL   string
+	cardLinks       paymentMethodLinker // nil-safe; unset, "update card" opens the portal
 	ticker          *time.Ticker
 	done            chan bool
 	stopOnce        sync.Once
@@ -46,6 +47,9 @@ func NewCardExpiringScheduler(
 		done:            make(chan bool),
 	}
 }
+
+// SetPaymentMethodLinks wires per-customer "update payment method" links. Nil-safe.
+func (s *CardExpiringScheduler) SetPaymentMethodLinks(l paymentMethodLinker) { s.cardLinks = l }
 
 // Start begins the scheduler (runs every 12 hours)
 func (s *CardExpiringScheduler) Start() {
@@ -119,6 +123,10 @@ func (s *CardExpiringScheduler) runCardExpiryNotifications() {
 
 	for _, cust := range customers {
 		expiryDate := fmt.Sprintf("%s %d", time.Month(cust.CardExpMonth).String(), cust.CardExpYear)
+		updatePaymentURL := s.portalBaseURL + "/portal/login"
+		if s.cardLinks != nil {
+			updatePaymentURL = s.cardLinks.UpdatePaymentURL(ctx, s.portalBaseURL, cust.CustomerID, "", uuid.Nil)
+		}
 
 		data := email.CardExpiringEmailData{
 			CustomerName:     cust.CustomerName,
@@ -126,7 +134,7 @@ func (s *CardExpiringScheduler) runCardExpiryNotifications() {
 			CardBrand:        cust.CardBrand,
 			CardLast4:        cust.CardLast4,
 			ExpiryDate:       expiryDate,
-			UpdatePaymentURL: s.portalBaseURL + "/portal/login",
+			UpdatePaymentURL: updatePaymentURL,
 		}
 
 		if err := s.notificationSvc.SendCardExpiringNotification(ctx, data); err != nil {

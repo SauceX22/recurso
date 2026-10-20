@@ -57,11 +57,22 @@ type DunningScheduler struct {
 	locker          port.Locker
 	config          DunningConfig
 	portalBaseURL   string
-	attempts        inFlightChecker // nil-safe; skips dunning for a settling payment
+	attempts        inFlightChecker     // nil-safe; skips dunning for a settling payment
+	cardLinks       paymentMethodLinker // nil-safe; unset, "update card" opens the portal
 	ticker          *time.Ticker
 	done            chan bool
 	stopOnce        sync.Once
 }
+
+// paymentMethodLinker builds a recovery email's "update payment method" link:
+// the portal, or the invoice's hosted checkout for a customer whose gateway
+// has no self-serve card update. Satisfied by *service.PaymentMethodUpdatePolicy.
+type paymentMethodLinker interface {
+	UpdatePaymentURL(ctx context.Context, baseURL string, customerID uuid.UUID, currency string, invoiceID uuid.UUID) string
+}
+
+// SetPaymentMethodLinks wires per-customer "update payment method" links. Nil-safe.
+func (s *DunningScheduler) SetPaymentMethodLinks(l paymentMethodLinker) { s.cardLinks = l }
 
 // SetPaymentAttempts wires the in-flight checker so dunning skips invoices with
 // a settling payment (e.g. an ACH debit still processing). Nil-safe (Inc 3b).
@@ -243,6 +254,11 @@ func (s *DunningScheduler) processInvoice(ctx context.Context, invoice domain.Ov
 	nextRetry := time.Now().AddDate(0, 0, nextRetryDays)
 	suspensionDate := invoice.DueDate.AddDate(0, 0, s.config.SuspendAfterDays)
 
+	updatePaymentURL := s.portalBaseURL + "/portal/login"
+	if s.cardLinks != nil {
+		updatePaymentURL = s.cardLinks.UpdatePaymentURL(ctx, s.portalBaseURL, invoice.CustomerID, invoice.Currency, invoice.ID)
+	}
+
 	// Send dunning email
 	data := email.DunningEmailData{
 		CustomerName:   invoice.CustomerName,
@@ -257,7 +273,7 @@ func (s *DunningScheduler) processInvoice(ctx context.Context, invoice domain.Ov
 		// (magic link) fronts the card-update flow. The previous /portal/pay and
 		// /portal/payment-methods paths never existed.
 		PayNowURL:        fmt.Sprintf("%s/checkout/%s", s.portalBaseURL, invoice.ID),
-		UpdatePaymentURL: s.portalBaseURL + "/portal/login",
+		UpdatePaymentURL: updatePaymentURL,
 	}
 
 	if err := s.notificationSvc.SendDunningEmail(ctx, level, data); err != nil {

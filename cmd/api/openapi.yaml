@@ -4753,11 +4753,26 @@ paths:
         - portalSession: []
       responses:
         '200':
-          description: The customer profile.
+          description: The customer profile, plus how the portal may update the customer's card.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Customer'
+                allOf:
+                  - $ref: '#/components/schemas/Customer'
+                  - type: object
+                    properties:
+                      payment_method_provider:
+                        type: string
+                        description: >
+                          Gateway governing the customer's card: the saved method's
+                          gateway, or the one the billing currency routes to.
+                        examples: [stripe, moyasar]
+                      card_update_supported:
+                        type: boolean
+                        description: >
+                          False when the portal's card-update flow would move the
+                          customer's renewals off their gateway; the card is then
+                          replaced by paying an open invoice on the hosted checkout.
         '401':
           $ref: '#/components/responses/Unauthorized'
 
@@ -4960,6 +4975,12 @@ paths:
                         type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: The customer's card can't be replaced here (`card_update_unsupported`); pay an open invoice on the hosted checkout instead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           description: Self-serve card update isn't available on this deployment.
           content:
@@ -4998,6 +5019,12 @@ paths:
                         type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: The customer's card can't be replaced here (`card_update_unsupported`); pay an open invoice on the hosted checkout instead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           description: Bank (ACH) payments aren't available on this deployment.
           content:
@@ -5057,6 +5084,12 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: The customer's card can't be replaced here (`card_update_unsupported`); pay an open invoice on the hosted checkout instead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           description: Self-serve card update isn't available on this deployment.
           content:
