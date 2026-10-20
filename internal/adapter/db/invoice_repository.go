@@ -1474,6 +1474,28 @@ func (r *InvoiceRepository) SetGatewayPaymentID(ctx context.Context, tenantID, i
 	return nil
 }
 
+// ClaimGatewayPaymentID records paymentID as the payment that settled the
+// invoice unless a different payment is already recorded. It reports whether
+// paymentID is now the recorded one; false means another payment got there
+// first, so paymentID is a duplicate charge. Conditional in SQL so two
+// concurrent settlers cannot both win.
+func (r *InvoiceRepository) ClaimGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (bool, error) {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE invoices
+		SET gateway_payment_id = $1
+		WHERE id = $2 AND tenant_id = $3
+		  AND (gateway_payment_id IS NULL OR gateway_payment_id = '' OR gateway_payment_id = $1)`,
+		paymentID, invoiceID, tenantID)
+	if err != nil {
+		return false, fmt.Errorf("failed to claim gateway payment id: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to claim gateway payment id: %w", err)
+	}
+	return n > 0, nil
+}
+
 // VoidIfOpen atomically voids a still-open (unpaid) invoice. Returns true only
 // when this call performed the transition — a paid, already-void, or missing
 // invoice is left untouched. Used by gift cancellation: an unpaid purchase
