@@ -4,10 +4,10 @@ import { cardUpdateViaInvoice } from "../cardUpdate";
 
 describe("cardUpdateViaInvoice", () => {
   it.each([
-    [{ payment_method: { provider: "moyasar" } }, true],
+    [{ card_update_supported: false, payment_method_provider: "stripe" }, true],
+    [{ card_update_supported: true, payment_method_provider: "moyasar" }, false],
     [{ payment_method_provider: "moyasar" }, true],
-    [{ pm_provider: "moyasar" }, true],
-    [{ payment_method: { provider: "stripe" } }, false],
+    [{ payment_method_provider: "stripe" }, false],
     [{}, false],
     [null, false],
   ])("%j → %s", (profile, want) => {

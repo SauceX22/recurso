@@ -6,9 +6,8 @@ export const CARD_UPDATE_VIA_INVOICE =
 // card setup for those (a Stripe setup would move renewals to Stripe), so the
 // card is replaced by paying an open invoice.
 export function cardUpdateViaInvoice(profile) {
-  const provider =
-    profile?.payment_method?.provider ??
-    profile?.payment_method_provider ??
-    profile?.pm_provider;
-  return provider === "moyasar";
+  if (typeof profile?.card_update_supported === "boolean") {
+    return !profile.card_update_supported;
+  }
+  return profile?.payment_method_provider === "moyasar";
 }
