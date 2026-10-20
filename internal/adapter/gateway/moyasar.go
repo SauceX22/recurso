@@ -232,15 +232,28 @@ func (g *MoyasarGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.
 	}, &out)
 
 	var apiErr *moyasarAPIError
-	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusBadRequest &&
-		strings.Contains(strings.ToLower(apiErr.Message), "already created") {
-		// An earlier attempt with this key already created the payment:
-		// read it back instead of creating a second one.
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusBadRequest {
+		// Moyasar answers a reused given_id with a 400 whose message is not
+		// stable, so read the id back: if an earlier attempt with this key
+		// created the payment, that payment is the answer.
 		existing, ferr := g.fetch(ctx, givenID)
-		if ferr != nil {
+		var notFound *moyasarAPIError
+		switch {
+		case errors.As(ferr, &notFound) && notFound.StatusCode == http.StatusNotFound:
+			// Never created: the 400 is a genuine rejection, handled below.
+		case ferr != nil:
 			return &port.PaymentResult{Success: false, ErrorCode: "gateway_error", ErrorMsg: ferr.Error()}, ferr
+		case existing.Amount != req.Amount || !strings.EqualFold(existing.Currency, req.Currency):
+			return &port.PaymentResult{
+				Success:   false,
+				PaymentID: existing.ID,
+				ErrorCode: "processing_error",
+				ErrorMsg: fmt.Sprintf("idempotency key reused: payment %s is %d %s, charge is %d %s",
+					existing.ID, existing.Amount, existing.Currency, req.Amount, strings.ToUpper(req.Currency)),
+			}, nil
+		default:
+			return mapMoyasarCharge(existing), nil
 		}
-		return mapMoyasarCharge(existing), nil
 	}
 	if errors.As(err, &apiErr) && moyasarRejected(apiErr.StatusCode) {
 		return &port.PaymentResult{Success: false, ErrorCode: "invalid_payment_method", ErrorMsg: apiErr.Error(), Permanent: true}, nil

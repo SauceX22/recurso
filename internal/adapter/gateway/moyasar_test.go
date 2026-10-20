@@ -198,6 +198,11 @@ func TestMoyasarGivenIDDeterministic(t *testing.T) {
 	if _, err := uuid.Parse(a1); err != nil {
 		t.Fatalf("given_id %q is not a UUID: %v", a1, err)
 	}
+	// Pinned: a changed namespace maps an in-flight key to a new payment id,
+	// so a replay after the change would charge the customer again.
+	if want := "8575d574-fa2e-569f-a060-2fd2f3c06217"; a1 != want {
+		t.Fatalf("given_id(renewal-inv-1) = %s, want %s", a1, want)
+	}
 }
 
 func TestMoyasarChargeSameKeySameGivenIDOnTheWire(t *testing.T) {
@@ -306,10 +311,113 @@ func TestMoyasarChargeAlreadyCreatedFetchesInsteadOfRecreating(t *testing.T) {
 	}
 }
 
+// Replay detection must not depend on the wording of Moyasar's message, which
+// changes and is localized: any 400 on a create that carried given_id is
+// checked by reading that id back.
+func TestMoyasarChargeReplayDetectedByReadBackNotMessage(t *testing.T) {
+	givenID := moyasarGivenID("renewal-inv-1")
+	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+		"POST /payments": {http.StatusBadRequest,
+			`{"type":"invalid_request_error","message":"تم إنشاء عملية الدفع مسبقاً","errors":null}`},
+		"GET /payments/" + givenID: {http.StatusOK, moyasarPaymentJSON(givenID, "paid", "00", "APPROVED")},
+	})
+	g := testMoyasar(srv.URL)
+
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
+	if err != nil || !res.Success || res.PaymentID != givenID {
+		t.Fatalf("res = %+v, err = %v; want the existing paid payment %s", res, err, givenID)
+	}
+	if n := rec.count(http.MethodPost); n != 1 {
+		t.Fatalf("POST count = %d, want 1", n)
+	}
+}
+
+// A 400 whose given_id was never created is a genuine rejection.
+func TestMoyasarChargeBadRequestWithNoExistingPaymentIsRejected(t *testing.T) {
+	givenID := moyasarGivenID("renewal-inv-1")
+	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+		"POST /payments": {http.StatusBadRequest,
+			`{"type":"invalid_request_error","message":"Validation Failed","errors":{"amount":["must be greater than 100"]}}`},
+	})
+	g := testMoyasar(srv.URL)
+
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 50, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
+	if err != nil || res.Success || !res.Permanent || res.ErrorCode != "invalid_payment_method" {
+		t.Fatalf("res = %+v, err = %v; want the original rejection", res, err)
+	}
+	if want := "moyasar /payments: Validation Failed (invalid_request_error)"; res.ErrorMsg != want {
+		t.Fatalf("ErrorMsg = %q, want the create's error %q, not the read-back's", res.ErrorMsg, want)
+	}
+	calls := rec.all()
+	if len(calls) != 2 || calls[1].method != http.MethodGet || calls[1].path != "/payments/"+givenID {
+		t.Fatalf("calls = %+v, want POST then GET /payments/%s", calls, givenID)
+	}
+}
+
+// A replayed key must not settle on a payment for a different amount or
+// currency: that is a reused key, not the same charge.
+func TestMoyasarChargeReplayMustMatchAmountAndCurrency(t *testing.T) {
+	givenID := moyasarGivenID("renewal-inv-1")
+	for _, tc := range []struct{ name, amount, currency string }{
+		{"amount", "5000", "SAR"},
+		{"currency", "10000", "USD"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := moyasarTestServer(t, map[string]moyasarReply{
+				"POST /payments": {http.StatusBadRequest, `{"type":"invalid_request_error","message":"Payment is already created.","errors":null}`},
+				"GET /payments/" + givenID: {http.StatusOK, `{"id":"` + givenID + `","status":"paid","amount":` + tc.amount +
+					`,"currency":"` + tc.currency + `","metadata":{"invoice_id":"inv-1"},"source":{"type":"token","response_code":"00"}}`},
+			})
+			g := testMoyasar(srv.URL)
+
+			res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if res.Success || res.ErrorCode != "processing_error" || res.PaymentID != givenID {
+				t.Fatalf("res = %+v, want a processing_error failure naming %s", res, givenID)
+			}
+		})
+	}
+}
+
+// Only a 400 can mean "already created"; the same words on a 5xx are an outage.
+func TestMoyasarChargeAlreadyCreatedOnlyOnBadRequest(t *testing.T) {
+	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+		"POST /payments": {http.StatusInternalServerError, `{"type":"api_error","message":"Payment is already created.","errors":null}`},
+	})
+	g := testMoyasar(srv.URL)
+
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
+	if err == nil || res.ErrorCode != "gateway_error" {
+		t.Fatalf("res = %+v, err = %v; want gateway_error", res, err)
+	}
+	if n := rec.count(http.MethodGet); n != 0 {
+		t.Fatalf("GET count = %d, want 0", n)
+	}
+}
+
+// The read-back of a replay goes through the same decline mapping.
+func TestMoyasarChargeReplayOfHardDeclineIsPermanent(t *testing.T) {
+	givenID := moyasarGivenID("renewal-inv-1")
+	srv, _ := moyasarTestServer(t, map[string]moyasarReply{
+		"POST /payments":           {http.StatusBadRequest, `{"type":"invalid_request_error","message":"Payment is already created.","errors":null}`},
+		"GET /payments/" + givenID: {http.StatusOK, moyasarPaymentJSON(givenID, "failed", "54", "EXPIRED CARD")},
+	})
+	g := testMoyasar(srv.URL)
+
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
+	if err != nil || res.Success || !res.Permanent {
+		t.Fatalf("res = %+v, err = %v; want a permanent decline", res, err)
+	}
+}
+
 func TestMoyasarChargeAlreadyCreatedFetchFails(t *testing.T) {
+	givenID := moyasarGivenID("renewal-inv-1")
 	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
 		"POST /payments": {http.StatusBadRequest,
 			`{"type":"invalid_request_error","message":"Payment is already created.","errors":null}`},
+		"GET /payments/" + givenID: {http.StatusBadGateway, ``},
 	})
 	g := testMoyasar(srv.URL)
 
