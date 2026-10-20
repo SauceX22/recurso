@@ -646,7 +646,7 @@ func TestMoyasarChargeMalformedResponse(t *testing.T) {
 	g := testMoyasar(srv.URL)
 
 	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
-	if err == nil || res.ErrorCode != "gateway_error" {
+	if err == nil || res.Success || res.ErrorCode != "gateway_error" {
 		t.Fatalf("res = %+v, err = %v; an unreadable answer must not be treated as paid", res, err)
 	}
 }
