@@ -70,6 +70,9 @@ type WalletService struct {
 	// chargerRouter routes the recharge to the gateway the card was saved on
 	// (B1 autopay). nil-safe: without it, `charger` (platform) is used.
 	chargerRouter renewalChargerRouter
+	// providerMethods charges methods saved on a non-Stripe gateway (Moyasar).
+	// nil-safe: when unset or unresolved, the Stripe path runs unchanged.
+	providerMethods *ProviderSavedMethods
 
 	now func() time.Time
 }
@@ -100,6 +103,13 @@ func (s *WalletService) SetSavedMethodCharging(charger walletCharger, lookup ren
 // `charger` is used.
 func (s *WalletService) SetChargerRouter(router renewalChargerRouter) {
 	s.chargerRouter = router
+}
+
+// SetProviderSavedMethods wires provider-neutral saved methods (Moyasar
+// tokens) for auto-recharge. nil-safe; consulted before the Stripe path and
+// independent of the Stripe charger.
+func (s *WalletService) SetProviderSavedMethods(p *ProviderSavedMethods) {
+	s.providerMethods = p
 }
 
 // CreateWalletInput creates a wallet, optionally with auto-recharge.
@@ -494,6 +504,13 @@ func (s *WalletService) ProcessAutoRecharges(ctx context.Context) (int, error) {
 }
 
 func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bool {
+	// A method saved on a non-Stripe gateway (Moyasar) charges there; anything
+	// else continues down the Stripe path below, unchanged.
+	if w.AutoRechargeAmount != nil {
+		if charger, ref, ok := s.providerMethods.Resolve(ctx, w.CustomerID); ok {
+			return s.chargeAndCredit(ctx, w, charger, "", ref)
+		}
+	}
 	if s.charger == nil || s.lookup == nil || w.AutoRechargeAmount == nil {
 		return false
 	}
@@ -516,6 +533,12 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 		charger = c
 	}
 
+	return s.chargeAndCredit(ctx, w, charger, stripeCustomerID, paymentMethodID)
+}
+
+// chargeAndCredit charges the auto-recharge amount on charger and, on
+// success, credits the wallet and posts the top-up ledger legs.
+func (s *WalletService) chargeAndCredit(ctx context.Context, w *domain.Wallet, charger walletCharger, stripeCustomerID, paymentMethodID string) bool {
 	amount := *w.AutoRechargeAmount
 	// Key on wallet + current balance so a crashed sweep retried within the
 	// same balance state cannot double-charge, while a later legitimate

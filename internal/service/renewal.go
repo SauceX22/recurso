@@ -74,6 +74,10 @@ type RenewalService struct {
 	// (B1 autopay). nil-safe: when unset, `charger` (the platform gateway) is
 	// used for every card, preserving pre-B1 behavior.
 	chargerRouter renewalChargerRouter
+	// providerMethods charges methods saved on a non-Stripe gateway (Moyasar).
+	// nil-safe: when unset, or when it resolves nothing for the customer, the
+	// Stripe path below runs unchanged.
+	providerMethods *ProviderSavedMethods
 
 	now func() time.Time // injectable for tests
 }
@@ -99,6 +103,14 @@ func (s *RenewalService) SetSavedMethodCharging(charger renewalSavedCharger, loo
 // every card charges on the platform `charger`.
 func (s *RenewalService) SetChargerRouter(router renewalChargerRouter) {
 	s.chargerRouter = router
+}
+
+// SetProviderSavedMethods wires provider-neutral saved methods (Moyasar
+// tokens). nil-safe. Consulted before the Stripe path and independent of the
+// Stripe charger, so a deployment with Stripe mocked still autopays them; it
+// needs only the settler from SetSavedMethodCharging.
+func (s *RenewalService) SetProviderSavedMethods(p *ProviderSavedMethods) {
+	s.providerMethods = p
 }
 
 // renewalClaimLease mirrors the mandate debitClaimWindow: shorter than the
@@ -195,6 +207,9 @@ func (s *RenewalService) RenewSubscription(ctx context.Context, sub *domain.Subs
 // renewal invoice. Strictly best-effort: no saved method, a lookup error,
 // or a gateway decline all leave the invoice open — dunning owns recovery.
 func (s *RenewalService) attemptPayment(ctx context.Context, inv *domain.Invoice) {
+	if s.attemptProviderPayment(ctx, inv) {
+		return
+	}
 	if s.charger == nil || s.lookup == nil || s.settler == nil {
 		return
 	}
@@ -237,4 +252,45 @@ func (s *RenewalService) attemptPayment(ctx context.Context, inv *domain.Invoice
 		slog.ErrorContext(ctx, "renewal charge succeeded but settlement failed (webhook will reconcile)",
 			"invoice_id", inv.ID, "error", err)
 	}
+}
+
+// attemptProviderPayment charges a method saved on a non-Stripe gateway
+// (Moyasar token). It reports true when it owned the attempt (the customer's
+// method resolved to a registered provider), whatever the charge outcome, so
+// the caller must not also try the Stripe path. false means "not mine": the
+// Stripe path runs exactly as before.
+func (s *RenewalService) attemptProviderPayment(ctx context.Context, inv *domain.Invoice) bool {
+	if s.providerMethods == nil || s.settler == nil {
+		return false
+	}
+	if inv == nil || inv.Status != domain.InvoiceStatusOpen || inv.Total <= 0 {
+		return false
+	}
+	amountDue := inv.Total - inv.AmountPaid - inv.CreditApplied
+	if amountDue <= 0 {
+		return false
+	}
+	charger, ref, ok := s.providerMethods.Resolve(ctx, inv.CustomerID)
+	if !ok {
+		return false
+	}
+
+	// Same key as the Stripe path: a re-run after a crash replays the same
+	// gateway charge (Moyasar derives its given_id from it) and never doubles.
+	idemKey := fmt.Sprintf("renewal-%s", inv.ID)
+	result, err := charger.ChargeSavedPaymentMethod(ctx, "", ref, amountDue, inv.Currency, inv.ID.String(), idemKey)
+	if err != nil || result == nil || !result.Success {
+		slog.WarnContext(ctx, "renewal provider payment attempt failed; invoice left open for dunning",
+			"invoice_id", inv.ID, "error", err)
+		return true
+	}
+	// The renewal sweep's ctx carries no tenant; settlement reads the invoice
+	// tenant-scoped, so inject the invoice's own tenant (as the retry worker
+	// and webhook handlers do).
+	tenantCtx := context.WithValue(ctx, domain.TenantIDKey, inv.TenantID)
+	if _, err := s.settler.MarkInvoicePaid(tenantCtx, inv.ID); err != nil {
+		slog.ErrorContext(ctx, "renewal provider charge succeeded but settlement failed (webhook will reconcile)",
+			"invoice_id", inv.ID, "error", err)
+	}
+	return true
 }

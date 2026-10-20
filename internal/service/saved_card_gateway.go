@@ -71,3 +71,59 @@ func (r *SavedCardGatewayRouter) ChargerFor(ctx context.Context, gatewayConnecti
 	}
 	return r.buildStripe(secret), nil
 }
+
+// providerMethodLookup reads a customer's provider-tagged saved method.
+// Satisfied by *db.CustomerRepository.
+type providerMethodLookup interface {
+	GetSavedGatewayMethod(ctx context.Context, customerID uuid.UUID) (domain.SavedPaymentMethod, error)
+}
+
+// ProviderSavedMethods routes off-session charges for methods saved on a
+// non-Stripe gateway (customers.pm_provider, e.g. "moyasar") to that gateway's
+// charger. Renewal, dunning retry and wallet auto-recharge consult it BEFORE
+// their Stripe saved-card path; whenever Resolve reports ok=false the caller
+// continues down that Stripe path unchanged. A nil *ProviderSavedMethods
+// resolves nothing.
+type ProviderSavedMethods struct {
+	lookup   providerMethodLookup
+	chargers map[string]SavedCardCharger
+}
+
+// NewProviderSavedMethods builds the resolver over the customer lookup.
+func NewProviderSavedMethods(lookup providerMethodLookup) *ProviderSavedMethods {
+	return &ProviderSavedMethods{lookup: lookup, chargers: map[string]SavedCardCharger{}}
+}
+
+// Register makes provider's saved methods chargeable through c. Stripe keeps
+// its own path, so registering "stripe" has no effect on Resolve.
+func (p *ProviderSavedMethods) Register(provider string, c SavedCardCharger) {
+	if p == nil || c == nil {
+		return
+	}
+	if p.chargers == nil {
+		p.chargers = map[string]SavedCardCharger{}
+	}
+	p.chargers[provider] = c
+}
+
+// Resolve returns the charger and the method reference to charge for the
+// customer. ok is true only when the lookup succeeds, the saved method's
+// provider is a registered non-Stripe provider, and a reference is stored.
+func (p *ProviderSavedMethods) Resolve(ctx context.Context, customerID uuid.UUID) (SavedCardCharger, string, bool) {
+	if p == nil || p.lookup == nil || len(p.chargers) == 0 {
+		return nil, "", false
+	}
+	m, err := p.lookup.GetSavedGatewayMethod(ctx, customerID)
+	if err != nil {
+		return nil, "", false
+	}
+	provider := m.ProviderOrStripe()
+	if provider == domain.SavedMethodStripe || m.PaymentMethodRef == "" {
+		return nil, "", false
+	}
+	c, ok := p.chargers[provider]
+	if !ok || c == nil {
+		return nil, "", false
+	}
+	return c, m.PaymentMethodRef, true
+}
