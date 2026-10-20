@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/recurso-dev/recurso/internal/core/domain"
 	"github.com/recurso-dev/recurso/internal/core/port"
+	"github.com/recurso-dev/recurso/internal/service"
 )
 
 // paymentInspector is the subset of a gateway that can read back a payment for
@@ -79,18 +80,19 @@ type CheckoutHandler struct {
 	// Per-tenant (BYO) resolution; nil => env values above (backward compat).
 	gwResolver checkoutGatewayResolver
 	connLookup checkoutConnLookup
-	// Moyasar (SAR) embedded-form checkout; a nil fetcher disables verify.
-	moyasar               moyasarPaymentFetcher
-	moyasarCards          gatewayCardSaver
+	// Moyasar (SAR) embedded-form checkout; unset disables it.
+	moyasar               paymentReader
+	moyasarSettler        paymentSettler
 	moyasarPublishableKey string
+	logger                *slog.Logger
 }
 
 // SetMoyasar wires the Moyasar embedded-form checkout. fetcher reads payments
-// back with the secret key for verification; saver stores the card token a
-// paid payment created; publishableKey is handed to the browser form.
-func (h *CheckoutHandler) SetMoyasar(fetcher moyasarPaymentFetcher, saver gatewayCardSaver, publishableKey string) {
+// back with the secret key; settler is the settlement path the webhook shares;
+// publishableKey is handed to the browser form.
+func (h *CheckoutHandler) SetMoyasar(fetcher paymentReader, settler paymentSettler, publishableKey string) {
 	h.moyasar = fetcher
-	h.moyasarCards = saver
+	h.moyasarSettler = settler
 	h.moyasarPublishableKey = publishableKey
 }
 
@@ -173,6 +175,7 @@ func NewCheckoutHandler(repo port.InvoiceRepository, gw port.PaymentGateway, ins
 		inspector:      inspector,
 		settler:        settler,
 		publishableKey: publishableKey,
+		logger:         slog.Default().With("component", "checkout_handler"),
 	}
 }
 
@@ -204,8 +207,13 @@ func (h *CheckoutHandler) ShowCheckout(c *gin.Context) {
 			"tax_amount":     invoice.TaxAmount,
 			"total":          invoice.Total,
 			"display_amount": domain.FormatMoneyPlain(invoice.Total, invoice.Currency),
-			"due_date":       invoice.DueDate.Format("2006-01-02"),
-			"customer_id":    invoice.CustomerID,
+			// What the buyer still owes after partial payments and applied credit.
+			"amount_paid":        invoice.AmountPaid,
+			"credit_applied":     invoice.CreditApplied,
+			"amount_due":         invoice.AmountDue,
+			"display_amount_due": domain.FormatMoneyPlain(invoice.AmountDue, invoice.Currency),
+			"due_date":           invoice.DueDate.Format("2006-01-02"),
+			"customer_id":        invoice.CustomerID,
 		},
 	})
 }
@@ -280,8 +288,8 @@ func (h *CheckoutHandler) InitiatePayment(c *gin.Context) {
 		respondError(c, http.StatusServiceUnavailable, codeInternalError, "checkout is not fully configured (missing Razorpay key id)")
 		return
 	}
-	if gatewayName == "moyasar" && h.moyasarPublishableKey == "" {
-		respondError(c, http.StatusServiceUnavailable, codeInternalError, "checkout is not fully configured (missing Moyasar publishable key)")
+	if gatewayName == string(domain.GatewayMoyasar) && (h.moyasarPublishableKey == "" || h.moyasarSettler == nil) {
+		respondError(c, http.StatusServiceUnavailable, codeCheckoutUnavailable, "checkout is not fully configured (missing Moyasar publishable key)")
 		return
 	}
 
@@ -307,11 +315,13 @@ func (h *CheckoutHandler) InitiatePayment(c *gin.Context) {
 		"publishable_key": stripePubKey,
 		"razorpay_key_id": razorpayKeyID,
 	}
-	if gatewayName == "moyasar" {
+	if gatewayName == string(domain.GatewayMoyasar) {
 		// The embedded form creates the payment in the browser, so it needs the
 		// outstanding balance (verify requires amount >= due), a description,
 		// and the invoice_id metadata the server-side read-back binds on.
-		data["amount"] = moyasarAmountDue(invoice)
+		// save_card is the consent the page must disclose before payment.
+		data["amount"] = invoice.AmountDue
+		data["save_card"] = h.moyasarSettler.SavesCard(payCtx, invoice)
 		data["moyasar_publishable_key"] = h.moyasarPublishableKey
 		data["description"] = "Invoice " + invoice.InvoiceNumber
 		data["metadata"] = gin.H{"invoice_id": invoice.ID.String()}
@@ -514,11 +524,9 @@ func (h *CheckoutHandler) RazorpayVerify(c *gin.Context) {
 }
 
 // MoyasarVerify settles an invoice after a Moyasar embedded-form payment. The
-// browser supplies only the payment id (from the callback redirect); the
-// server fetches the payment with the secret key and settles only when Moyasar
-// reports it paid AND it is bound to this invoice (metadata, currency, amount
-// >= due). The redirect's own status param is never trusted. The webhook
-// (payment_paid) remains the authoritative backstop.
+// browser supplies only the payment id from the return URL; the server fetches
+// the payment with the secret key and settles through the path the webhook
+// shares, only when Moyasar reports it paid and it is bound to this invoice.
 func (h *CheckoutHandler) MoyasarVerify(c *gin.Context) {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -540,8 +548,9 @@ func (h *CheckoutHandler) MoyasarVerify(c *gin.Context) {
 		respondCheckoutStatus(c, invoice, "paid")
 		return
 	}
-	if h.moyasar == nil {
-		respondError(c, http.StatusServiceUnavailable, codeInternalError, "moyasar checkout isn't available on this deployment")
+	// Without the settlement path the buyer must never be told "paid".
+	if h.moyasar == nil || h.moyasarSettler == nil {
+		respondError(c, http.StatusServiceUnavailable, codeCheckoutUnavailable, "moyasar checkout isn't available on this deployment")
 		return
 	}
 
@@ -554,15 +563,17 @@ func (h *CheckoutHandler) MoyasarVerify(c *gin.Context) {
 	}
 
 	p, err := h.moyasar.FetchPayment(ctx, req.PaymentID)
-	if err != nil {
-		respondError(c, http.StatusBadGateway, codeInternalError, "could not confirm the payment")
+	if err != nil || p == nil {
+		h.logger.Warn("moyasar checkout: could not fetch payment", "invoice_id", invoice.ID, "payment_id", req.PaymentID, "error", err)
+		respondError(c, http.StatusBadGateway, codeGatewayUnavailable, "could not confirm the payment")
 		return
 	}
 
-	// Bind before reporting anything: a payment for another invoice, in another
-	// currency, or for less than is owed must never settle this one.
-	if err := checkMoyasarPaymentForInvoice(p, invoice); err != nil {
-		respondError(c, http.StatusBadRequest, codeValidationFailed, err.Error())
+	// Bind before reporting anything. One message for every binding failure,
+	// so the endpoint does not tell a prober which check failed.
+	if err := service.BindPaymentToInvoice(p, invoice); err != nil {
+		h.logger.Warn("moyasar checkout: payment not bound to invoice", "invoice_id", invoice.ID, "payment_id", p.ID, "reason", err.Error())
+		respondError(c, http.StatusBadRequest, codePaymentMismatch, "payment does not match this invoice")
 		return
 	}
 
@@ -584,21 +595,10 @@ func (h *CheckoutHandler) MoyasarVerify(c *gin.Context) {
 		return
 	}
 
-	// Verified paid and bound — settle through the ledger path (idempotent
-	// with the webhook).
-	tenantCtx := context.WithValue(ctx, domain.TenantIDKey, invoice.TenantID)
-	if h.settler != nil {
-		if _, err := h.settler.MarkInvoicePaid(tenantCtx, invoice.ID); err != nil {
-			respondError(c, http.StatusInternalServerError, codeInternalError, "failed to settle invoice")
-			return
-		}
+	if _, err := h.moyasarSettler.Settle(ctx, invoice, p); err != nil {
+		h.logger.Error("moyasar checkout: settlement failed", "invoice_id", invoice.ID, "payment_id", p.ID, "error", err)
+		respondError(c, http.StatusInternalServerError, codeInternalError, "failed to settle invoice")
+		return
 	}
-	// Best-effort: record the refundable payment id and keep the card for
-	// off-session renewals (the webhook does both too).
-	_ = h.invoiceRepo.SetGatewayPaymentID(ctx, invoice.TenantID, invoice.ID, p.ID)
-	if err := saveMoyasarCard(tenantCtx, h.moyasarCards, p, invoice); err != nil {
-		slog.WarnContext(ctx, "moyasar checkout: saving card failed", "invoice_id", invoice.ID, "error", err)
-	}
-
 	respondCheckoutStatus(c, invoice, "paid")
 }

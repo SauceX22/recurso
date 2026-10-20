@@ -1,8 +1,11 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -220,7 +223,11 @@ func TestBindPaymentToInvoice_AcceptsLowerCaseCurrencyAndOverpayment(t *testing.
 // A second paid payment for an invoice another payment settled must not
 // replace the refund target or the saved card.
 func TestGatewaySettlement_SecondPaymentIsFlaggedNotRecorded(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 	f := newSettlementFixture()
+	slog.SetDefault(prev)
 	f.settler.transitioned = false
 	f.claims.recorded = "pay-A"
 	transitioned, err := f.svc.Settle(context.Background(), f.inv, f.payment)
@@ -235,6 +242,9 @@ func TestGatewaySettlement_SecondPaymentIsFlaggedNotRecorded(t *testing.T) {
 	}
 	if len(f.outcomes.outcomes) != 0 || len(f.campaigns.invoices) != 0 {
 		t.Fatal("dunning recovery recorded without the paid transition")
+	}
+	if out := logs.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "duplicate charge") || !strings.Contains(out, "payment_id=pay-1") {
+		t.Fatalf("duplicate payment not flagged for refund; logs:\n%s", out)
 	}
 }
 
