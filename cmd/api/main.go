@@ -1674,19 +1674,7 @@ func main() {
 	platformRepo := db.NewPlatformRepository(database)
 	platformChargeRepo := db.NewCloudChargeRepository(database)
 
-	// gateway_mode drives the dashboard's "Test mode" chip: "test" when any
-	// configured gateway key is a test key, "live" when keys are live-only,
-	// "none" when no real gateway is configured (mock).
-	gatewayMode := "none"
-	stripeKey := os.Getenv("STRIPE_SECRET_KEY")
-	razorpayKey := os.Getenv("RAZORPAY_KEY_ID")
-	if stripeKey != "" || razorpayKey != "" {
-		if strings.HasPrefix(stripeKey, "sk_test") || strings.HasPrefix(razorpayKey, "rzp_test") {
-			gatewayMode = "test"
-		} else {
-			gatewayMode = "live"
-		}
-	}
+	gatewayMode := gatewayModeFromEnv(os.Getenv, !demo.Enabled())
 
 	// Public Routes — stricter rate limit (20 req/min per IP) for endpoints
 	// worth brute-forcing (credentials, tokens, payment initiation).
