@@ -99,10 +99,14 @@ func (r *SavedCardGatewayRouter) SetCurrencyRouting(p currencyProviders) {
 }
 
 // ChargerFor returns the charger for m, refusing with ErrSavedMethodNotRoutable
-// when currency routes to a different gateway than the one m lives on.
+// when currency routes to a different saved-card gateway than the one m lives on.
 func (r *SavedCardGatewayRouter) ChargerFor(ctx context.Context, m domain.SavedPaymentMethod, currency string) (SavedCardCharger, error) {
 	if r.routes != nil {
-		if want := r.routes.ProviderFor(currency); want != m.Provider {
+		// A Stripe card keeps reaching currencies whose gateway can't charge a
+		// saved method (INR on Razorpay, EUR on GoCardless), as it always has.
+		want := r.routes.ProviderFor(currency)
+		_, wantCharges := r.platform[want]
+		if want != m.Provider && (m.Provider != domain.GatewayStripe || wantCharges) {
 			return nil, fmt.Errorf("%w: %s method, %s routes to %s", ErrSavedMethodNotRoutable, m.Provider, currency, want)
 		}
 	}

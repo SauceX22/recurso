@@ -160,13 +160,15 @@ func (f fixedRoutes) ProviderFor(currency string) domain.GatewayProvider {
 
 // A saved method is charged only on the gateway its charge's currency routes
 // to: a customer with one slot can't have their USD renewal sent to Moyasar,
-// or their SAR renewal sent to Stripe.
+// or their SAR renewal sent to Stripe. A Stripe card keeps its historical
+// reach into currencies whose gateway has no saved-card charger (INR on
+// Razorpay, EUR on GoCardless).
 func TestSavedCardGatewayRouter_CurrencyGuard(t *testing.T) {
 	stripe := &namedCharger{name: "stripe"}
 	moyasar := &namedCharger{name: "moyasar"}
 	r := NewSavedCardGatewayRouter(nil, nil, stripe)
 	r.RegisterProvider(domain.GatewayMoyasar, moyasar)
-	r.SetCurrencyRouting(fixedRoutes{"SAR": domain.GatewayMoyasar})
+	r.SetCurrencyRouting(fixedRoutes{"SAR": domain.GatewayMoyasar, "INR": domain.GatewayRazorpay, "EUR": domain.GatewayGoCardless})
 
 	for _, tc := range []struct {
 		name     string
@@ -178,6 +180,9 @@ func TestSavedCardGatewayRouter_CurrencyGuard(t *testing.T) {
 		{"stripe card for USD", stripeMethod(nil), "USD", stripe},
 		{"stripe card for SAR", stripeMethod(nil), "SAR", nil},
 		{"moyasar token for USD", moyasarMethod(), "USD", nil},
+		{"stripe card for INR", stripeMethod(nil), "INR", stripe},
+		{"stripe card for EUR", stripeMethod(nil), "EUR", stripe},
+		{"moyasar token for INR", moyasarMethod(), "INR", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := r.ChargerFor(context.Background(), tc.m, tc.currency)
@@ -199,6 +204,7 @@ func TestSavedCardGatewayRouter_CurrencyGuardBeforeConnection(t *testing.T) {
 	connID := uuid.New()
 	opener := &fakeConnOpener{getErr: errors.New("must not be called")}
 	r := NewSavedCardGatewayRouter(opener, func(string) SavedCardCharger { return &namedCharger{} }, nil)
+	r.RegisterProvider(domain.GatewayMoyasar, &namedCharger{name: "moyasar"})
 	r.SetCurrencyRouting(fixedRoutes{"SAR": domain.GatewayMoyasar})
 	if _, err := r.ChargerFor(context.Background(), stripeMethod(&connID), "SAR"); !errors.Is(err, ErrSavedMethodNotRoutable) {
 		t.Fatalf("err = %v, want ErrSavedMethodNotRoutable", err)
