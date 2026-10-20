@@ -119,7 +119,7 @@ func (r *WalletRepository) ListByTenant(ctx context.Context, tenantID uuid.UUID,
 
 func (r *WalletRepository) UpdateAutoRecharge(ctx context.Context, tenantID, id uuid.UUID, threshold, amount *int64) error {
 	res, err := r.db.ExecContext(ctx, `
-		UPDATE wallets SET auto_recharge_threshold = $3, auto_recharge_amount = $4, updated_at = NOW()
+		UPDATE wallets SET auto_recharge_threshold = $3, auto_recharge_amount = $4, updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond')
 		WHERE tenant_id = $1 AND id = $2`,
 		tenantID, id, threshold, amount)
 	if err != nil {
@@ -173,7 +173,7 @@ func (r *WalletRepository) TopUp(ctx context.Context, wtx *domain.WalletTransact
 		return false, nil
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE wallets SET balance = $3, updated_at = NOW() WHERE tenant_id = $1 AND id = $2`,
+		`UPDATE wallets SET balance = $3, updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond') WHERE tenant_id = $1 AND id = $2`,
 		wtx.TenantID, wtx.WalletID, balance); err != nil {
 		return false, fmt.Errorf("failed to update wallet balance: %w", err)
 	}
@@ -325,7 +325,7 @@ func (r *WalletRepository) Drain(ctx context.Context, tenantID, walletID uuid.UU
 		return 0, fmt.Errorf("failed to insert wallet drain: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE wallets SET balance = $3, updated_at = NOW() WHERE tenant_id = $1 AND id = $2`,
+		`UPDATE wallets SET balance = $3, updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond') WHERE tenant_id = $1 AND id = $2`,
 		tenantID, walletID, balance); err != nil {
 		return 0, fmt.Errorf("failed to update wallet balance after drain: %w", err)
 	}
@@ -432,7 +432,7 @@ func (r *WalletRepository) finishExpiry(ctx context.Context, tx *sql.Tx, tenantI
 		return uuid.Nil, fmt.Errorf("failed to insert expiry transaction: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE wallets SET balance = $3, updated_at = NOW() WHERE tenant_id = $1 AND id = $2`,
+		`UPDATE wallets SET balance = $3, updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond') WHERE tenant_id = $1 AND id = $2`,
 		tenantID, walletID, balance); err != nil {
 		return uuid.Nil, fmt.Errorf("failed to update wallet balance after expiry: %w", err)
 	}
@@ -464,6 +464,10 @@ func (r *WalletRepository) ListDueForRecharge(ctx context.Context, limit int) ([
 	return wallets, rows.Err()
 }
 
+// MarkRechargeAttempted moves updated_at forward after a declined recharge.
+// Every wallet write advances updated_at strictly (never back to an earlier
+// NOW()), because the auto-recharge idempotency key is derived from it and
+// must never repeat.
 func (r *WalletRepository) MarkRechargeAttempted(ctx context.Context, tenantID, walletID uuid.UUID) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE wallets SET updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond') WHERE tenant_id = $1 AND id = $2`,
