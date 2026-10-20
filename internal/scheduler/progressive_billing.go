@@ -36,7 +36,7 @@ type ProgressiveBillingScheduler struct {
 
 // progressiveSweepRepo lists the sweep's candidate subscriptions.
 type progressiveSweepRepo interface {
-	ListActiveProgressiveSubscriptionIDs(ctx context.Context) ([]uuid.UUID, error)
+	ListActiveProgressiveSubscriptionIDs(ctx context.Context) ([]domain.TenantScopedID, error)
 }
 
 // progressiveBiller generates an interim invoice for one subscription when its
@@ -125,8 +125,11 @@ func (s *ProgressiveBillingScheduler) run() {
 	}
 
 	var billed int
-	for _, id := range ids {
-		inv, err := s.biller.GenerateProgressiveInvoiceForSub(ctx, id)
+	for _, ref := range ids {
+		id := ref.ID
+		// The sweep ctx is tenantless; the biller's subscription/plan/customer reads fail closed without the row's tenant.
+		tctx := context.WithValue(ctx, domain.TenantIDKey, ref.TenantID)
+		inv, err := s.biller.GenerateProgressiveInvoiceForSub(tctx, id)
 		if err != nil {
 			slog.Error("progressive sweep: interim billing failed", "subscription_id", id, "error", err)
 			continue

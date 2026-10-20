@@ -1306,7 +1306,7 @@ func (UnimplementedProgressiveBillingRepository) GetThreshold(context.Context, u
 	panic("porttest: ProgressiveBillingRepository.GetThreshold is not implemented")
 }
 
-func (UnimplementedProgressiveBillingRepository) ListActiveProgressiveSubscriptionIDs(context.Context) ([]uuid.UUID, error) {
+func (UnimplementedProgressiveBillingRepository) ListActiveProgressiveSubscriptionIDs(context.Context) ([]domain.TenantScopedID, error) {
 	panic("porttest: ProgressiveBillingRepository.ListActiveProgressiveSubscriptionIDs is not implemented")
 }
 
