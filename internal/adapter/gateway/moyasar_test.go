@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ import (
 
 type moyasarCall struct {
 	method, path, rawPath, auth, contentType string
+	query                                    url.Values
 	body                                     map[string]any
 }
 
@@ -48,8 +50,23 @@ func (r *moyasarRecorder) count(method string) int {
 	return n
 }
 
+// to returns the calls made with method to path, in order.
+func (r *moyasarRecorder) to(method, path string) []moyasarCall {
+	var out []moyasarCall
+	for _, c := range r.all() {
+		if c.method == method && c.path == path {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+const moyasarNoPayments = `{"payments":[],"meta":{"current_page":1,"next_page":null,"total_count":0}}`
+
 // moyasarTestServer serves canned replies keyed by "METHOD /path"; an
-// unrouted request gets a 404 so a stray call fails the test loudly.
+// unrouted request gets a 404 so a stray call fails the test loudly. The
+// payment list an invoice charge consults first answers "none" unless a
+// test routes it.
 func moyasarTestServer(t *testing.T, routes map[string]moyasarReply) (*httptest.Server, *moyasarRecorder) {
 	t.Helper()
 	rec := &moyasarRecorder{}
@@ -60,6 +77,7 @@ func moyasarTestServer(t *testing.T, routes map[string]moyasarReply) (*httptest.
 			rawPath:     r.URL.EscapedPath(),
 			auth:        r.Header.Get("Authorization"),
 			contentType: r.Header.Get("Content-Type"),
+			query:       r.URL.Query(),
 		}
 		_ = json.NewDecoder(r.Body).Decode(&c.body)
 		rec.mu.Lock()
@@ -68,6 +86,9 @@ func moyasarTestServer(t *testing.T, routes map[string]moyasarReply) (*httptest.
 
 		w.Header().Set("Content-Type", "application/json")
 		reply, ok := routes[r.Method+" "+r.URL.Path]
+		if !ok && r.Method == http.MethodGet && r.URL.Path == "/payments" {
+			reply, ok = moyasarReply{http.StatusOK, moyasarNoPayments}, true
+		}
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"type":"api_error","message":"Object not found","errors":null}`))
@@ -150,9 +171,9 @@ func TestMoyasarChargeSavedPaymentMethod(t *testing.T) {
 		t.Fatalf("res = %+v, want success with PaymentID = given_id %s", res, givenID)
 	}
 
-	calls := rec.all()
-	if len(calls) != 1 || calls[0].method != http.MethodPost || calls[0].path != "/payments" {
-		t.Fatalf("calls = %+v, want exactly one POST /payments", calls)
+	calls := rec.to(http.MethodPost, "/payments")
+	if len(calls) != 1 || len(rec.all()) != 2 {
+		t.Fatalf("calls = %+v, want the paid-payment lookup then exactly one POST /payments", rec.all())
 	}
 	c := calls[0]
 	if c.contentType != "application/json" {
@@ -216,7 +237,7 @@ func TestMoyasarChargeSameKeySameGivenIDOnTheWire(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	}
-	calls := rec.all()
+	calls := rec.to(http.MethodPost, "/payments")
 	if calls[0].body["given_id"] != calls[1].body["given_id"] {
 		t.Fatal("replaying the same key must send the same given_id")
 	}
@@ -338,8 +359,8 @@ func TestMoyasarChargeBadRequestWithNoExistingPaymentIsRejected(t *testing.T) {
 		t.Fatalf("ErrorMsg = %q, want the create's error %q, not the read-back's", res.ErrorMsg, want)
 	}
 	calls := rec.all()
-	if len(calls) != 2 || calls[1].method != http.MethodGet || calls[1].path != "/payments/"+givenID {
-		t.Fatalf("calls = %+v, want POST then GET /payments/%s", calls, givenID)
+	if len(calls) != 3 || calls[1].method != http.MethodPost || calls[2].method != http.MethodGet || calls[2].path != "/payments/"+givenID {
+		t.Fatalf("calls = %+v, want lookup, POST, then GET /payments/%s", calls, givenID)
 	}
 }
 
@@ -381,8 +402,76 @@ func TestMoyasarChargeAlreadyCreatedOnlyOnBadRequest(t *testing.T) {
 	if err == nil || res.ErrorCode != "gateway_error" {
 		t.Fatalf("res = %+v, err = %v; want gateway_error", res, err)
 	}
-	if n := rec.count(http.MethodGet); n != 0 {
-		t.Fatalf("GET count = %d, want 0", n)
+	if n := len(rec.to(http.MethodGet, "/payments/"+moyasarGivenID("renewal-inv-1"))); n != 0 {
+		t.Fatalf("given_id read-backs = %d, want 0", n)
+	}
+}
+
+// --- Already-paid invoices ---
+
+// A charge whose response was lost (timeout, crash) can have paid the invoice
+// under a different key than the next attempt uses (renewal-<inv> then
+// retry-<inv>-1), and without the webhook nothing settled it. Charging again
+// would take the money twice.
+func TestMoyasarChargeInvoiceAlreadyPaidIsNotChargedAgain(t *testing.T) {
+	const earlier = "11111111-2222-4333-8444-555555555555"
+	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+		"GET /payments": {http.StatusOK, `{"payments":[` + moyasarPaymentJSON(earlier, "paid", "00", "APPROVED") + `],"meta":{"total_count":1}}`},
+	})
+	g := testMoyasar(srv.URL)
+
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "retry-inv-1-1"})
+	if err != nil || !res.Success || res.PaymentID != earlier {
+		t.Fatalf("res = %+v, err = %v; want success with the earlier payment %s", res, err, earlier)
+	}
+	if n := rec.count(http.MethodPost); n != 0 {
+		t.Fatalf("POST count = %d, want 0: the invoice is already paid", n)
+	}
+	q := rec.to(http.MethodGet, "/payments")[0].query
+	if q.Get("metadata[invoice_id]") != "inv-1" || q.Get("status") != "paid" {
+		t.Fatalf("lookup query = %v, want metadata[invoice_id]=inv-1&status=paid", q)
+	}
+}
+
+// Only a paid payment that covers this charge in its currency counts.
+func TestMoyasarChargeIgnoresPaidPaymentsThatDontCover(t *testing.T) {
+	for _, tc := range []struct{ name, amount, currency string }{
+		{"smaller amount", "5000", "SAR"},
+		{"other currency", "10000", "USD"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			givenID := moyasarGivenID("retry-inv-1-1")
+			srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+				"GET /payments": {http.StatusOK, `{"payments":[{"id":"other","status":"paid","amount":` + tc.amount +
+					`,"currency":"` + tc.currency + `","metadata":{"invoice_id":"inv-1"},"source":{}}]}`},
+				"POST /payments": {http.StatusCreated, moyasarPaymentJSON(givenID, "paid", "00", "APPROVED")},
+			})
+			g := testMoyasar(srv.URL)
+
+			res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "retry-inv-1-1"})
+			if err != nil || !res.Success || res.PaymentID != givenID {
+				t.Fatalf("res = %+v, err = %v; want a new charge %s", res, err, givenID)
+			}
+			if n := rec.count(http.MethodPost); n != 1 {
+				t.Fatalf("POST count = %d, want 1", n)
+			}
+		})
+	}
+}
+
+// If Moyasar can't say whether the invoice is paid, don't charge blind.
+func TestMoyasarChargeLookupFailureDoesNotCharge(t *testing.T) {
+	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+		"GET /payments": {http.StatusBadGateway, ``},
+	})
+	g := testMoyasar(srv.URL)
+
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "retry-inv-1-1"})
+	if err == nil || res == nil || res.Success {
+		t.Fatalf("res = %+v, err = %v; want an error", res, err)
+	}
+	if n := rec.count(http.MethodPost); n != 0 {
+		t.Fatalf("POST count = %d, want 0", n)
 	}
 }
 

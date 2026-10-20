@@ -227,6 +227,16 @@ func (g *MoyasarGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.
 		return &port.PaymentResult{Success: false, ErrorCode: "invalid_request", ErrorMsg: err.Error()}, err
 	}
 
+	if req.InvoiceID != "" {
+		paid, err := g.paidPaymentFor(ctx, req)
+		if err != nil {
+			return &port.PaymentResult{Success: false, ErrorCode: "gateway_error", ErrorMsg: err.Error()}, err
+		}
+		if paid != nil {
+			return &port.PaymentResult{Success: true, PaymentID: paid.ID}, nil
+		}
+	}
+
 	givenID := moyasarGivenID(req.IdempotencyKey)
 	var out moyasarPayment
 	err := g.do(ctx, http.MethodPost, "/payments", map[string]any{
@@ -270,6 +280,28 @@ func (g *MoyasarGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.
 		return &port.PaymentResult{Success: false, ErrorCode: "gateway_error", ErrorMsg: err.Error()}, err
 	}
 	return mapMoyasarCharge(&out), nil
+}
+
+// paidPaymentFor returns a paid payment already bound to req's invoice that
+// covers the charge, or nil. Each attempt uses its own given_id, so a payment
+// whose response was lost under an earlier key (renewal, then a dunning retry)
+// is only found by asking Moyasar which payments carry the invoice.
+func (g *MoyasarGateway) paidPaymentFor(ctx context.Context, req port.SavedMethodCharge) (*moyasarPayment, error) {
+	q := url.Values{"metadata[invoice_id]": {req.InvoiceID}, "status": {"paid"}}
+	var out struct {
+		Payments []moyasarPayment `json:"payments"`
+	}
+	if err := g.do(ctx, http.MethodGet, "/payments?"+q.Encode(), nil, &out); err != nil {
+		return nil, err
+	}
+	for i := range out.Payments {
+		p := &out.Payments[i]
+		if p.Status == "paid" && p.Metadata["invoice_id"] == req.InvoiceID &&
+			strings.EqualFold(p.Currency, req.Currency) && p.Amount-p.Refunded >= req.Amount {
+			return p, nil
+		}
+	}
+	return nil, nil
 }
 
 // moyasarRejected reports whether an HTTP status means Moyasar refused this
