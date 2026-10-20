@@ -325,22 +325,50 @@ func TestMoyasarChargeAlreadyCreatedFetchFails(t *testing.T) {
 	}
 }
 
-func TestMoyasarChargeOtherBadRequestIsGatewayError(t *testing.T) {
-	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
-		"POST /payments": {http.StatusBadRequest,
+// Moyasar rejecting the charge itself (an inactive or deleted token, a request
+// it won't accept) is an answer, not an outage: returned as an error, the
+// dunning worker would retry it every five minutes forever.
+func TestMoyasarChargeRejectedIsPermanentFailureNotError(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"validation failed", http.StatusBadRequest,
 			`{"type":"invalid_request_error","message":"Validation Failed","errors":{"amount":["must be greater than 100"]}}`},
+		{"token not found", http.StatusNotFound, `{"type":"api_error","message":"Object not found","errors":null}`},
+		{"not activated for live", http.StatusMethodNotAllowed, `{"type":"account_inactive_error","message":"Not activated","errors":null}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := moyasarTestServer(t, map[string]moyasarReply{
+				"POST /payments": {tc.status, tc.body},
+			})
+			g := testMoyasar(srv.URL)
+
+			res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 50, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
+			if err != nil {
+				t.Fatalf("a rejected charge is a result, not an error: %v", err)
+			}
+			if res.Success || !res.Permanent || res.ErrorCode != "invalid_payment_method" {
+				t.Fatalf("res = %+v, want a permanent invalid_payment_method failure", res)
+			}
+			if !strings.Contains(res.ErrorMsg, "moyasar /payments") {
+				t.Fatalf("ErrorMsg = %q, want Moyasar's answer for diagnosis", res.ErrorMsg)
+			}
+		})
+	}
+}
+
+// Throttling is transient and says nothing about the card: keep it an error
+// so the worker retries the same attempt shortly.
+func TestMoyasarChargeRateLimitedIsError(t *testing.T) {
+	srv, _ := moyasarTestServer(t, map[string]moyasarReply{
+		"POST /payments": {http.StatusTooManyRequests, `{"type":"rate_limit_error","message":"Too many requests","errors":null}`},
 	})
 	g := testMoyasar(srv.URL)
 
-	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 50, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
-	if err == nil || res.ErrorCode != "gateway_error" || res.Success {
-		t.Fatalf("res = %+v, err = %v; want gateway_error", res, err)
-	}
-	if want := "moyasar /payments: Validation Failed (invalid_request_error)"; err.Error() != want {
-		t.Fatalf("error = %q, want %q", err.Error(), want)
-	}
-	if len(rec.all()) != 1 {
-		t.Fatal("a non-idempotency 400 must not trigger a read-back")
+	if _, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"}); err == nil {
+		t.Fatal("429 must be an error")
 	}
 }
 

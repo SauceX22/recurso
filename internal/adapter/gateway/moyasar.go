@@ -242,10 +242,25 @@ func (g *MoyasarGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.
 		}
 		return mapMoyasarCharge(existing), nil
 	}
+	if errors.As(err, &apiErr) && moyasarRejected(apiErr.StatusCode) {
+		return &port.PaymentResult{Success: false, ErrorCode: "invalid_payment_method", ErrorMsg: apiErr.Error(), Permanent: true}, nil
+	}
 	if err != nil {
 		return &port.PaymentResult{Success: false, ErrorCode: "gateway_error", ErrorMsg: err.Error()}, err
 	}
 	return mapMoyasarCharge(&out), nil
+}
+
+// moyasarRejected reports whether an HTTP status means Moyasar refused this
+// charge request itself (bad or inactive token, invalid request): retrying it
+// unchanged cannot succeed. Auth failures and throttling are not about the
+// charge and stay errors, as do 5xx.
+func moyasarRejected(status int) bool {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests:
+		return false
+	}
+	return status >= 400 && status < 500
 }
 
 // mapMoyasarCharge applies the spec's decline-mapping table.
