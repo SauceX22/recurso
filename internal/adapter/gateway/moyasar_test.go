@@ -680,7 +680,7 @@ func TestMoyasarChargeRefusesBlindCharges(t *testing.T) {
 	}
 }
 
-// --- FetchPayment / VerifyPayment ---
+// --- FetchPayment ---
 
 func TestMoyasarFetchPaymentMapping(t *testing.T) {
 	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
@@ -753,26 +753,19 @@ func TestMoyasarFetchPaymentNotFound(t *testing.T) {
 	}
 }
 
-func TestMoyasarVerifyPayment(t *testing.T) {
-	srv, _ := moyasarTestServer(t, map[string]moyasarReply{
-		"GET /payments/paid-1":    {http.StatusOK, moyasarPaymentJSON("paid-1", "paid", "00", "")},
-		"GET /payments/failed-1":  {http.StatusOK, moyasarPaymentJSON("failed-1", "failed", "51", "")},
-		"GET /payments/missing-1": {http.StatusNotFound, `{"type":"api_error","message":"Object not found"}`},
+// VerifyPayment can't bind amount or currency, so it must never accept a
+// payment; settlement reads payments back with FetchPayment instead.
+func TestMoyasarVerifyPaymentNotSupported(t *testing.T) {
+	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+		"GET /payments/paid-1": {http.StatusOK, moyasarPaymentJSON("paid-1", "paid", "00", "")},
 	})
 	g := testMoyasar(srv.URL)
-	ctx := context.Background()
 
-	if err := g.VerifyPayment(ctx, "inv-1", "paid-1", ""); err != nil {
-		t.Fatalf("paid payment bound to inv-1 must verify, got %v", err)
+	if err := g.VerifyPayment(context.Background(), "inv-1", "paid-1", ""); err == nil {
+		t.Fatal("VerifyPayment must refuse")
 	}
-	if err := g.VerifyPayment(ctx, "inv-OTHER", "paid-1", ""); err == nil {
-		t.Fatal("a paid payment for a different invoice must not settle this one")
-	}
-	if err := g.VerifyPayment(ctx, "inv-1", "failed-1", ""); err == nil {
-		t.Fatal("an unpaid payment must not verify")
-	}
-	if err := g.VerifyPayment(ctx, "inv-1", "missing-1", ""); err == nil {
-		t.Fatal("an unknown payment must not verify")
+	if len(rec.all()) != 0 {
+		t.Fatal("VerifyPayment must not call Moyasar")
 	}
 }
 
@@ -1018,18 +1011,6 @@ func TestMoyasarUnsupportedSurfaces(t *testing.T) {
 	}
 	if _, err := g.CreateVirtualAccount(ctx, "c", "i", 1, "d"); err == nil {
 		t.Fatal("CreateVirtualAccount must be not-supported")
-	}
-}
-
-func TestMoyasarOwnsPaymentID(t *testing.T) {
-	g := testMoyasar("http://unused")
-	if !g.OwnsPaymentID(moyasarPaymentID) {
-		t.Fatal("a bare UUID is a Moyasar payment id")
-	}
-	for _, id := range []string{"pi_123", "order_123", "pay_123", ""} {
-		if g.OwnsPaymentID(id) {
-			t.Fatalf("OwnsPaymentID(%q) = true; must not claim other gateways' ids", id)
-		}
 	}
 }
 

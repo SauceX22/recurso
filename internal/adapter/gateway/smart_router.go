@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/recurso-dev/recurso/internal/core/domain"
@@ -130,42 +129,9 @@ func (r *SmartRouter) VerifyPayment(ctx context.Context, orderID, paymentID, sig
 		return r.Stripe.VerifyPayment(ctx, orderID, paymentID, signature)
 	}
 
-	// Any other id: ask the registered extra gateways (sorted by name, so the
-	// choice is deterministic) whether they own the PAYMENT id. The payment id,
-	// not the order id, is the discriminator: gateways without a server-side
-	// order (Moyasar) pass Recurso's invoice UUID as orderID, which says
-	// nothing about the gateway, while paymentID is the gateway's own id.
-	if gw := r.extraOwnerOf(paymentID); gw != nil {
-		return gw.VerifyPayment(ctx, orderID, paymentID, signature)
-	}
-
+	// Fallback/Error
+	// Try Razorpay default if unsure? Or error.
 	return fmt.Errorf("unknown gateway for order ID: %s", orderID)
-}
-
-// paymentIDOwner is implemented by extra gateways whose payment ids carry no
-// distinguishing prefix (Moyasar's bare UUIDs).
-type paymentIDOwner interface {
-	OwnsPaymentID(id string) bool
-}
-
-// extraOwnerOf returns the first registered extra gateway, in sorted-name
-// order, that claims id; nil when id is empty or no gateway claims it.
-func (r *SmartRouter) extraOwnerOf(id string) port.PaymentGateway {
-	if id == "" || len(r.Extra) == 0 {
-		return nil
-	}
-	names := make([]string, 0, len(r.Extra))
-	for name := range r.Extra {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		gw := r.Extra[name]
-		if owner, ok := gw.(paymentIDOwner); ok && owner.OwnsPaymentID(id) {
-			return gw
-		}
-	}
-	return nil
 }
 
 func (r *SmartRouter) CreateSubscription(ctx context.Context, planID string, totalCount int, customerEmail string, startAt *int64, currency string) (string, error) {

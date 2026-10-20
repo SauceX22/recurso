@@ -405,22 +405,6 @@ func (g *MoyasarGateway) CreateOrder(ctx context.Context, amount int64, currency
 	}, nil
 }
 
-// VerifyPayment reads the payment back and accepts it only when it is paid
-// and bound to the invoice (orderID is the invoice id; there is no signature).
-func (g *MoyasarGateway) VerifyPayment(ctx context.Context, orderID, paymentID, _ string) error {
-	p, err := g.FetchPayment(ctx, paymentID)
-	if err != nil {
-		return err
-	}
-	if p.Status != "paid" {
-		return fmt.Errorf("moyasar payment %s is %q, not paid", p.ID, p.Status)
-	}
-	if p.InvoiceID != orderID {
-		return fmt.Errorf("moyasar payment %s belongs to invoice %q, not %q", p.ID, p.InvoiceID, orderID)
-	}
-	return nil
-}
-
 // Refund refunds (part of) a payment. Moyasar has no refund idempotency key,
 // so the adapter makes exactly one refund call and never retries: a blind
 // retry after a timeout could refund twice. Instead, when the answer is lost
@@ -461,14 +445,14 @@ func (g *MoyasarGateway) Refund(ctx context.Context, paymentID string, amount in
 	return &port.RefundResult{RefundID: fmt.Sprintf("%s:%d", paymentID, out.Refunded), Status: "refunded"}, nil
 }
 
-// OwnsPaymentID reports whether id looks like a Moyasar payment id (a bare
-// UUID), for the smart router's verify fallback.
-func (g *MoyasarGateway) OwnsPaymentID(id string) bool {
-	_, err := uuid.Parse(id)
-	return err == nil
-}
-
 // --- Not supported ---
+
+// VerifyPayment is not how Moyasar payments are verified: there is no
+// server-side order or signature. Callers read the payment back with
+// FetchPayment and bind it to the invoice themselves.
+func (g *MoyasarGateway) VerifyPayment(ctx context.Context, orderID, paymentID, _ string) error {
+	return errors.New("moyasar payments are verified by FetchPayment read-back, not VerifyPayment")
+}
 
 // CreateSubscription must never return an id: a non-empty id is stored as the
 // gateway subscription id and the renewal claim then skips the subscription.
