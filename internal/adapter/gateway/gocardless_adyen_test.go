@@ -188,7 +188,7 @@ func TestAdyenChargeSavedMethodAuthorised(t *testing.T) {
 		`{"pspReference":"883Z","resultCode":"Authorised"}`)
 	g := testAdyen(srv.URL)
 
-	res, err := g.ChargeSavedPaymentMethod(context.Background(), "cus_1", "spm_9", 2900, "USD", "inv-1", "renewal-inv-1")
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{CustomerRef: "cus_1", MethodRef: "spm_9", Amount: 2900, Currency: "USD", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestAdyenChargeSavedMethodRefused(t *testing.T) {
 		`{"pspReference":"884Z","resultCode":"Refused","refusalReason":"NOT_ENOUGH_BALANCE"}`)
 	g := testAdyen(srv.URL)
 
-	res, err := g.ChargeSavedPaymentMethod(context.Background(), "cus_1", "spm_9", 2900, "USD", "inv-1", "k")
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{CustomerRef: "cus_1", MethodRef: "spm_9", Amount: 2900, Currency: "USD", InvoiceID: "inv-1", IdempotencyKey: "k"})
 	if err != nil {
 		t.Fatalf("a refusal is a result, not an error: %v", err)
 	}

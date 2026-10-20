@@ -76,9 +76,9 @@ type moyCheckoutCards struct {
 	customer uuid.UUID
 }
 
-func (s *moyCheckoutCards) SetGatewayPaymentMethod(_ context.Context, _, customerID uuid.UUID, provider, ref, _, _ string) error {
+func (s *moyCheckoutCards) SetGatewayPaymentMethod(_ context.Context, _, customerID uuid.UUID, provider domain.GatewayProvider, ref, _, _ string, _, _ int) error {
 	s.calls++
-	s.provider, s.ref, s.customer = provider, ref, customerID
+	s.provider, s.ref, s.customer = string(provider), ref, customerID
 	return nil
 }
 
@@ -247,7 +247,7 @@ func TestMoyasarVerify_PaidSettlesAndSavesCard(t *testing.T) {
 	if f.repo.setPaymentID != f.fetcher.p.ID {
 		t.Errorf("gateway payment id = %q, want %q", f.repo.setPaymentID, f.fetcher.p.ID)
 	}
-	if f.cards.calls != 1 || f.cards.provider != domain.SavedMethodMoyasar || f.cards.ref != "token_abc" || f.cards.customer != f.inv.CustomerID {
+	if f.cards.calls != 1 || f.cards.provider != string(domain.GatewayMoyasar) || f.cards.ref != "token_abc" || f.cards.customer != f.inv.CustomerID {
 		t.Errorf("card save = %+v", f.cards)
 	}
 }

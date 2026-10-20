@@ -219,20 +219,41 @@ func TestRetryWorker_ChargesOutstandingNotTotal(t *testing.T) {
 
 // --- B1 PR2: saved-card BYO routing fakes ---
 
+// fakeSavedCharger records each off-session charge request; result defaults
+// to a success with a payment id derived from name.
 type fakeSavedCharger struct {
 	name    string
 	charges int
+	result  *port.PaymentResult
+	reqs    []port.SavedMethodCharge
 }
 
-func (f *fakeSavedCharger) ChargeSavedPaymentMethod(_ context.Context, _, _ string, _ int64, _, _, _ string) (*port.PaymentResult, error) {
+func (f *fakeSavedCharger) ChargeSavedPaymentMethod(_ context.Context, req port.SavedMethodCharge) (*port.PaymentResult, error) {
 	f.charges++
+	f.reqs = append(f.reqs, req)
+	if f.result != nil {
+		return f.result, nil
+	}
 	return &port.PaymentResult{Success: true, PaymentID: "pay_" + f.name}, nil
 }
 
-type fakeCustomerLookup struct{ connID *uuid.UUID }
+// fakeCustomerLookup serves one saved method: a Stripe card by default, or a
+// method of provider/ref when set.
+type fakeCustomerLookup struct {
+	connID   *uuid.UUID
+	provider domain.GatewayProvider
+	ref      string
+	none     bool
+}
 
-func (f *fakeCustomerLookup) GetSavedPaymentMethod(_ context.Context, _ uuid.UUID) (string, string, *uuid.UUID, error) {
-	return "cus_1", "pm_1", f.connID, nil
+func (f *fakeCustomerLookup) GetSavedPaymentMethod(_ context.Context, _ uuid.UUID) (domain.SavedPaymentMethod, error) {
+	if f.none {
+		return domain.SavedPaymentMethod{Provider: domain.GatewayStripe}, nil
+	}
+	if f.provider != "" {
+		return domain.SavedPaymentMethod{Provider: f.provider, PaymentMethodRef: f.ref, GatewayConnectionID: f.connID}, nil
+	}
+	return domain.SavedPaymentMethod{Provider: domain.GatewayStripe, CustomerRef: "cus_1", PaymentMethodRef: "pm_1", GatewayConnectionID: f.connID}, nil
 }
 
 type fakeCardRouter struct {
@@ -241,9 +262,9 @@ type fakeCardRouter struct {
 	saw       bool
 }
 
-func (f *fakeCardRouter) ChargerFor(_ context.Context, connID *uuid.UUID) (service.SavedCardCharger, error) {
+func (f *fakeCardRouter) ChargerFor(_ context.Context, m domain.SavedPaymentMethod, _ string) (service.SavedCardCharger, error) {
 	f.saw = true
-	f.gotConnID = connID
+	f.gotConnID = m.GatewayConnectionID
 	return f.charger, nil
 }
 

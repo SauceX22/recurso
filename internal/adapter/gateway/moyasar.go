@@ -200,35 +200,35 @@ func moyasarGivenID(idempotencyKey string) string {
 }
 
 // ChargeSavedPaymentMethod charges a saved card token off-session (renewal,
-// dunning retry, wallet top-up). customerRef is unused: Moyasar has no
+// dunning retry, wallet top-up). CustomerRef is unused: Moyasar has no
 // customer object, the token alone identifies the card. Idempotency rides on
-// given_id (spec "Idempotency"); a declined charge returns Success=false with
-// a nil error, and Permanent marks a hard decline.
-func (g *MoyasarGateway) ChargeSavedPaymentMethod(ctx context.Context, _, token string, amount int64, currency, invoiceID, idempotencyKey string) (*port.PaymentResult, error) {
+// given_id; a declined charge returns Success=false with a nil error, and
+// Permanent marks a hard decline.
+func (g *MoyasarGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.SavedMethodCharge) (*port.PaymentResult, error) {
 	var invalid string
 	switch {
-	case idempotencyKey == "":
+	case req.IdempotencyKey == "":
 		invalid = "idempotency key is required (refusing to charge without one)"
-	case token == "":
+	case req.MethodRef == "":
 		invalid = "saved card token is required"
-	case amount <= 0:
-		invalid = fmt.Sprintf("amount must be positive, got %d", amount)
+	case req.Amount <= 0:
+		invalid = fmt.Sprintf("amount must be positive, got %d", req.Amount)
 	}
 	if invalid != "" {
 		err := errors.New("moyasar charge: " + invalid)
 		return &port.PaymentResult{Success: false, ErrorCode: "invalid_request", ErrorMsg: err.Error()}, err
 	}
 
-	givenID := moyasarGivenID(idempotencyKey)
+	givenID := moyasarGivenID(req.IdempotencyKey)
 	var out moyasarPayment
 	err := g.do(ctx, http.MethodPost, "/payments", map[string]any{
 		"given_id":     givenID,
-		"amount":       amount,
-		"currency":     strings.ToUpper(currency),
-		"description":  "Recurso invoice " + invoiceID,
-		"callback_url": g.checkoutBaseURL + "/checkout/" + invoiceID,
-		"metadata":     map[string]string{"invoice_id": invoiceID},
-		"source":       map[string]string{"type": "token", "token": token},
+		"amount":       req.Amount,
+		"currency":     strings.ToUpper(req.Currency),
+		"description":  "Recurso invoice " + req.InvoiceID,
+		"callback_url": g.checkoutBaseURL + "/checkout/" + req.InvoiceID,
+		"metadata":     map[string]string{"invoice_id": req.InvoiceID},
+		"source":       map[string]string{"type": "token", "token": req.MethodRef},
 	}, &out)
 
 	var apiErr *moyasarAPIError

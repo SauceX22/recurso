@@ -395,59 +395,48 @@ func (r *CustomerRepository) SetDefaultPaymentMethod(ctx context.Context, custom
 	return err
 }
 
-// GetSavedPaymentMethod returns the customer's Stripe customer id, default
-// PaymentMethod id, and the gateway connection the card was saved on (nil =
-// platform gateway) for off-session charging. Either string may be "" if not
-// set, in which case the caller must fall back to the interactive payment path.
-func (r *CustomerRepository) GetSavedPaymentMethod(ctx context.Context, customerID uuid.UUID) (stripeCustomerID, paymentMethodID string, gatewayConnectionID *uuid.UUID, err error) {
-	err = r.db.QueryRowContext(ctx,
-		`SELECT COALESCE(stripe_customer_id, ''), COALESCE(default_payment_method, ''), pm_gateway_connection_id
-		   FROM customers WHERE id = $1`, customerID).Scan(&stripeCustomerID, &paymentMethodID, &gatewayConnectionID)
-	return
-}
-
-// GetSavedGatewayMethod returns the customer's saved off-session method with
-// the gateway that issued it (pm_provider; "" = Stripe). Provider-neutral
-// sibling of GetSavedPaymentMethod.
+// GetSavedPaymentMethod returns the customer's saved off-session method and
+// the gateway that issued it. A NULL pm_provider is Stripe: every method saved
+// before provider tracking existed is a Stripe pm_*.
 //
-// Tenant scoping: when ctx carries a tenant the lookup filters by it. The
-// renewal, dunning and wallet sweeps run without a tenant in ctx and pass the
-// customer_id of a row they already claimed under its tenant, so for them the
-// lookup is by primary key only (same as GetSavedPaymentMethod).
-func (r *CustomerRepository) GetSavedGatewayMethod(ctx context.Context, customerID uuid.UUID) (domain.SavedPaymentMethod, error) {
-	query := `SELECT pm_provider, stripe_customer_id, default_payment_method, pm_gateway_connection_id
-		   FROM customers WHERE id = $1`
-	args := []interface{}{customerID}
-	if tenantID, ok := ctx.Value(domain.TenantIDKey).(uuid.UUID); ok {
-		query += ` AND tenant_id = $2`
-		args = append(args, tenantID)
-	}
+// Cross-tenant by design: the renewal, dunning-retry and wallet sweeps call it
+// with the customer_id of a row they already claimed under its own tenant, so
+// the primary key alone identifies the customer. Never call it with an id
+// taken from a request.
+func (r *CustomerRepository) GetSavedPaymentMethod(ctx context.Context, customerID uuid.UUID) (domain.SavedPaymentMethod, error) {
 	var provider, customerRef, methodRef sql.NullString
 	var m domain.SavedPaymentMethod
-	if err := r.db.QueryRowContext(ctx, query, args...).Scan(&provider, &customerRef, &methodRef, &m.GatewayConnectionID); err != nil {
+	err := r.db.QueryRowContext(ctx,
+		`SELECT pm_provider, stripe_customer_id, default_payment_method, pm_gateway_connection_id
+		   FROM customers WHERE id = $1`, customerID).
+		Scan(&provider, &customerRef, &methodRef, &m.GatewayConnectionID)
+	if err != nil {
 		return domain.SavedPaymentMethod{}, err
 	}
-	m.Provider = provider.String
+	m.Provider = domain.GatewayStripe
+	if provider.Valid && provider.String != "" {
+		m.Provider = domain.GatewayProvider(provider.String)
+	}
 	m.CustomerRef = customerRef.String
 	m.PaymentMethodRef = methodRef.String
 	return m, nil
 }
 
-// SetGatewayPaymentMethod records a non-Stripe reusable method (e.g. a Moyasar
-// token_*) as the customer's default: the reference, the card display fields
-// and the issuing provider. The expiry is cleared (the stored one belonged to
-// the previous card, and the card-expiry notifier must not mail about it), and
+// SetGatewayPaymentMethod records a reusable method issued by provider on the
+// platform gateway (e.g. a Moyasar token_*) as the customer's default, with its
+// card display fields. expMonth/expYear of 0 mean unknown and store NULL, so
+// the card-expiry notifier never mails about the previous card's expiry.
 // pm_gateway_connection_id is cleared because the method lives on the platform
-// gateway. stripe_customer_id is left untouched. Scoped by tenant_id; returns
+// gateway; stripe_customer_id is left untouched. Scoped by tenant_id; returns
 // sql.ErrNoRows when no row matched.
-func (r *CustomerRepository) SetGatewayPaymentMethod(ctx context.Context, tenantID, customerID uuid.UUID, provider, paymentMethodRef, brand, last4 string) error {
+func (r *CustomerRepository) SetGatewayPaymentMethod(ctx context.Context, tenantID, customerID uuid.UUID, provider domain.GatewayProvider, ref, brand, last4 string, expMonth, expYear int) error {
 	res, err := r.db.ExecContext(ctx,
 		`UPDATE customers
 		    SET default_payment_method = $1, card_brand = $2, card_last4 = $3,
-		        card_exp_month = NULL, card_exp_year = NULL,
-		        pm_provider = $4, pm_gateway_connection_id = NULL
-		  WHERE id = $5 AND tenant_id = $6`,
-		paymentMethodRef, brand, last4, provider, customerID, tenantID)
+		        card_exp_month = $4, card_exp_year = $5,
+		        pm_provider = $6, pm_gateway_connection_id = NULL
+		  WHERE id = $7 AND tenant_id = $8`,
+		ref, brand, last4, nullIfZero(expMonth), nullIfZero(expYear), string(provider), customerID, tenantID)
 	if err != nil {
 		return err
 	}
@@ -459,6 +448,14 @@ func (r *CustomerRepository) SetGatewayPaymentMethod(ctx context.Context, tenant
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// nullIfZero stores an unknown (zero) integer as NULL.
+func nullIfZero(v int) interface{} {
+	if v == 0 {
+		return nil
+	}
+	return v
 }
 
 // CustomerWithExpiringCard holds customer info for card expiry notifications

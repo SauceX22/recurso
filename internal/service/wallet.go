@@ -32,12 +32,6 @@ var (
 	ErrWalletCustomerGone = errors.New("customer not found")
 )
 
-// walletCharger charges a saved payment method for auto-recharge; the same
-// gateway slice the renewal engine uses. nil-safe.
-type walletCharger interface {
-	ChargeSavedPaymentMethod(ctx context.Context, stripeCustomerID, paymentMethodID string, amount int64, currency, invoiceID, idempotencyKey string) (*port.PaymentResult, error)
-}
-
 // walletLedger is the slice of LedgerService wallets post through. Wallets are
 // entity-scoped (Multi-Entity Books): top-up/drain legs post on the wallet's
 // own entity ledger.
@@ -65,14 +59,11 @@ type WalletService struct {
 	entities  walletEntityReader // nil-safe: entity resolution for new wallets
 	notifier  port.Notifier      // auto-recharge failure notices; nil-safe
 
-	charger walletCharger        // nil-safe: without it auto-recharge only notifies
-	lookup  renewalPaymentLookup // saved-method resolution (shared slice)
-	// chargerRouter routes the recharge to the gateway the card was saved on
-	// (B1 autopay). nil-safe: without it, `charger` (platform) is used.
-	chargerRouter renewalChargerRouter
-	// providerMethods charges methods saved on a non-Stripe gateway (Moyasar).
-	// nil-safe: when unset or unresolved, the Stripe path runs unchanged.
-	providerMethods *ProviderSavedMethods
+	charger SavedCardCharger  // nil-safe: without it auto-recharge only notifies
+	lookup  savedMethodLookup // saved-method resolution (shared slice)
+	// chargerRouter routes the recharge to the gateway the method was saved
+	// on. nil-safe: without it, only platform Stripe methods charge, on `charger`.
+	chargerRouter savedChargerRouter
 
 	now func() time.Time
 }
@@ -93,23 +84,16 @@ func (s *WalletService) SetEntityReader(r walletEntityReader) { s.entities = r }
 func (s *WalletService) SetNotifier(n port.Notifier) { s.notifier = n }
 
 // SetSavedMethodCharging wires gateway charging for auto-recharge (nil-safe).
-func (s *WalletService) SetSavedMethodCharging(charger walletCharger, lookup renewalPaymentLookup) {
+func (s *WalletService) SetSavedMethodCharging(charger SavedCardCharger, lookup savedMethodLookup) {
 	s.charger = charger
 	s.lookup = lookup
 }
 
-// SetChargerRouter wires BYO-gateway routing (B1 autopay): the recharge charges
-// on the gateway the card was saved with. nil-safe — without it, the platform
-// `charger` is used.
-func (s *WalletService) SetChargerRouter(router renewalChargerRouter) {
+// SetChargerRouter wires per-gateway routing: the recharge charges on the
+// gateway the method was saved with. nil-safe — without it, only platform
+// Stripe methods charge, on `charger`.
+func (s *WalletService) SetChargerRouter(router savedChargerRouter) {
 	s.chargerRouter = router
-}
-
-// SetProviderSavedMethods wires provider-neutral saved methods (Moyasar
-// tokens) for auto-recharge. nil-safe; consulted before the Stripe path and
-// independent of the Stripe charger.
-func (s *WalletService) SetProviderSavedMethods(p *ProviderSavedMethods) {
-	s.providerMethods = p
 }
 
 // CreateWalletInput creates a wallet, optionally with auto-recharge.
@@ -504,47 +488,43 @@ func (s *WalletService) ProcessAutoRecharges(ctx context.Context) (int, error) {
 }
 
 func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bool {
-	// A method saved on a non-Stripe gateway (Moyasar) charges there; anything
-	// else continues down the Stripe path below, unchanged.
-	if w.AutoRechargeAmount != nil {
-		if charger, ref, ok := s.providerMethods.Resolve(ctx, w.CustomerID); ok {
-			return s.chargeAndCredit(ctx, w, charger, "", ref)
-		}
-	}
-	if s.charger == nil || s.lookup == nil || w.AutoRechargeAmount == nil {
+	if s.lookup == nil || w.AutoRechargeAmount == nil || (s.charger == nil && s.chargerRouter == nil) {
 		return false
 	}
-	stripeCustomerID, paymentMethodID, connID, err := s.lookup.GetSavedPaymentMethod(ctx, w.CustomerID)
-	if err != nil || stripeCustomerID == "" || paymentMethodID == "" {
+	m, err := s.lookup.GetSavedPaymentMethod(ctx, w.CustomerID)
+	if err != nil || !m.Chargeable() {
 		s.notifyRechargeFailure(ctx, w, "no saved payment method")
 		return false
 	}
-
-	// B1: charge on the gateway the card was saved on (BYO or platform). Without
-	// a router, every card charges on the platform `charger`.
-	charger := s.charger
-	if s.chargerRouter != nil {
-		c, rerr := s.chargerRouter.ChargerFor(ctx, connID)
-		if rerr != nil || c == nil {
-			slog.WarnContext(ctx, "wallet auto-recharge: could not resolve saved-card gateway", "wallet_id", w.ID, "error", rerr)
-			s.notifyRechargeFailure(ctx, w, "payment gateway unavailable")
-			return false
-		}
-		charger = c
+	router := s.chargerRouter
+	if router == nil {
+		router = platformRouter(s.charger)
 	}
-
-	return s.chargeAndCredit(ctx, w, charger, stripeCustomerID, paymentMethodID)
+	charger, err := router.ChargerFor(ctx, m, w.Currency)
+	if err != nil {
+		slog.WarnContext(ctx, "wallet auto-recharge: saved payment method can't be charged", "wallet_id", w.ID, "provider", m.Provider, "error", err)
+		s.notifyRechargeFailure(ctx, w, "payment gateway unavailable")
+		return false
+	}
+	return s.chargeAndCredit(ctx, w, charger, m)
 }
 
 // chargeAndCredit charges the auto-recharge amount on charger and, on
 // success, credits the wallet and posts the top-up ledger legs.
-func (s *WalletService) chargeAndCredit(ctx context.Context, w *domain.Wallet, charger walletCharger, stripeCustomerID, paymentMethodID string) bool {
+func (s *WalletService) chargeAndCredit(ctx context.Context, w *domain.Wallet, charger SavedCardCharger, m domain.SavedPaymentMethod) bool {
 	amount := *w.AutoRechargeAmount
 	// Key on wallet + current balance so a crashed sweep retried within the
 	// same balance state cannot double-charge, while a later legitimate
 	// recharge (post-drain, different balance) gets a fresh key.
 	idemKey := fmt.Sprintf("wallet-recharge-%s-%d", w.ID, w.Balance)
-	result, err := charger.ChargeSavedPaymentMethod(ctx, stripeCustomerID, paymentMethodID, amount, w.Currency, w.ID.String(), idemKey)
+	result, err := charger.ChargeSavedPaymentMethod(ctx, port.SavedMethodCharge{
+		CustomerRef:    m.CustomerRef,
+		MethodRef:      m.PaymentMethodRef,
+		Amount:         amount,
+		Currency:       w.Currency,
+		InvoiceID:      w.ID.String(),
+		IdempotencyKey: idemKey,
+	})
 	if err != nil || result == nil || !result.Success {
 		slog.WarnContext(ctx, "wallet auto-recharge charge failed", "wallet_id", w.ID, "error", err)
 		s.notifyRechargeFailure(ctx, w, "payment failed")

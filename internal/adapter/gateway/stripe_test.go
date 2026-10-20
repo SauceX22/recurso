@@ -10,6 +10,8 @@ import (
 
 	"github.com/stripe/stripe-go/v76"
 	"github.com/stripe/stripe-go/v76/client"
+
+	"github.com/recurso-dev/recurso/internal/core/port"
 )
 
 func TestStripePaymentMethodTypes(t *testing.T) {
@@ -149,7 +151,7 @@ func TestStripeChargeSavedPaymentMethod(t *testing.T) {
 	defer srv.Close()
 
 	gw := newTestStripeGateway(t, srv)
-	res, err := gw.ChargeSavedPaymentMethod(context.Background(), "cus_123", "pm_456", 4900, "usd", "inv-uuid-9", "retry-inv-uuid-9-2")
+	res, err := gw.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{CustomerRef: "cus_123", MethodRef: "pm_456", Amount: 4900, Currency: "usd", InvoiceID: "inv-uuid-9", IdempotencyKey: "retry-inv-uuid-9-2"})
 	if err != nil {
 		t.Fatalf("ChargeSavedPaymentMethod returned error: %v", err)
 	}
@@ -178,7 +180,7 @@ func TestStripeChargeSavedPaymentMethod_Decline(t *testing.T) {
 	defer srv.Close()
 
 	gw := newTestStripeGateway(t, srv)
-	res, err := gw.ChargeSavedPaymentMethod(context.Background(), "cus_1", "pm_1", 1000, "usd", "inv-1", "k1")
+	res, err := gw.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{CustomerRef: "cus_1", MethodRef: "pm_1", Amount: 1000, Currency: "usd", InvoiceID: "inv-1", IdempotencyKey: "k1"})
 	if err != nil {
 		t.Fatalf("a decline must be a business failure, not an error: %v", err)
 	}

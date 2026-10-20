@@ -27,8 +27,16 @@ func (f *fakeConnOpener) OpenSecret(_ *domain.GatewayConnection) (string, error)
 // namedCharger records which gateway a charge was routed to.
 type namedCharger struct{ name string }
 
-func (c *namedCharger) ChargeSavedPaymentMethod(_ context.Context, _, _ string, _ int64, _, _, _ string) (*port.PaymentResult, error) {
+func (c *namedCharger) ChargeSavedPaymentMethod(_ context.Context, _ port.SavedMethodCharge) (*port.PaymentResult, error) {
 	return &port.PaymentResult{Success: true}, nil
+}
+
+func stripeMethod(connID *uuid.UUID) domain.SavedPaymentMethod {
+	return domain.SavedPaymentMethod{Provider: domain.GatewayStripe, CustomerRef: "cus_1", PaymentMethodRef: "pm_1", GatewayConnectionID: connID}
+}
+
+func moyasarMethod() domain.SavedPaymentMethod {
+	return domain.SavedPaymentMethod{Provider: domain.GatewayMoyasar, PaymentMethodRef: "token_1"}
 }
 
 func TestSavedCardGatewayRouter_ChargerFor(t *testing.T) {
@@ -37,7 +45,7 @@ func TestSavedCardGatewayRouter_ChargerFor(t *testing.T) {
 
 	t.Run("nil connection -> platform", func(t *testing.T) {
 		r := NewSavedCardGatewayRouter(&fakeConnOpener{}, build, platform)
-		got, err := r.ChargerFor(context.Background(), nil)
+		got, err := r.ChargerFor(context.Background(), stripeMethod(nil), "USD")
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -53,7 +61,7 @@ func TestSavedCardGatewayRouter_ChargerFor(t *testing.T) {
 			secret: "sk_byo",
 		}
 		r := NewSavedCardGatewayRouter(opener, build, platform)
-		got, err := r.ChargerFor(context.Background(), &connID)
+		got, err := r.ChargerFor(context.Background(), stripeMethod(&connID), "USD")
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -66,7 +74,7 @@ func TestSavedCardGatewayRouter_ChargerFor(t *testing.T) {
 	t.Run("connection load error -> error (dunning)", func(t *testing.T) {
 		connID := uuid.New()
 		r := NewSavedCardGatewayRouter(&fakeConnOpener{getErr: errors.New("db down")}, build, platform)
-		if _, err := r.ChargerFor(context.Background(), &connID); err == nil {
+		if _, err := r.ChargerFor(context.Background(), stripeMethod(&connID), "USD"); err == nil {
 			t.Fatal("expected error when the connection can't be loaded")
 		}
 	})
@@ -74,17 +82,27 @@ func TestSavedCardGatewayRouter_ChargerFor(t *testing.T) {
 	t.Run("missing connection -> error", func(t *testing.T) {
 		connID := uuid.New()
 		r := NewSavedCardGatewayRouter(&fakeConnOpener{conn: nil}, build, platform)
-		if _, err := r.ChargerFor(context.Background(), &connID); err == nil {
+		if _, err := r.ChargerFor(context.Background(), stripeMethod(&connID), "USD"); err == nil {
 			t.Fatal("expected error when the connection is gone")
 		}
 	})
 
-	t.Run("non-stripe connection -> error", func(t *testing.T) {
+	t.Run("connection of another provider -> error", func(t *testing.T) {
 		connID := uuid.New()
 		opener := &fakeConnOpener{conn: &domain.GatewayConnection{ID: connID, Provider: domain.GatewayRazorpay, SecretKeyEnc: "sealed"}, secret: "s"}
 		r := NewSavedCardGatewayRouter(opener, build, platform)
-		if _, err := r.ChargerFor(context.Background(), &connID); err == nil {
-			t.Fatal("expected error for a non-stripe saved-card connection")
+		if _, err := r.ChargerFor(context.Background(), stripeMethod(&connID), "USD"); err == nil {
+			t.Fatal("expected error for a stripe method on a razorpay connection")
+		}
+	})
+
+	t.Run("connection provider without a builder -> error", func(t *testing.T) {
+		connID := uuid.New()
+		opener := &fakeConnOpener{conn: &domain.GatewayConnection{ID: connID, Provider: domain.GatewayRazorpay, SecretKeyEnc: "sealed"}, secret: "s"}
+		r := NewSavedCardGatewayRouter(opener, build, platform)
+		m := domain.SavedPaymentMethod{Provider: domain.GatewayRazorpay, PaymentMethodRef: "tok", GatewayConnectionID: &connID}
+		if _, err := r.ChargerFor(context.Background(), m, "INR"); err == nil {
+			t.Fatal("expected error when no BYO builder exists for the provider")
 		}
 	})
 
@@ -92,8 +110,55 @@ func TestSavedCardGatewayRouter_ChargerFor(t *testing.T) {
 		connID := uuid.New()
 		opener := &fakeConnOpener{conn: &domain.GatewayConnection{ID: connID, Provider: domain.GatewayStripe, SecretKeyEnc: "sealed"}, secErr: errors.New("vault down")}
 		r := NewSavedCardGatewayRouter(opener, build, platform)
-		if _, err := r.ChargerFor(context.Background(), &connID); err == nil {
+		if _, err := r.ChargerFor(context.Background(), stripeMethod(&connID), "USD"); err == nil {
 			t.Fatal("expected error when the secret can't be opened")
 		}
 	})
+}
+
+func TestSavedCardGatewayRouter_DispatchesOnProvider(t *testing.T) {
+	stripe := &namedCharger{name: "stripe"}
+	moyasar := &namedCharger{name: "moyasar"}
+	r := NewSavedCardGatewayRouter(nil, nil, stripe)
+	r.RegisterProvider(domain.GatewayMoyasar, moyasar)
+
+	if got, err := r.ChargerFor(context.Background(), moyasarMethod(), "SAR"); err != nil || got != SavedCardCharger(moyasar) {
+		t.Fatalf("moyasar method routed to %#v (%v), want the moyasar charger", got, err)
+	}
+	if got, err := r.ChargerFor(context.Background(), stripeMethod(nil), "USD"); err != nil || got != SavedCardCharger(stripe) {
+		t.Fatalf("stripe method routed to %#v (%v), want the stripe charger", got, err)
+	}
+}
+
+// A method whose provider has no charger must never fall back to another
+// provider's charger: a Moyasar token sent to Stripe always fails, and the
+// reverse too.
+func TestSavedCardGatewayRouter_UnregisteredProviderRefused(t *testing.T) {
+	stripe := &namedCharger{name: "stripe"}
+	r := NewSavedCardGatewayRouter(nil, nil, stripe)
+	if got, err := r.ChargerFor(context.Background(), moyasarMethod(), "SAR"); err == nil {
+		t.Fatalf("unregistered moyasar method resolved to %#v, want an error", got)
+	}
+
+	noStripe := NewSavedCardGatewayRouter(nil, nil, nil)
+	noStripe.RegisterProvider(domain.GatewayMoyasar, &namedCharger{name: "moyasar"})
+	if got, err := noStripe.ChargerFor(context.Background(), stripeMethod(nil), "USD"); err == nil {
+		t.Fatalf("stripe method with no stripe charger resolved to %#v, want an error", got)
+	}
+}
+
+func TestSavedCardGatewayRouter_NilChargerNotRegistered(t *testing.T) {
+	r := NewSavedCardGatewayRouter(nil, nil, nil)
+	r.RegisterProvider(domain.GatewayMoyasar, nil)
+	if _, err := r.ChargerFor(context.Background(), moyasarMethod(), "SAR"); err == nil {
+		t.Fatal("a nil charger must not be registered")
+	}
+}
+
+func TestSavedCardGatewayRouter_BYOConnectionWithoutStoreRefused(t *testing.T) {
+	connID := uuid.New()
+	r := NewSavedCardGatewayRouter(nil, nil, &namedCharger{name: "platform"})
+	if got, err := r.ChargerFor(context.Background(), stripeMethod(&connID), "USD"); err == nil {
+		t.Fatalf("BYO method without a connection store resolved to %#v; it must never charge the platform account", got)
+	}
 }

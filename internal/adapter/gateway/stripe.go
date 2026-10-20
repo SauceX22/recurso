@@ -319,26 +319,25 @@ func (s *StripeGateway) FinalizeSetupIntent(ctx context.Context, setupIntentID s
 // decline (or a required 3DS step, which off-session can't perform) is returned
 // as a business failure so dunning handles it; only transport errors surface as
 // an error.
-func (s *StripeGateway) ChargeSavedPaymentMethod(ctx context.Context, stripeCustomerID, paymentMethodID string, amount int64, currency, invoiceID, idempotencyKey string) (*port.PaymentResult, error) {
+func (s *StripeGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.SavedMethodCharge) (*port.PaymentResult, error) {
+	// India-region Stripe accounts reject foreign-currency (export) charges
+	// without a description (stripe.com/docs/india-exports) — same rule the
+	// online checkout (CreateOrder) already satisfies. Without this, every
+	// off-session dunning retry of a foreign-currency invoice fails.
+	description := "Invoice " + req.InvoiceID
+	metadata := map[string]string{"invoice_id": req.InvoiceID, "retry_payment": "true"}
 	params := &stripe.PaymentIntentParams{
-		Amount:        stripe.Int64(amount),
-		Currency:      stripe.String(currency),
-		Customer:      stripe.String(stripeCustomerID),
-		PaymentMethod: stripe.String(paymentMethodID),
+		Amount:        stripe.Int64(req.Amount),
+		Currency:      stripe.String(req.Currency),
+		Customer:      stripe.String(req.CustomerRef),
+		PaymentMethod: stripe.String(req.MethodRef),
 		OffSession:    stripe.Bool(true),
 		Confirm:       stripe.Bool(true),
-		// India-region Stripe accounts reject foreign-currency (export) charges
-		// without a description (stripe.com/docs/india-exports) — same rule the
-		// online checkout (CreateOrder) already satisfies. Without this, every
-		// off-session dunning retry of a foreign-currency invoice fails.
-		Description: stripe.String("Invoice " + invoiceID),
-		Metadata: map[string]string{
-			"invoice_id":    invoiceID,
-			"retry_payment": "true",
-		},
+		Description:   stripe.String(description),
+		Metadata:      metadata,
 	}
-	if idempotencyKey != "" {
-		params.SetIdempotencyKey(idempotencyKey)
+	if req.IdempotencyKey != "" {
+		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
 	params.Context = ctx
 

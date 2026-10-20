@@ -48,8 +48,8 @@ type savedCard struct {
 
 type fakeCardSaver struct{ saved []savedCard }
 
-func (f *fakeCardSaver) SetGatewayPaymentMethod(_ context.Context, tenantID, customerID uuid.UUID, provider, ref, brand, last4 string) error {
-	f.saved = append(f.saved, savedCard{tenantID, customerID, provider, ref, brand, last4})
+func (f *fakeCardSaver) SetGatewayPaymentMethod(_ context.Context, tenantID, customerID uuid.UUID, provider domain.GatewayProvider, ref, brand, last4 string, _, _ int) error {
+	f.saved = append(f.saved, savedCard{tenantID, customerID, string(provider), ref, brand, last4})
 	return nil
 }
 
@@ -212,7 +212,7 @@ func TestMoyasarWebhook_PaymentPaidSettles(t *testing.T) {
 	if len(f.repo.setPaymentIDs) != 1 || f.repo.setPaymentIDs[0] != f.payment.ID {
 		t.Fatalf("gateway payment ids recorded = %v, want [%s]", f.repo.setPaymentIDs, f.payment.ID)
 	}
-	want := savedCard{f.inv.TenantID, f.inv.CustomerID, domain.SavedMethodMoyasar, "token_abc", "mada", "1010"}
+	want := savedCard{f.inv.TenantID, f.inv.CustomerID, string(domain.GatewayMoyasar), "token_abc", "mada", "1010"}
 	if len(f.cards.saved) != 1 || f.cards.saved[0] != want {
 		t.Fatalf("saved cards = %+v, want [%+v]", f.cards.saved, want)
 	}

@@ -47,22 +47,41 @@ type SavedCard struct {
 	BankName string // us_bank_account only
 }
 
+// SavedMethodCharge is one off-session charge of a customer's saved payment
+// method. Exactly one of InvoiceID and WalletID names what the charge pays
+// for, so a gateway never labels a wallet top-up as an invoice payment.
+type SavedMethodCharge struct {
+	CustomerRef string // gateway customer (Stripe cus_*); "" when the gateway has none
+	MethodRef   string // chargeable reference (Stripe pm_*, Moyasar token_*)
+	Amount      int64  // minor units
+	Currency    string
+	InvoiceID   string
+	WalletID    string
+	// IdempotencyKey is stable across replays of the same attempt, so a re-run
+	// after a crash or timeout cannot charge twice.
+	IdempotencyKey string
+}
+
+// ErrCodeNoSavedMethod is the PaymentResult.ErrorCode a gateway returns when it
+// cannot collect off-session because the customer has no saved method for it.
+const ErrCodeNoSavedMethod = "no_saved_payment_method"
+
 // PaymentResult represents the outcome of a payment retry attempt
 type PaymentResult struct {
 	Success   bool
 	PaymentID string
 	ErrorCode string // "insufficient_funds", "card_expired", "network_error", etc.
 	ErrorMsg  string
-	// Permanent marks a hard decline (lost/stolen/expired card, invalid
-	// account): retrying the same saved method cannot succeed, so dunning
-	// stops auto-retrying it. Only gateways that classify declines set it
-	// (Moyasar); false keeps the historical retry-everything behavior.
+	// Permanent marks a hard decline only (lost/stolen/expired card, a token
+	// the gateway rejects): retrying the same method cannot succeed, so
+	// dunning stops charging it. Gateways that don't classify declines leave
+	// it false.
 	Permanent bool
 }
 
 // GatewayPayment is a server-side read-back of one gateway payment, used to
 // verify a checkout or webhook before settling and to capture the reusable
-// card token the payment created. Moyasar only, today.
+// card token the payment created.
 type GatewayPayment struct {
 	ID             string // gateway payment id
 	Status         string // gateway-reported, e.g. "paid", "failed", "initiated"

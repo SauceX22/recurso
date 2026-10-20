@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/recurso-dev/recurso/internal/core/domain"
 	"github.com/recurso-dev/recurso/internal/core/port"
 )
 
@@ -67,6 +68,21 @@ func (r *SmartRouter) resolveByName(name string) port.PaymentGateway {
 		return r.Stripe
 	}
 	return r.Extra[name]
+}
+
+// ProviderFor names the gateway that collects payments in currency, by the
+// same rule as gatewayFor: an override first, then INR to Razorpay and
+// everything else to Stripe. It reports the routing, not whether that gateway
+// is configured.
+func (r *SmartRouter) ProviderFor(currency string) domain.GatewayProvider {
+	cur := strings.ToUpper(currency)
+	if name, ok := r.currencyOverrides[cur]; ok {
+		return domain.GatewayProvider(name)
+	}
+	if cur == "INR" {
+		return domain.GatewayRazorpay
+	}
+	return domain.GatewayStripe
 }
 
 // gatewayFor returns the gateway for a currency, or an error when that

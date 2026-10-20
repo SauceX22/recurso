@@ -121,27 +121,27 @@ func (g *AdyenGateway) CreateOrder(ctx context.Context, amount int64, currency s
 
 // ChargeSavedPaymentMethod charges a stored payment method off-session
 // (the renewal/auto-recharge path). storedPaymentMethodID is Adyen's
-// stored method id; shopperReference is the Recurso customer id the method
-// was stored under.
-func (g *AdyenGateway) ChargeSavedPaymentMethod(ctx context.Context, shopperReference, storedPaymentMethodID string, amount int64, currency, invoiceID, idempotencyKey string) (*port.PaymentResult, error) {
+// stored method id (MethodRef); shopperReference is the Recurso customer id
+// the method was stored under (CustomerRef).
+func (g *AdyenGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.SavedMethodCharge) (*port.PaymentResult, error) {
 	var out struct {
 		PspReference  string `json:"pspReference"`
 		ResultCode    string `json:"resultCode"`
 		RefusalReason string `json:"refusalReason"`
 	}
 	err := g.do(ctx, "/payments", map[string]any{
-		"amount":          adyenAmount{Value: amount, Currency: strings.ToUpper(currency)},
+		"amount":          adyenAmount{Value: req.Amount, Currency: strings.ToUpper(req.Currency)},
 		"merchantAccount": g.merchantAccount,
-		"reference":       invoiceID,
+		"reference":       req.InvoiceID,
 		"paymentMethod": map[string]string{
 			"type":                  "scheme",
-			"storedPaymentMethodId": storedPaymentMethodID,
+			"storedPaymentMethodId": req.MethodRef,
 		},
-		"shopperReference":         shopperReference,
+		"shopperReference":         req.CustomerRef,
 		"shopperInteraction":       "ContAuth",
 		"recurringProcessingModel": "UnscheduledCardOnFile",
-		"metadata":                 map[string]string{"invoice_id": invoiceID},
-	}, idempotencyKey, &out)
+		"metadata":                 map[string]string{"invoice_id": req.InvoiceID},
+	}, req.IdempotencyKey, &out)
 	if err != nil {
 		return &port.PaymentResult{Success: false, ErrorCode: "gateway_error", ErrorMsg: err.Error()}, err
 	}

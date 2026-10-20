@@ -21,7 +21,7 @@ type moyasarPaymentFetcher interface {
 // gatewayCardSaver records a reusable gateway card as the customer's default
 // off-session method. Satisfied by *db.CustomerRepository.
 type gatewayCardSaver interface {
-	SetGatewayPaymentMethod(ctx context.Context, tenantID, customerID uuid.UUID, provider, paymentMethodRef, brand, last4 string) error
+	SetGatewayPaymentMethod(ctx context.Context, tenantID, customerID uuid.UUID, provider domain.GatewayProvider, ref, brand, last4 string, expMonth, expYear int) error
 }
 
 var (
@@ -59,5 +59,5 @@ func saveMoyasarCard(ctx context.Context, saver gatewayCardSaver, p *port.Gatewa
 	if saver == nil || p.CardToken == "" {
 		return nil
 	}
-	return saver.SetGatewayPaymentMethod(ctx, inv.TenantID, inv.CustomerID, domain.SavedMethodMoyasar, p.CardToken, p.CardBrand, p.CardLast4)
+	return saver.SetGatewayPaymentMethod(ctx, inv.TenantID, inv.CustomerID, domain.GatewayMoyasar, p.CardToken, p.CardBrand, p.CardLast4, 0, 0)
 }

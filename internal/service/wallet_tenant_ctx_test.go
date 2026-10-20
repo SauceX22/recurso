@@ -22,13 +22,13 @@ func (r *dueWalletRepo) ListDueForRecharge(context.Context, int) ([]domain.Walle
 // noSavedMethodLookup reports no saved card, forcing the failure notice.
 type noSavedMethodLookup struct{}
 
-func (noSavedMethodLookup) GetSavedPaymentMethod(context.Context, uuid.UUID) (string, string, *uuid.UUID, error) {
-	return "", "", nil, nil
+func (noSavedMethodLookup) GetSavedPaymentMethod(context.Context, uuid.UUID) (domain.SavedPaymentMethod, error) {
+	return domain.SavedPaymentMethod{Provider: domain.GatewayStripe}, nil
 }
 
 type unusedWalletCharger struct{}
 
-func (unusedWalletCharger) ChargeSavedPaymentMethod(context.Context, string, string, int64, string, string, string) (*port.PaymentResult, error) {
+func (unusedWalletCharger) ChargeSavedPaymentMethod(context.Context, port.SavedMethodCharge) (*port.PaymentResult, error) {
 	panic("charger must not be called without a saved method")
 }
 

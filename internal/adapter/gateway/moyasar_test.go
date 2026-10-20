@@ -142,7 +142,7 @@ func TestMoyasarChargeSavedPaymentMethod(t *testing.T) {
 	})
 	g := testMoyasar(srv.URL)
 
-	res, err := g.ChargeSavedPaymentMethod(context.Background(), "", "token_abc", 10000, "sar", "inv-1", "renewal-inv-1")
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "sar", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestMoyasarChargeSameKeySameGivenIDOnTheWire(t *testing.T) {
 	g := testMoyasar(srv.URL)
 	ctx := context.Background()
 	for _, key := range []string{"renewal-inv-1", "renewal-inv-1", "retry-inv-1-1"} {
-		if _, err := g.ChargeSavedPaymentMethod(ctx, "", "token_abc", 100, "SAR", "inv-1", key); err != nil {
+		if _, err := g.ChargeSavedPaymentMethod(ctx, port.SavedMethodCharge{MethodRef: "token_abc", Amount: 100, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: key}); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	}
@@ -241,7 +241,7 @@ func TestMoyasarChargeDeclineMapping(t *testing.T) {
 			})
 			g := testMoyasar(srv.URL)
 
-			res, err := g.ChargeSavedPaymentMethod(context.Background(), "", "token_abc", 10000, "SAR", "inv-1", "renewal-inv-1")
+			res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
 			if err != nil {
 				t.Fatalf("a decline is a result, not an error: %v", err)
 			}
@@ -290,7 +290,7 @@ func TestMoyasarChargeAlreadyCreatedFetchesInsteadOfRecreating(t *testing.T) {
 	})
 	g := testMoyasar(srv.URL)
 
-	res, err := g.ChargeSavedPaymentMethod(context.Background(), "", "token_abc", 10000, "SAR", "inv-1", "renewal-inv-1")
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
 	if err != nil {
 		t.Fatalf("an already-created payment must resolve via read-back, got %v", err)
 	}
@@ -313,7 +313,7 @@ func TestMoyasarChargeAlreadyCreatedFetchFails(t *testing.T) {
 	})
 	g := testMoyasar(srv.URL)
 
-	res, err := g.ChargeSavedPaymentMethod(context.Background(), "", "token_abc", 10000, "SAR", "inv-1", "renewal-inv-1")
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
 	if err == nil {
 		t.Fatal("a failed read-back must surface an error, not a guessed result")
 	}
@@ -332,7 +332,7 @@ func TestMoyasarChargeOtherBadRequestIsGatewayError(t *testing.T) {
 	})
 	g := testMoyasar(srv.URL)
 
-	res, err := g.ChargeSavedPaymentMethod(context.Background(), "", "token_abc", 50, "SAR", "inv-1", "renewal-inv-1")
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 50, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
 	if err == nil || res.ErrorCode != "gateway_error" || res.Success {
 		t.Fatalf("res = %+v, err = %v; want gateway_error", res, err)
 	}
@@ -351,7 +351,7 @@ func TestMoyasarChargeUnauthorizedNeverLeaksSecret(t *testing.T) {
 	})
 	g := testMoyasar(srv.URL)
 
-	res, err := g.ChargeSavedPaymentMethod(context.Background(), "", "token_abc", 10000, "SAR", "inv-1", "renewal-inv-1")
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
 	if err == nil {
 		t.Fatal("401 must be an error")
 	}
@@ -375,7 +375,7 @@ func TestMoyasarChargeHTTPErrorWithoutBody(t *testing.T) {
 	})
 	g := testMoyasar(srv.URL)
 
-	_, err := g.ChargeSavedPaymentMethod(context.Background(), "", "token_abc", 10000, "SAR", "inv-1", "renewal-inv-1")
+	_, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
 	if err == nil || err.Error() != "moyasar /payments: HTTP 502" {
 		t.Fatalf("err = %v, want status fallback when the body is not Moyasar's error shape", err)
 	}
@@ -386,7 +386,7 @@ func TestMoyasarChargeTransportError(t *testing.T) {
 	g := testMoyasar(srv.URL)
 	srv.Close() // connection refused
 
-	res, err := g.ChargeSavedPaymentMethod(context.Background(), "", "token_abc", 10000, "SAR", "inv-1", "renewal-inv-1")
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
 	if err == nil {
 		t.Fatal("transport failure must be an error")
 	}
@@ -401,7 +401,7 @@ func TestMoyasarChargeMalformedResponse(t *testing.T) {
 	})
 	g := testMoyasar(srv.URL)
 
-	res, err := g.ChargeSavedPaymentMethod(context.Background(), "", "token_abc", 10000, "SAR", "inv-1", "renewal-inv-1")
+	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
 	if err == nil || res.ErrorCode != "gateway_error" {
 		t.Fatalf("res = %+v, err = %v; an unreadable answer must not be treated as paid", res, err)
 	}
@@ -422,7 +422,7 @@ func TestMoyasarChargeRefusesBlindCharges(t *testing.T) {
 			srv, rec := moyasarTestServer(t, nil)
 			g := testMoyasar(srv.URL)
 
-			res, err := g.ChargeSavedPaymentMethod(context.Background(), "", tc.token, tc.amount, "SAR", "inv-1", tc.key)
+			res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: tc.token, Amount: tc.amount, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: tc.key})
 			if err == nil {
 				t.Fatal("invalid charge input must be refused with an error")
 			}

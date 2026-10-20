@@ -11,38 +11,6 @@ import (
 	"github.com/recurso-dev/recurso/internal/service"
 )
 
-// main.go wires *service.ProviderSavedMethods directly; no adapter needed.
-var _ providerSavedMethodResolver = (*service.ProviderSavedMethods)(nil)
-
-// argsSavedCharger records the arguments of each off-session charge.
-type argsSavedCharger struct {
-	result      *port.PaymentResult
-	calls       int
-	customerRef string
-	methodRef   string
-	amount      int64
-	currency    string
-	invoiceID   string
-	key         string
-}
-
-func (c *argsSavedCharger) ChargeSavedPaymentMethod(_ context.Context, customerRef, methodRef string, amount int64, currency, invoiceID, key string) (*port.PaymentResult, error) {
-	c.calls++
-	c.customerRef, c.methodRef, c.amount, c.currency, c.invoiceID, c.key = customerRef, methodRef, amount, currency, invoiceID, key
-	return c.result, nil
-}
-
-// fakeProviderResolver resolves every customer to one charger + ref when ok.
-type fakeProviderResolver struct {
-	charger service.SavedCardCharger
-	ref     string
-	ok      bool
-}
-
-func (f *fakeProviderResolver) Resolve(_ context.Context, _ uuid.UUID) (service.SavedCardCharger, string, bool) {
-	return f.charger, f.ref, f.ok
-}
-
 func pastDueSARInvoice(retryCount int) *domain.Invoice {
 	now := time.Now()
 	return &domain.Invoice{
@@ -60,6 +28,10 @@ func pastDueSARInvoice(retryCount int) *domain.Invoice {
 	}
 }
 
+func newTestRetryService() *service.SmartRetryService {
+	return service.NewSmartRetryService(&mockDunningRepo{weights: map[string]domain.DunningWeight{}})
+}
+
 // TestRetryWorker_PermanentDeclineStopsRetries: a hard decline leaves the
 // invoice past_due with no next retry and never consults DecideRetry. The
 // worker runs with a nil SmartRetryService, so reaching DecideRetry would
@@ -68,7 +40,7 @@ func TestRetryWorker_PermanentDeclineStopsRetries(t *testing.T) {
 	inv := pastDueSARInvoice(1)
 	inv.DunningActionID = "" // no previous action → RecordOutcome is skipped too
 	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
-	gw := &mockGateway{result: &port.PaymentResult{Success: false, ErrorCode: "card_declined_54", Permanent: true}}
+	gw := &mockGateway{result: &port.PaymentResult{Success: false, ErrorCode: "expired_card", Permanent: true}}
 
 	w := NewRetryWorker(repo, nil, gw, &mockNotifier{})
 	w.processRetries(context.Background())
@@ -83,8 +55,8 @@ func TestRetryWorker_PermanentDeclineStopsRetries(t *testing.T) {
 	if got.NextRetryAt != nil {
 		t.Fatalf("NextRetryAt = %v, want nil (auto-retries stopped)", got.NextRetryAt)
 	}
-	if got.LastPaymentError != "card_declined_54" || got.RetryCount != 2 {
-		t.Fatalf("LastPaymentError=%q RetryCount=%d, want card_declined_54/2", got.LastPaymentError, got.RetryCount)
+	if got.LastPaymentError != "expired_card" || got.RetryCount != 2 {
+		t.Fatalf("LastPaymentError=%q RetryCount=%d, want expired_card/2", got.LastPaymentError, got.RetryCount)
 	}
 	if got.DunningActionID != "" || got.DunningContextKey != "" {
 		t.Fatalf("dunning action not cleared: %q/%q", got.DunningActionID, got.DunningContextKey)
@@ -98,7 +70,7 @@ func TestRetryWorker_PermanentDeclineStillRecordsPreviousOutcome(t *testing.T) {
 	inv.DunningActionID = "1h"
 	inv.DunningContextKey = "SAR:card_declined"
 	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
-	gw := &mockGateway{result: &port.PaymentResult{Success: false, ErrorCode: "no_saved_payment_method", Permanent: true}}
+	gw := &mockGateway{result: &port.PaymentResult{Success: false, ErrorCode: "lost_or_stolen", Permanent: true}}
 	dunningRepo := &mockDunningRepo{weights: make(map[string]domain.DunningWeight)}
 
 	w := NewRetryWorker(repo, service.NewSmartRetryService(dunningRepo), gw, &mockNotifier{})
@@ -118,7 +90,7 @@ func TestRetryWorker_PermanentDeclineStillRecordsPreviousOutcome(t *testing.T) {
 func TestRetryWorker_SoftDeclineStillReschedules(t *testing.T) {
 	inv := pastDueSARInvoice(1)
 	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
-	gw := &mockGateway{result: &port.PaymentResult{Success: false, ErrorCode: "card_declined_51"}}
+	gw := &mockGateway{result: &port.PaymentResult{Success: false, ErrorCode: "insufficient_funds"}}
 	dunningRepo := &mockDunningRepo{weights: make(map[string]domain.DunningWeight)}
 
 	w := NewRetryWorker(repo, service.NewSmartRetryService(dunningRepo), gw, &mockNotifier{})
@@ -130,47 +102,52 @@ func TestRetryWorker_SoftDeclineStillReschedules(t *testing.T) {
 	}
 }
 
-// TestRetryWorker_ProviderSavedMethodCharged: a Moyasar-saved customer is
-// charged on the provider charger with the per-attempt key, ahead of the
-// Stripe saved-card path.
+// TestRetryWorker_ProviderSavedMethodCharged: a method saved on a non-Stripe
+// gateway is charged on that gateway's charger with the per-attempt key, never
+// on the platform Stripe charger or the interactive retry.
 func TestRetryWorker_ProviderSavedMethodCharged(t *testing.T) {
 	inv := pastDueSARInvoice(3)
 	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
 	gw := &mockGateway{result: &port.PaymentResult{Success: true}}
-	moyasar := &argsSavedCharger{result: &port.PaymentResult{Success: true, PaymentID: uuid.NewString()}}
-	stripe := &fakeSavedCharger{}
+	moyasar := &fakeSavedCharger{name: "moyasar"}
+	stripe := &fakeSavedCharger{name: "stripe"}
+	router := service.NewSavedCardGatewayRouter(nil, nil, stripe)
+	router.RegisterProvider(domain.GatewayMoyasar, moyasar)
 
-	w := NewRetryWorker(repo, service.NewSmartRetryService(&mockDunningRepo{weights: map[string]domain.DunningWeight{}}), gw, &mockNotifier{})
-	w.SetSavedMethodCharging(stripe, &fakeCustomerLookup{})
-	w.SetProviderSavedMethods(&fakeProviderResolver{charger: moyasar, ref: "token_r", ok: true})
+	w := NewRetryWorker(repo, newTestRetryService(), gw, &mockNotifier{})
+	w.SetSavedMethodCharging(stripe, &fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_r"})
+	w.SetChargerRouter(router)
 	w.processRetries(context.Background())
 
-	if moyasar.calls != 1 || gw.calls != 0 || stripe.charges != 0 {
-		t.Fatalf("moyasar calls=%d interactive=%d stripe=%d, want 1/0/0", moyasar.calls, gw.calls, stripe.charges)
+	if moyasar.charges != 1 || gw.calls != 0 || stripe.charges != 0 {
+		t.Fatalf("moyasar calls=%d interactive=%d stripe=%d, want 1/0/0", moyasar.charges, gw.calls, stripe.charges)
 	}
-	wantKey := "retry-" + inv.ID.String() + "-3"
-	if moyasar.customerRef != "" || moyasar.methodRef != "token_r" || moyasar.amount != 10000 ||
-		moyasar.currency != "SAR" || moyasar.invoiceID != inv.ID.String() || moyasar.key != wantKey {
-		t.Fatalf("charge args = %+v, want ('', token_r, 10000, SAR, %s, %s)", moyasar, inv.ID, wantKey)
+	want := port.SavedMethodCharge{
+		MethodRef: "token_r", Amount: 10000, Currency: "SAR",
+		InvoiceID: inv.ID.String(), IdempotencyKey: "retry-" + inv.ID.String() + "-3",
+	}
+	if moyasar.reqs[0] != want {
+		t.Fatalf("charge = %+v, want %+v", moyasar.reqs[0], want)
 	}
 	if repo.updated[0].Status != domain.InvoiceStatusPaid {
 		t.Fatalf("status = %s, want paid", repo.updated[0].Status)
 	}
 }
 
-// TestRetryWorker_ProviderUnresolvedFallsThrough: ok=false leaves the
-// existing path in charge (here, the interactive gateway retry).
-func TestRetryWorker_ProviderUnresolvedFallsThrough(t *testing.T) {
+// TestRetryWorker_UnchargeableMethodUsesInteractiveRetry: a method whose
+// provider has no charger is never charged elsewhere; the interactive gateway
+// retry runs instead.
+func TestRetryWorker_UnchargeableMethodUsesInteractiveRetry(t *testing.T) {
 	inv := pastDueSARInvoice(0)
 	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
 	gw := &mockGateway{result: &port.PaymentResult{Success: true}}
-	moyasar := &argsSavedCharger{result: &port.PaymentResult{Success: true}}
+	stripe := &fakeSavedCharger{name: "stripe"}
 
-	w := NewRetryWorker(repo, service.NewSmartRetryService(&mockDunningRepo{weights: map[string]domain.DunningWeight{}}), gw, &mockNotifier{})
-	w.SetProviderSavedMethods(&fakeProviderResolver{charger: moyasar, ok: false})
+	w := NewRetryWorker(repo, newTestRetryService(), gw, &mockNotifier{})
+	w.SetSavedMethodCharging(stripe, &fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_r"})
 	w.processRetries(context.Background())
 
-	if moyasar.calls != 0 || gw.calls != 1 || gw.lastAmount != 10000 {
-		t.Fatalf("moyasar=%d interactive=%d amount=%d, want 0/1/10000", moyasar.calls, gw.calls, gw.lastAmount)
+	if stripe.charges != 0 || gw.calls != 1 || gw.lastAmount != 10000 {
+		t.Fatalf("stripe=%d interactive=%d amount=%d, want 0/1/10000", stripe.charges, gw.calls, gw.lastAmount)
 	}
 }
