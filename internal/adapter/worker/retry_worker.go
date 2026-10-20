@@ -45,6 +45,13 @@ type savedCardChargerRouter interface {
 	ChargerFor(ctx context.Context, gatewayConnectionID *uuid.UUID) (service.SavedCardCharger, error)
 }
 
+// providerSavedMethodResolver resolves a customer's method saved on a
+// non-Stripe gateway (Moyasar token) to that gateway's charger. Implemented by
+// *service.ProviderSavedMethods.
+type providerSavedMethodResolver interface {
+	Resolve(ctx context.Context, customerID uuid.UUID) (service.SavedCardCharger, string, bool)
+}
+
 type RetryWorker struct {
 	invoiceRepo            port.InvoiceRepository
 	retryService           *service.SmartRetryService
@@ -56,6 +63,7 @@ type RetryWorker struct {
 	customerLookup         customerPaymentLookup
 	chargerRouter          savedCardChargerRouter
 	settler                invoiceSettler
+	providerMethods        providerSavedMethodResolver
 }
 
 func NewRetryWorker(
@@ -103,6 +111,13 @@ func (w *RetryWorker) SetChargerRouter(router savedCardChargerRouter) {
 	w.chargerRouter = router
 }
 
+// SetProviderSavedMethods wires provider-neutral saved methods (Moyasar
+// tokens): a retry for a customer whose method lives on a non-Stripe gateway
+// charges it there. nil-safe; consulted before the Stripe saved-card path.
+func (w *RetryWorker) SetProviderSavedMethods(r providerSavedMethodResolver) {
+	w.providerMethods = r
+}
+
 // chargeInvoice attempts collection, preferring the customer's saved payment
 // method (charged off-session) when one exists, and falling back to the
 // interactive gateway retry otherwise.
@@ -116,6 +131,15 @@ func (w *RetryWorker) chargeInvoice(ctx context.Context, inv *domain.Invoice) (*
 		// Fully covered by wallet/credit — nothing left to collect, so treat it as
 		// paid rather than charging the card for an amount that isn't owed.
 		return &port.PaymentResult{Success: true, PaymentID: "no_charge_due"}, nil
+	}
+
+	// A method saved on a non-Stripe gateway (Moyasar) is charged there, with
+	// the same per-attempt key as the Stripe path below.
+	if w.providerMethods != nil {
+		if charger, ref, ok := w.providerMethods.Resolve(ctx, inv.CustomerID); ok {
+			key := fmt.Sprintf("retry-%s-%d", inv.ID, inv.RetryCount)
+			return charger.ChargeSavedPaymentMethod(ctx, "", ref, amountDue, inv.Currency, inv.ID.String(), key)
+		}
 	}
 
 	if w.savedCharger != nil && w.customerLookup != nil {
@@ -293,6 +317,23 @@ func (w *RetryWorker) processInvoice(ctx context.Context, inv *domain.Invoice) {
 		errorCode = "GENERIC_FAILURE"
 	}
 	inv.LastPaymentError = errorCode
+
+	// Hard decline (lost/stolen/expired card, no saved method): retrying the
+	// same method cannot succeed, so stop auto-retries. The invoice stays
+	// past_due with no next retry; dunning emails and the checkout link are the
+	// recovery path. Only gateways that classify declines set Permanent
+	// (Moyasar); Stripe never does, so its flow below is unchanged.
+	if result.Permanent {
+		slog.Warn("retry worker: hard decline, stopping auto-retries", "invoice_number", inv.InvoiceNumber, "error_code", errorCode)
+		inv.Status = domain.InvoiceStatusPastDue
+		inv.NextRetryAt = nil
+		inv.DunningActionID = ""
+		inv.DunningContextKey = ""
+		if updateErr := w.invoiceRepo.Update(ctx, inv); updateErr != nil {
+			slog.Error("retry worker: failed to update invoice", "invoice_id", inv.ID, "error", updateErr)
+		}
+		return
+	}
 
 	decision := w.retryService.DecideRetry(ctx, inv, errorCode)
 	if decision == nil {
