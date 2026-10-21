@@ -2,12 +2,14 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/recurso-dev/recurso/internal/core/domain"
 	"github.com/recurso-dev/recurso/internal/core/port"
+	"github.com/recurso-dev/recurso/internal/core/port/porttest"
 	"github.com/recurso-dev/recurso/internal/service"
 )
 
@@ -255,5 +257,122 @@ func TestRetryWorker_RecordsSettlingPaymentID(t *testing.T) {
 				t.Fatalf("claimed payment ids = %v, want %v", repo.claimed, tc.want)
 			}
 		})
+	}
+}
+
+// A saved method that can't be charged off-session (no ref, or a Stripe pm_*
+// with no cus_*) never reaches a charger: it goes to the interactive retry,
+// whose no_saved_payment_method answer hands the invoice to email dunning at
+// once. Charging it would send an empty token to the gateway and burn the
+// infra-retry ladder on a request that can never succeed.
+func TestRetryWorker_UnchargeableMethodNeverReachesCharger(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		lookup *fakeCustomerLookup
+	}{
+		{"nothing saved", &fakeCustomerLookup{none: true}},
+		{"stripe pm without customer", &fakeCustomerLookup{provider: domain.GatewayStripe, ref: "pm_orphan"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inv := pastDueSARInvoice(1)
+			inv.Currency = "USD"
+			repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
+			stripe := &fakeSavedCharger{name: "stripe"}
+			router := service.NewSavedCardGatewayRouter(nil, nil, stripe)
+			gw := &mockGateway{result: &port.PaymentResult{Success: false, ErrorCode: port.ErrCodeNoSavedMethod}}
+
+			w := NewRetryWorker(repo, &countingDecider{}, gw, &mockNotifier{})
+			w.SetSavedMethodCharging(tc.lookup, router)
+			w.processRetries(context.Background())
+
+			if stripe.charges != 0 {
+				t.Fatalf("unchargeable method charged %d times: %+v", stripe.charges, stripe.reqs)
+			}
+			if gw.calls != 1 {
+				t.Fatalf("interactive retry calls = %d, want 1", gw.calls)
+			}
+			assertHandedToEmailDunning(t, repo.updated[0])
+		})
+	}
+}
+
+// fakeCampaignRepo serves one active dunning-campaign execution and records
+// the update that closes it.
+type fakeCampaignRepo struct {
+	porttest.UnimplementedDunningCampaignRepository
+	exec    *domain.DunningCampaignExecution
+	updated []*domain.DunningCampaignExecution
+}
+
+func (f *fakeCampaignRepo) GetExecutionByInvoice(context.Context, uuid.UUID) (*domain.DunningCampaignExecution, error) {
+	return f.exec, nil
+}
+
+func (f *fakeCampaignRepo) UpdateExecution(_ context.Context, e *domain.DunningCampaignExecution) error {
+	f.updated = append(f.updated, e)
+	return nil
+}
+
+type noInvoiceRepo struct {
+	porttest.UnimplementedInvoiceRepository
+}
+
+func (noInvoiceRepo) GetByIDPublic(context.Context, uuid.UUID) (*domain.Invoice, error) {
+	return nil, nil
+}
+
+// A retry that collects closes the invoice's dunning campaign, which lifts the
+// payment wall; left open, the paying customer stays walled.
+func TestRetryWorker_SuccessClosesDunningCampaign(t *testing.T) {
+	inv := pastDueSARInvoice(1)
+	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
+	charger := &fakeSavedCharger{name: "moyasar"}
+	router := service.NewSavedCardGatewayRouter(nil, nil, nil)
+	router.RegisterProvider(domain.GatewayMoyasar, charger)
+	campaigns := &fakeCampaignRepo{exec: &domain.DunningCampaignExecution{ID: uuid.New(), InvoiceID: inv.ID, Status: domain.DunningExecStatusActive}}
+
+	w := NewRetryWorker(repo, &countingDecider{}, &mockGateway{}, &mockNotifier{})
+	w.SetSavedMethodCharging(&fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_ok"}, router)
+	w.SetSettler(&fakeSettler{transitioned: true})
+	w.SetDunningCampaignService(service.NewDunningCampaignService(campaigns, noInvoiceRepo{}, nil, nil, nil))
+	w.processRetries(context.Background())
+
+	if len(campaigns.updated) != 1 || campaigns.updated[0].Status != domain.DunningExecStatusRecovered {
+		t.Fatalf("campaign updates = %+v, want one marked recovered", campaigns.updated)
+	}
+}
+
+type failingSettler struct{ calls int }
+
+func (f *failingSettler) MarkInvoicePaid(context.Context, uuid.UUID) (bool, error) {
+	f.calls++
+	return false, errors.New("ledger unavailable")
+}
+
+// A charge that succeeded but could not be settled leaves the retry state
+// alone, so the next poll replays the same key and settles. Clearing it (or
+// closing the campaign, or recording the payment) on an unpaid invoice strands
+// it: past_due, no next retry, no dunning action.
+func TestRetryWorker_SettleFailureLeavesRetryStateForReplay(t *testing.T) {
+	inv := pastDueSARInvoice(1)
+	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
+	charger := &fakeSavedCharger{name: "moyasar"}
+	router := service.NewSavedCardGatewayRouter(nil, nil, nil)
+	router.RegisterProvider(domain.GatewayMoyasar, charger)
+	campaigns := &fakeCampaignRepo{exec: &domain.DunningCampaignExecution{ID: uuid.New(), InvoiceID: inv.ID, Status: domain.DunningExecStatusActive}}
+
+	w := NewRetryWorker(repo, &countingDecider{}, &mockGateway{}, &mockNotifier{})
+	w.SetSavedMethodCharging(&fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_ok"}, router)
+	settler := &failingSettler{}
+	w.SetSettler(settler)
+	w.SetDunningCampaignService(service.NewDunningCampaignService(campaigns, noInvoiceRepo{}, nil, nil, nil))
+	w.processRetries(context.Background())
+
+	if settler.calls != 1 {
+		t.Fatalf("settle calls = %d, want 1", settler.calls)
+	}
+	if len(repo.cleared) != 0 || len(repo.claimed) != 0 || len(repo.updated) != 0 || len(campaigns.updated) != 0 {
+		t.Fatalf("after a failed settle: cleared=%v claimed=%v updated=%d campaign=%d; want nothing written",
+			repo.cleared, repo.claimed, len(repo.updated), len(campaigns.updated))
 	}
 }

@@ -481,3 +481,23 @@ func TestRetryWorker_GatewayError(t *testing.T) {
 		t.Errorf("expected 0 history entries for infra error, got %d", len(dunningRepo.history))
 	}
 }
+
+// A Stripe payment method is charged through its customer; without the cus_*
+// every off-session Stripe retry is refused by Stripe.
+func TestRetryWorker_ChargePassesCustomerRef(t *testing.T) {
+	inv := pastDueSARInvoice(1)
+	inv.Currency = "USD"
+	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
+	stripe := &fakeSavedCharger{name: "stripe"}
+	w := NewRetryWorker(repo, &countingDecider{}, &mockGateway{}, &mockNotifier{})
+	w.SetSavedMethodCharging(&fakeCustomerLookup{}, service.NewSavedCardGatewayRouter(nil, nil, stripe))
+	w.SetSettler(&fakeSettler{transitioned: true})
+	w.processRetries(context.Background())
+
+	if len(stripe.reqs) != 1 {
+		t.Fatalf("charges = %d, want 1", len(stripe.reqs))
+	}
+	if r := stripe.reqs[0]; r.CustomerRef != "cus_1" || r.MethodRef != "pm_1" || r.Amount != 10000 || r.Currency != "USD" || r.InvoiceID != inv.ID.String() {
+		t.Fatalf("charge request = %+v, want cus_1/pm_1/10000 USD for the invoice", r)
+	}
+}
