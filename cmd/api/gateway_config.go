@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 )
 
@@ -77,31 +79,83 @@ const (
 	moyasarTestPrefix = "sk_test_"
 )
 
-// validateMoyasarConfig checks the Moyasar keys at boot. A secret key of the
-// wrong kind, or test and live keys mixed, is an error: the browser would
-// create payments in one mode while the server reads them back in the other,
-// so customers pay and invoices never settle. A missing publishable key
-// (SAR checkout unavailable) or webhook secret (no settlement backstop when
-// the checkout return is lost) is a warning.
-func validateMoyasarConfig(secretKey, publishableKey, webhookSecret string) (warnings []string, err error) {
+// moyasarConfig is the Moyasar boot configuration.
+type moyasarConfig struct {
+	secretKey, publishableKey, webhookSecret string
+	// apiURL (MOYASAR_API_URL) replaces the Moyasar API base. Test only: the
+	// e2e suite points it at a stub; refused with a live key.
+	apiURL string
+	// callbackBaseURL is the dashboard origin token charges send Moyasar as
+	// their callback_url: DASHBOARD_URL, else BASE_URL.
+	callbackBaseURL string
+}
+
+func moyasarConfigFromEnv(getenv func(string) string, baseURL string) moyasarConfig {
+	callback := getenv("DASHBOARD_URL")
+	if callback == "" {
+		callback = baseURL
+	}
+	return moyasarConfig{
+		secretKey:       getenv("MOYASAR_SECRET_KEY"),
+		publishableKey:  getenv("MOYASAR_PUBLISHABLE_KEY"),
+		webhookSecret:   getenv("MOYASAR_WEBHOOK_SECRET"),
+		apiURL:          getenv("MOYASAR_API_URL"),
+		callbackBaseURL: callback,
+	}
+}
+
+// validateMoyasarConfig checks the Moyasar configuration at boot. A secret key
+// of the wrong kind, or test and live keys mixed, is an error: the browser
+// would create payments in one mode while the server reads them back in the
+// other, so customers pay and invoices never settle. So is a callback origin
+// Moyasar can't use (live needs absolute https on a real host), since it
+// would refuse every token charge, and an API override on a live key. A
+// missing publishable key (SAR checkout unavailable) or webhook secret (no
+// settlement backstop when the checkout return is lost) is a warning.
+func validateMoyasarConfig(c moyasarConfig) (warnings []string, err error) {
 	var live bool
 	switch {
-	case strings.HasPrefix(secretKey, moyasarLivePrefix):
+	case strings.HasPrefix(c.secretKey, moyasarLivePrefix):
 		live = true
-	case strings.HasPrefix(secretKey, moyasarTestPrefix):
+	case strings.HasPrefix(c.secretKey, moyasarTestPrefix):
 	default:
 		return nil, fmt.Errorf("MOYASAR_SECRET_KEY must start with %s or %s", moyasarTestPrefix, moyasarLivePrefix)
 	}
 	switch {
-	case publishableKey == "":
+	case c.publishableKey == "":
 		warnings = append(warnings, "MOYASAR_PUBLISHABLE_KEY is not set: SAR checkout will answer 503")
-	case !strings.HasPrefix(publishableKey, "pk_test_") && !strings.HasPrefix(publishableKey, "pk_live_"):
+	case !strings.HasPrefix(c.publishableKey, "pk_test_") && !strings.HasPrefix(c.publishableKey, "pk_live_"):
 		return nil, errors.New("MOYASAR_PUBLISHABLE_KEY must start with pk_test_ or pk_live_")
-	case strings.HasPrefix(publishableKey, "pk_live_") != live:
+	case strings.HasPrefix(c.publishableKey, "pk_live_") != live:
 		return nil, errors.New("MOYASAR_SECRET_KEY and MOYASAR_PUBLISHABLE_KEY mix test and live mode")
 	}
-	if webhookSecret == "" {
+	if c.webhookSecret == "" {
 		warnings = append(warnings, "MOYASAR_WEBHOOK_SECRET is not set: Moyasar webhooks will be refused, so a payment whose checkout return is lost is never settled")
 	}
+	cb, perr := url.Parse(c.callbackBaseURL)
+	switch {
+	case perr != nil || (cb.Scheme != "http" && cb.Scheme != "https") || cb.Host == "":
+		return nil, fmt.Errorf("DASHBOARD_URL (or BASE_URL) %q must be an absolute URL: Moyasar token charges use it as their callback_url", c.callbackBaseURL)
+	case live && (cb.Scheme != "https" || isLocalHost(cb.Hostname())):
+		return nil, fmt.Errorf("DASHBOARD_URL (or BASE_URL) %q must be a public https URL with a live Moyasar key: it is every token charge's callback_url", c.callbackBaseURL)
+	}
+	if c.apiURL != "" {
+		u, perr := url.Parse(c.apiURL)
+		switch {
+		case live:
+			return nil, errors.New("MOYASAR_API_URL is a test-only override and is refused with a live Moyasar key")
+		case perr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
+			return nil, fmt.Errorf("MOYASAR_API_URL %q must be an absolute URL", c.apiURL)
+		}
+		warnings = append(warnings, "MOYASAR_API_URL overrides the Moyasar API (test only): "+c.apiURL)
+	}
 	return warnings, nil
+}
+
+func isLocalHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
 }

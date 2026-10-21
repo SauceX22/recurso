@@ -5,12 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -105,9 +107,7 @@ func moyasarTestServer(t *testing.T, routes map[string]moyasarReply) (*httptest.
 const moyasarTestSecret = "sk_test_x"
 
 func testMoyasar(srvURL string) *MoyasarGateway {
-	g := NewMoyasarGateway(moyasarTestSecret, "https://app.recurso.dev/")
-	g.baseURL = srvURL
-	return g
+	return NewMoyasarGateway(moyasarTestSecret, "https://app.recurso.dev/", srvURL)
 }
 
 // moyasarPaymentJSON builds a payment object; responseCode "null" renders a
@@ -128,7 +128,7 @@ const moyasarPaymentID = "760878ec-d1d3-5f72-9056-191683f55872"
 // --- Constructor and auth ---
 
 func TestMoyasarNewGatewayDefaults(t *testing.T) {
-	g := NewMoyasarGateway("sk_live_y", "https://app.recurso.dev//")
+	g := NewMoyasarGateway("sk_live_y", "https://app.recurso.dev//", "")
 	if g.baseURL != "https://api.moyasar.com/v1" {
 		t.Fatalf("baseURL = %q, want Moyasar v1 API", g.baseURL)
 	}
@@ -297,6 +297,36 @@ func TestMoyasarChargeDeclineMapping(t *testing.T) {
 	}
 }
 
+// Every hard code stops dunning on the card; dropping one from the list would
+// keep re-charging lost, stolen or closed cards, which card networks forbid.
+// The list is the spec's decline table.
+func TestClassifyMoyasarDecline(t *testing.T) {
+	for _, rc := range []string{"04", "07", "14", "15", "33", "34", "35", "36", "37", "38", "41", "43", "54", "56", "57", "59", "62", "63", "67", "79", "93"} {
+		if _, hard := classifyMoyasarDecline(rc); !hard {
+			t.Errorf("%s must be a hard decline", rc)
+		}
+	}
+	for _, rc := range []string{"05", "51", "61", "65", "91", "96", ""} {
+		if _, hard := classifyMoyasarDecline(rc); hard {
+			t.Errorf("%s must be soft", rc)
+		}
+	}
+}
+
+// MOYASAR_API_URL points the adapter at a stub for the e2e suite.
+func TestMoyasarAPIURLOverride(t *testing.T) {
+	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+		"GET /payments/" + moyasarPaymentID: {http.StatusOK, moyasarPaymentJSON(moyasarPaymentID, "paid", "00", "APPROVED")},
+	})
+	g := NewMoyasarGateway(moyasarTestSecret, "https://app.recurso.dev", srv.URL+"/")
+	if _, err := g.FetchPayment(context.Background(), moyasarPaymentID); err != nil {
+		t.Fatalf("fetch through the override: %v", err)
+	}
+	if len(rec.all()) != 1 {
+		t.Fatalf("calls = %+v, want the one fetch on the override URL", rec.all())
+	}
+}
+
 func TestMoyasarChargeAlreadyCreatedFetchesInsteadOfRecreating(t *testing.T) {
 	givenID := moyasarGivenID("renewal-inv-1")
 	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
@@ -343,7 +373,8 @@ func TestMoyasarChargeReplayDetectedByReadBackNotMessage(t *testing.T) {
 	}
 }
 
-// A 400 whose given_id was never created is a genuine rejection.
+// A 400 whose given_id was never created is a genuine rejection of the
+// request, reported with the create's error.
 func TestMoyasarChargeBadRequestWithNoExistingPaymentIsRejected(t *testing.T) {
 	givenID := moyasarGivenID("renewal-inv-1")
 	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
@@ -353,10 +384,10 @@ func TestMoyasarChargeBadRequestWithNoExistingPaymentIsRejected(t *testing.T) {
 	g := testMoyasar(srv.URL)
 
 	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 50, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
-	if err != nil || res.Success || !res.Permanent || res.ErrorCode != "invalid_payment_method" {
-		t.Fatalf("res = %+v, err = %v; want the original rejection", res, err)
+	if err == nil || res == nil || res.Success || res.Permanent {
+		t.Fatalf("res = %+v, err = %v; want the original rejection as an error", res, err)
 	}
-	if want := "moyasar /payments: Validation Failed (invalid_request_error)"; res.ErrorMsg != want {
+	if want := "moyasar /payments: Validation Failed (invalid_request_error)"; !strings.Contains(res.ErrorMsg, want) {
 		t.Fatalf("ErrorMsg = %q, want the create's error %q, not the read-back's", res.ErrorMsg, want)
 	}
 	calls := rec.all()
@@ -463,17 +494,22 @@ func TestMoyasarChargeInvoiceAlreadyPaidIsNotChargedAgain(t *testing.T) {
 	}
 }
 
-// Only a paid payment that covers this charge in its currency counts.
+// Only a paid payment of this invoice that still covers this charge in its
+// currency counts. The list query filters by invoice and status too, but if
+// Moyasar ignored those filters, any other payment returned here would settle
+// the invoice without charging anyone.
 func TestMoyasarChargeIgnoresPaidPaymentsThatDontCover(t *testing.T) {
-	for _, tc := range []struct{ name, amount, currency string }{
-		{"smaller amount", "5000", "SAR"},
-		{"other currency", "10000", "USD"},
+	for _, tc := range []struct{ name, payment string }{
+		{"smaller amount", `{"id":"other","status":"paid","amount":5000,"refunded":0,"currency":"SAR","metadata":{"invoice_id":"inv-1"},"source":{}}`},
+		{"other currency", `{"id":"other","status":"paid","amount":10000,"refunded":0,"currency":"USD","metadata":{"invoice_id":"inv-1"},"source":{}}`},
+		{"other invoice", `{"id":"other","status":"paid","amount":10000,"refunded":0,"currency":"SAR","metadata":{"invoice_id":"inv-2"},"source":{}}`},
+		{"fully refunded", `{"id":"other","status":"paid","amount":10000,"refunded":10000,"currency":"SAR","metadata":{"invoice_id":"inv-1"},"source":{}}`},
+		{"not paid", `{"id":"other","status":"failed","amount":10000,"refunded":0,"currency":"SAR","metadata":{"invoice_id":"inv-1"},"source":{}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			givenID := moyasarGivenID("retry-inv-1-1")
 			srv, rec := moyasarTestServer(t, map[string]moyasarReply{
-				"GET /payments": {http.StatusOK, `{"payments":[{"id":"other","status":"paid","amount":` + tc.amount +
-					`,"currency":"` + tc.currency + `","metadata":{"invoice_id":"inv-1"},"source":{}}]}`},
+				"GET /payments":  {http.StatusOK, `{"payments":[` + tc.payment + `]}`},
 				"POST /payments": {http.StatusCreated, moyasarPaymentJSON(givenID, "paid", "00", "APPROVED")},
 			})
 			g := testMoyasar(srv.URL)
@@ -541,19 +577,21 @@ func TestMoyasarChargeAlreadyCreatedFetchFails(t *testing.T) {
 	}
 }
 
-// Moyasar rejecting the charge itself (an inactive or deleted token, a request
-// it won't accept) is an answer, not an outage: returned as an error, the
-// dunning worker would retry it every five minutes forever.
-func TestMoyasarChargeRejectedIsPermanentFailureNotError(t *testing.T) {
+// Moyasar rejecting the saved card itself (an inactive, expired or deleted
+// token) is an answer about the card: a permanent decline, not an error, so
+// dunning stops charging it instead of retrying forever.
+func TestMoyasarChargeTokenRejectedIsPermanentDecline(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		status int
 		body   string
 	}{
-		{"validation failed", http.StatusBadRequest,
-			`{"type":"invalid_request_error","message":"Validation Failed","errors":{"amount":["must be greater than 100"]}}`},
-		{"token not found", http.StatusNotFound, `{"type":"api_error","message":"Object not found","errors":null}`},
-		{"not activated for live", http.StatusMethodNotAllowed, `{"type":"account_inactive_error","message":"Not activated","errors":null}`},
+		{"token field invalid", http.StatusBadRequest,
+			`{"type":"invalid_request_error","message":"Validation Failed","errors":{"source.token":["is invalid"]}}`},
+		{"source rejected", http.StatusUnprocessableEntity,
+			`{"type":"invalid_request_error","message":"Validation Failed","errors":{"source":["token is inactive"]}}`},
+		{"token named in the message", http.StatusBadRequest,
+			`{"type":"invalid_request_error","message":"Token is expired","errors":null}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, _ := moyasarTestServer(t, map[string]moyasarReply{
@@ -561,15 +599,50 @@ func TestMoyasarChargeRejectedIsPermanentFailureNotError(t *testing.T) {
 			})
 			g := testMoyasar(srv.URL)
 
-			res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 50, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
+			res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
 			if err != nil {
-				t.Fatalf("a rejected charge is a result, not an error: %v", err)
+				t.Fatalf("a rejected card is a result, not an error: %v", err)
 			}
 			if res.Success || !res.Permanent || res.ErrorCode != "invalid_payment_method" {
 				t.Fatalf("res = %+v, want a permanent invalid_payment_method failure", res)
 			}
 			if !strings.Contains(res.ErrorMsg, "moyasar /payments") {
 				t.Fatalf("ErrorMsg = %q, want Moyasar's answer for diagnosis", res.ErrorMsg)
+			}
+		})
+	}
+}
+
+// A 4xx caused by our own request or configuration (a callback_url built from
+// a bad DASHBOARD_URL, an amount below the minimum, an account not activated
+// for live) says nothing about the card. Reported as a hard decline it would
+// hand every SAR invoice to email dunning as "card declined"; it is an error,
+// which the retry worker backs off and escalates.
+func TestMoyasarChargeRequestRejectedIsAnErrorNotADecline(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"callback url invalid", http.StatusBadRequest,
+			`{"type":"invalid_request_error","message":"Validation Failed","errors":{"callback_url":["must be a valid URL"]}}`},
+		{"amount below minimum", http.StatusBadRequest,
+			`{"type":"invalid_request_error","message":"Validation Failed","errors":{"amount":["must be greater than 100"]}}`},
+		{"not activated for live", http.StatusMethodNotAllowed, `{"type":"account_inactive_error","message":"Not activated","errors":null}`},
+		{"unexpected not found", http.StatusNotFound, `{"type":"api_error","message":"Object not found","errors":null}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := moyasarTestServer(t, map[string]moyasarReply{
+				"POST /payments": {tc.status, tc.body},
+			})
+			g := testMoyasar(srv.URL)
+
+			res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
+			if err == nil || !strings.Contains(err.Error(), "moyasar /payments") {
+				t.Fatalf("err = %v, want Moyasar's rejection as an error", err)
+			}
+			if res == nil || res.Success || res.Permanent {
+				t.Fatalf("res = %+v, want a non-permanent failure", res)
 			}
 		})
 	}
@@ -786,9 +859,11 @@ type refundServer struct {
 	posts    int
 	gets     int
 	getFails bool
-	apply    bool
-	reply    int
-	hangUp   bool
+	// failGetsAfter > 0 fails every GET after that many succeeded.
+	failGetsAfter int
+	apply         bool
+	reply         int
+	hangUp        bool
 }
 
 func (s *refundServer) start(t *testing.T) *httptest.Server {
@@ -800,7 +875,7 @@ func (s *refundServer) start(t *testing.T) *httptest.Server {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/payments/"+moyasarPaymentID:
 			s.gets++
-			if s.getFails {
+			if s.getFails || (s.failGetsAfter > 0 && s.gets > s.failGetsAfter) {
 				w.WriteHeader(http.StatusBadGateway)
 				return
 			}
@@ -860,46 +935,153 @@ func TestMoyasarRefundFailureMakesOneCall(t *testing.T) {
 	s := &refundServer{reply: http.StatusInternalServerError}
 	g := testMoyasar(s.start(t).URL)
 
-	if _, err := g.Refund(context.Background(), moyasarPaymentID, 2500, "SAR"); err == nil {
-		t.Fatal("a 500 that applied nothing must be an error")
+	res, err := g.Refund(context.Background(), moyasarPaymentID, 2500, "SAR")
+	if err != nil || res.Status != "pending" {
+		t.Fatalf("res = %+v, err = %v; a 500 may still apply the refund, so its outcome is pending", res, err)
 	}
 	if s.posts != 1 {
 		t.Fatalf("refund POSTs = %d, want 1: a blind refund retry could refund twice", s.posts)
 	}
 }
 
-// A refund whose answer was lost may still have been applied. Reporting it as
-// failed invites a re-issue that refunds the customer twice, so the outcome
-// is read from the payment's refunded total.
+// A refund whose answer was lost may still have been applied, or still be in
+// flight. Reporting it as failed invites a re-issue that refunds the customer
+// twice, so the outcome is read from the payment's refunded total; when the
+// read-back doesn't show it (not applied yet, or the read-back itself failed)
+// the refund is reported pending: it holds the refundable amount and an
+// operator confirms it against Moyasar.
 func TestMoyasarRefundLostAnswerReadBack(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		hangUp  bool
-		reply   int
-		apply   bool
-		wantErr bool
+		name        string
+		hangUp      bool
+		reply       int
+		apply       bool
+		readFails   bool
+		wantPending bool
 	}{
-		{"timeout, applied", true, 0, true, false},
-		{"5xx, applied", false, http.StatusBadGateway, true, false},
-		{"timeout, not applied", true, 0, false, true},
-		{"5xx, not applied", false, http.StatusBadGateway, false, true},
+		{"timeout, applied", true, 0, true, false, false},
+		{"5xx, applied", false, http.StatusBadGateway, true, false, false},
+		{"timeout, not visible yet", true, 0, false, false, true},
+		{"5xx, not visible yet", false, http.StatusBadGateway, false, false, true},
+		{"timeout, read-back fails", true, 0, true, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &refundServer{refunded: 1000, hangUp: tc.hangUp, reply: tc.reply, apply: tc.apply}
-			g := testMoyasar(s.start(t).URL)
+			srv := s.start(t)
+			if tc.readFails {
+				s.failGetsAfter = 1
+			}
+			g := testMoyasar(srv.URL)
 
 			res, err := g.Refund(context.Background(), moyasarPaymentID, 2500, "SAR")
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("res = %+v, want an error when the refund didn't apply", res)
+			if err != nil {
+				t.Fatalf("err = %v; a lost refund answer must never read as failed", err)
+			}
+			if tc.wantPending {
+				if res.Status != "pending" || !strings.HasPrefix(res.RefundID, moyasarPaymentID+":") || res.RefundID == moyasarPaymentID+":3500" {
+					t.Fatalf("res = %+v, want pending with an id of its own", res)
 				}
-			} else if err != nil || res.RefundID != moyasarPaymentID+":3500" || res.Status != "refunded" {
-				t.Fatalf("res = %+v, err = %v; want the applied refund", res, err)
+			} else if res.RefundID != moyasarPaymentID+":3500" || res.Status != "refunded" {
+				t.Fatalf("res = %+v; want the applied refund", res)
 			}
 			if s.posts != 1 || s.gets != 2 {
 				t.Fatalf("POSTs=%d GETs=%d, want 1 refund, a baseline and one read-back", s.posts, s.gets)
 			}
 		})
+	}
+}
+
+// The read-back after a lost answer must run even when the caller's request
+// has been cancelled meanwhile; otherwise an applied refund reads as unknown.
+func TestMoyasarRefundReadBackSurvivesCallerCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var mu sync.Mutex
+	refunded := int64(1000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_, _ = io.Copy(io.Discard, r.Body)
+			mu.Lock()
+			refunded += 2500
+			mu.Unlock()
+			cancel() // the caller gives up while the refund is applied
+			<-r.Context().Done()
+			return
+		}
+		mu.Lock()
+		cur := refunded
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(moyasarRefundJSON(cur)))
+	}))
+	defer srv.Close()
+
+	res, err := testMoyasar(srv.URL).Refund(ctx, moyasarPaymentID, 2500, "SAR")
+	if err != nil || res.RefundID != moyasarPaymentID+":3500" || res.Status != "refunded" {
+		t.Fatalf("res=%+v err=%v; a refund applied while the caller cancelled must read back as refunded", res, err)
+	}
+}
+
+// Two partial refunds of one payment must not overlap: if one's answer is
+// lost while the other applies, its read-back would see the other's amount
+// and report a refund that never happened. Here the first refund's answer is
+// lost (nothing applied) and the server waits briefly for a second refund to
+// arrive meanwhile; run one after the other, exactly one is refunded and the
+// lost one stays pending.
+func TestMoyasarRefundsOfOnePaymentDoNotOverlap(t *testing.T) {
+	var mu sync.Mutex
+	refunded, posts := int64(0), 0
+	secondPost := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var body struct {
+				Amount int64 `json:"amount"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			posts++
+			first := posts == 1
+			mu.Unlock()
+			if first {
+				select { // overlapping refunds would arrive here
+				case <-secondPost:
+				case <-time.After(300 * time.Millisecond):
+				}
+				conn, _, _ := w.(http.Hijacker).Hijack()
+				_ = conn.Close() // answer lost, nothing applied
+				return
+			}
+			close(secondPost)
+			mu.Lock()
+			refunded += body.Amount
+			mu.Unlock()
+		}
+		mu.Lock()
+		cur := refunded
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(moyasarRefundJSON(cur)))
+	}))
+	defer srv.Close()
+	g := testMoyasar(srv.URL)
+
+	var wg sync.WaitGroup
+	statuses := make([]string, 2)
+	for i := range statuses {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			res, err := g.Refund(context.Background(), moyasarPaymentID, 100, "SAR")
+			if err != nil {
+				t.Errorf("refund %d: %v", i, err)
+				return
+			}
+			statuses[i] = res.Status
+		}(i)
+	}
+	wg.Wait()
+	if !(statuses[0] == "refunded" && statuses[1] == "pending") && !(statuses[0] == "pending" && statuses[1] == "refunded") {
+		t.Fatalf("statuses = %v, want one refunded and the lost one pending", statuses)
 	}
 }
 

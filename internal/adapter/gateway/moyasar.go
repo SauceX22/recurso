@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,6 +33,8 @@ type MoyasarGateway struct {
 	checkoutBaseURL string
 	baseURL         string
 	httpClient      *http.Client
+	// refundLocks serializes refunds per payment id (*sync.Mutex values).
+	refundLocks sync.Map
 }
 
 var _ port.PaymentGateway = (*MoyasarGateway)(nil)
@@ -63,24 +67,42 @@ func classifyMoyasarDecline(responseCode string) (code string, permanent bool) {
 
 // NewMoyasarGateway builds the gateway. The secret key alone selects test or
 // live mode (sk_test_ / sk_live_). checkoutBaseURL is the dashboard origin used
-// to build the callback_url that Moyasar requires for token charges.
-func NewMoyasarGateway(secretKey, checkoutBaseURL string) *MoyasarGateway {
+// to build the callback_url that Moyasar requires for token charges. apiURL
+// replaces the Moyasar API base for tests (an e2e stub); "" is the real API.
+func NewMoyasarGateway(secretKey, checkoutBaseURL, apiURL string) *MoyasarGateway {
+	if apiURL == "" {
+		apiURL = moyasarBaseURL
+	}
 	return &MoyasarGateway{
 		secretKey:       secretKey,
 		checkoutBaseURL: strings.TrimRight(checkoutBaseURL, "/"),
-		baseURL:         moyasarBaseURL,
+		baseURL:         strings.TrimRight(apiURL, "/"),
 		httpClient:      &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
 // moyasarAPIError is an HTTP >= 400 answer in Moyasar's {type, message,
 // errors} shape. It never carries request headers, so the secret key cannot
-// leak through an error string.
+// leak through an error string. Fields are the request fields the errors
+// object names.
 type moyasarAPIError struct {
 	Path       string
 	StatusCode int
 	Type       string
 	Message    string
+	Fields     []string
+}
+
+// aboutCard reports whether Moyasar refused the saved card itself (its token
+// is invalid, inactive or expired) rather than something in our request or
+// account.
+func (e *moyasarAPIError) aboutCard() bool {
+	for _, f := range e.Fields {
+		if f == "source" || strings.HasPrefix(f, "source.") || strings.Contains(f, "token") {
+			return true
+		}
+	}
+	return strings.Contains(strings.ToLower(e.Message), "token")
 }
 
 func (e *moyasarAPIError) Error() string {
@@ -118,11 +140,16 @@ func (g *MoyasarGateway) do(ctx context.Context, method, path string, body any, 
 
 	if resp.StatusCode >= 400 {
 		var me struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
+			Type    string                     `json:"type"`
+			Message string                     `json:"message"`
+			Errors  map[string]json.RawMessage `json:"errors"`
 		}
 		_ = json.Unmarshal(payload, &me)
-		return &moyasarAPIError{Path: path, StatusCode: resp.StatusCode, Type: me.Type, Message: me.Message}
+		apiErr := &moyasarAPIError{Path: path, StatusCode: resp.StatusCode, Type: me.Type, Message: me.Message}
+		for field := range me.Errors {
+			apiErr.Fields = append(apiErr.Fields, field)
+		}
+		return apiErr
 	}
 	if out != nil {
 		if err := json.Unmarshal(payload, out); err != nil {
@@ -308,7 +335,15 @@ func (g *MoyasarGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.
 		}
 	}
 	if errors.As(err, &apiErr) && moyasarRejected(apiErr.StatusCode) {
-		return &port.PaymentResult{Success: false, ErrorCode: "invalid_payment_method", ErrorMsg: apiErr.Error(), Permanent: true}, nil
+		if apiErr.aboutCard() {
+			return &port.PaymentResult{Success: false, ErrorCode: "invalid_payment_method", ErrorMsg: apiErr.Error(), Permanent: true}, nil
+		}
+		// Our request or account, not the card: a hard decline would hand
+		// every SAR invoice to email dunning as "card declined". An error
+		// gets the caller's backoff and escalation, and operators a log line.
+		slog.ErrorContext(ctx, "moyasar refused the charge request itself, not the card: check DASHBOARD_URL (callback_url), the account's activation and the request",
+			"status", apiErr.StatusCode, "type", apiErr.Type, "message", apiErr.Message, "fields", apiErr.Fields)
+		return &port.PaymentResult{Success: false, ErrorCode: "gateway_error", ErrorMsg: apiErr.Error()}, fmt.Errorf("moyasar charge request rejected: %w", err)
 	}
 	if err != nil {
 		return &port.PaymentResult{Success: false, ErrorCode: "gateway_error", ErrorMsg: err.Error()}, err
@@ -339,7 +374,7 @@ func (g *MoyasarGateway) paidPaymentFor(ctx context.Context, req port.SavedMetho
 }
 
 // moyasarRejected reports whether an HTTP status means Moyasar refused this
-// charge request itself (bad or inactive token, invalid request): retrying it
+// charge request (bad or inactive token, invalid request): retrying it
 // unchanged cannot succeed. Auth failures and throttling are not about the
 // charge and stay errors, as do 5xx.
 func moyasarRejected(status int) bool {
@@ -412,6 +447,13 @@ func (g *MoyasarGateway) CreateOrder(ctx context.Context, amount int64, currency
 // one read before the call. Moyasar refunds have no id of their own, so
 // RefundID is "<payment id>:<refunded total after this refund>", which is
 // unique per partial refund of a payment.
+//
+// A lost answer the read-back can't confirm (the refund may still be in
+// flight, or the read-back failed) is reported "pending", never failed: a
+// failed refund invites a re-issue that refunds the customer twice, while a
+// pending one holds the refundable amount until an operator confirms it.
+// Refunds of one payment run one at a time in this process, so a read-back
+// never counts another refund's amount.
 func (g *MoyasarGateway) Refund(ctx context.Context, paymentID string, amount int64, currency string) (*port.RefundResult, error) {
 	if paymentID == "" {
 		return nil, errors.New("moyasar refund: payment id is required")
@@ -419,6 +461,10 @@ func (g *MoyasarGateway) Refund(ctx context.Context, paymentID string, amount in
 	if amount <= 0 {
 		return nil, fmt.Errorf("moyasar refund: amount must be positive, got %d", amount)
 	}
+	lock, _ := g.refundLocks.LoadOrStore(paymentID, &sync.Mutex{})
+	lock.(*sync.Mutex).Lock()
+	defer lock.(*sync.Mutex).Unlock()
+
 	before, err := g.fetch(ctx, paymentID)
 	if err != nil {
 		return nil, fmt.Errorf("moyasar refund: read payment before refunding: %w", err)
@@ -434,11 +480,10 @@ func (g *MoyasarGateway) Refund(ctx context.Context, paymentID string, amount in
 		// The answer was lost; the refund may still have been applied. Read
 		// the payment back even if ctx has expired.
 		after, ferr := g.fetch(context.WithoutCancel(ctx), paymentID)
-		if ferr != nil {
-			return nil, fmt.Errorf("moyasar refund outcome unknown (do not retry before checking the payment): %w; read-back: %w", err, ferr)
-		}
-		if after.Refunded < before.Refunded+amount {
-			return nil, fmt.Errorf("moyasar refund not applied: %w", err)
+		if ferr != nil || after.Refunded < before.Refunded+amount {
+			slog.WarnContext(ctx, "moyasar refund outcome unknown; recorded as pending — confirm it on the Moyasar dashboard before re-issuing",
+				"payment_id", paymentID, "amount", amount, "error", err, "read_back_error", ferr)
+			return &port.RefundResult{RefundID: fmt.Sprintf("%s:unknown:%s", paymentID, uuid.NewString()), Status: "pending"}, nil
 		}
 		out = *after
 	}
