@@ -1,5 +1,5 @@
 import { StrictMode } from "react";
-import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, cleanup, fireEvent, act } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router";
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import axios from "axios";
@@ -268,8 +268,8 @@ describe("Checkout — Moyasar embedded form", () => {
     await startPayment();
     const init = await loadMoyasar();
     await waitFor(() => expect(init).toHaveBeenCalled());
-    // Give any duplicate effect pass a chance to run.
-    await new Promise((r) => setTimeout(r, 20));
+    // Flush any duplicate effect pass before counting.
+    await act(async () => {});
     expect(init).toHaveBeenCalledTimes(1);
     expect(document.querySelectorAll(`script[src="${MOYASAR_JS}"]`)).toHaveLength(1);
   });
@@ -282,8 +282,7 @@ describe("Checkout — Moyasar embedded form", () => {
     unmount();
     const init = vi.fn();
     window.Moyasar = { init };
-    moyasarScript().dispatchEvent(new Event("load"));
-    await new Promise((r) => setTimeout(r, 20));
+    await act(async () => moyasarScript().dispatchEvent(new Event("load")));
     expect(init).not.toHaveBeenCalled();
   });
 
@@ -376,6 +375,21 @@ describe("Checkout — Moyasar return verification", () => {
     renderAt(`?id=${PAYMENT_ID}&status=paid`);
     expect(await screen.findByRole("button", { name: PAY_DUE })).toBeInTheDocument();
     expect(verify).not.toHaveBeenCalled();
+  });
+
+  it("keeps the stored payment and the URL when it unmounts before verify resolves", async () => {
+    mockFetch(payResponse());
+    sessionStorage.setItem(moyasarPaymentKey(INVOICE_ID), PAYMENT_ID);
+    let resolveVerify;
+    vi.spyOn(endpoints, "verifyMoyasarCheckout").mockImplementation(
+      () => new Promise((r) => (resolveVerify = r))
+    );
+    const { unmount } = renderAt(`?gateway=moyasar&id=${PAYMENT_ID}&status=paid`);
+    await waitFor(() => expect(resolveVerify).toBeTypeOf("function"));
+    unmount();
+    await act(async () => resolveVerify({ data: { data: { status: "paid" } } }));
+    expect(sessionStorage.getItem(moyasarPaymentKey(INVOICE_ID))).toBe(PAYMENT_ID);
+    expect(window.location.search).toContain(`id=${PAYMENT_ID}`);
   });
 
   it("verifies once under StrictMode", async () => {
