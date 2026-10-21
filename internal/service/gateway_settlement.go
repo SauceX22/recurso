@@ -63,6 +63,12 @@ type cardTokenReader interface {
 	FetchToken(ctx context.Context, tokenID string) (expMonth, expYear int, err error)
 }
 
+// paidPaymentFinder finds a payment the gateway already captured for an
+// invoice in currency covering amount (net of refunds), or nil.
+type paidPaymentFinder interface {
+	FindPaidPayment(ctx context.Context, invoiceID, currency string, amount int64) (*port.GatewayPayment, error)
+}
+
 type dunningRecoveryMarker interface {
 	MarkRecovered(ctx context.Context, invoiceID uuid.UUID) error
 }
@@ -84,6 +90,8 @@ type GatewaySettlementService struct {
 	tokens    cardTokenReader
 	campaigns dunningRecoveryMarker
 	outcomes  dunningOutcomeRecorder
+	paid      paidPaymentFinder
+	routesTo  func(currency string) domain.GatewayProvider
 	logger    *slog.Logger
 }
 
@@ -111,6 +119,35 @@ func (s *GatewaySettlementService) SetCardSaving(cards gatewayMethodSaver, token
 func (s *GatewaySettlementService) SetDunningRecovery(campaigns dunningRecoveryMarker, outcomes dunningOutcomeRecorder) {
 	s.campaigns = campaigns
 	s.outcomes = outcomes
+}
+
+// SetPaidPaymentLookup wires the check for a payment the gateway already
+// captured. routesTo names the gateway a currency is collected on; only
+// invoices routed to this service's gateway are looked up.
+func (s *GatewaySettlementService) SetPaidPaymentLookup(paid paidPaymentFinder, routesTo func(currency string) domain.GatewayProvider) {
+	s.paid = paid
+	s.routesTo = routesTo
+}
+
+// SettleExistingPayment settles inv from a payment the gateway already
+// captured for it, so a buyer whose earlier payment (a renewal whose answer
+// was lost, or a missed webhook) is not yet recorded is never asked to pay
+// again. It reports whether inv is now paid. A lookup error is returned: the
+// caller must not take a new payment it could not check against.
+func (s *GatewaySettlementService) SettleExistingPayment(ctx context.Context, inv *domain.Invoice) (bool, error) {
+	if s == nil || s.paid == nil || s.routesTo == nil ||
+		inv.Status == domain.InvoiceStatusPaid || inv.AmountDue <= 0 || s.routesTo(inv.Currency) != s.provider {
+		return false, nil
+	}
+	p, err := s.paid.FindPaidPayment(ctx, inv.ID.String(), inv.Currency, inv.AmountDue)
+	if err != nil || p == nil {
+		return false, err
+	}
+	s.logger.InfoContext(ctx, "invoice has a captured payment not yet recorded; settling it", "invoice_id", inv.ID, "payment_id", p.ID)
+	if _, err := s.Settle(ctx, inv, p); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // SavesCard reports whether paying inv may store the card for off-session

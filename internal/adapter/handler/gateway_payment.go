@@ -18,5 +18,8 @@ type paymentReader interface {
 // webhook. Satisfied by *service.GatewaySettlementService.
 type paymentSettler interface {
 	Settle(ctx context.Context, inv *domain.Invoice, p *port.GatewayPayment) (bool, error)
+	// SettleExistingPayment settles inv from a payment the gateway already
+	// captured for it and reports whether inv is now paid.
+	SettleExistingPayment(ctx context.Context, inv *domain.Invoice) (bool, error)
 	SavesCard(ctx context.Context, inv *domain.Invoice) bool
 }

@@ -65,6 +65,25 @@ type fakePaymentSettler struct {
 	err          error
 	savesCard    bool
 	settled      []settleCall
+
+	// The already-captured payment check; existing marks the invoice paid
+	// in the fixture's repository, as settling would.
+	existing      bool
+	existingErr   error
+	existingCalls int
+	invoices      *fakeCheckoutInvoices
+}
+
+func (f *fakePaymentSettler) SettleExistingPayment(_ context.Context, inv *domain.Invoice) (bool, error) {
+	f.existingCalls++
+	if f.existingErr != nil {
+		return false, f.existingErr
+	}
+	if f.existing && f.invoices != nil && f.invoices.inv.ID == inv.ID {
+		f.invoices.inv.Status = domain.InvoiceStatusPaid
+		f.invoices.inv.AmountDue = 0
+	}
+	return f.existing, nil
 }
 
 func (f *fakePaymentSettler) Settle(_ context.Context, inv *domain.Invoice, p *port.GatewayPayment) (bool, error) {
@@ -98,11 +117,12 @@ func newMoyasarHandlerFixture() *moyasarHandlerFixture {
 		ID: uuid.NewString(), Status: "paid", Amount: 8000, Currency: "SAR", InvoiceID: inv.ID.String(),
 		CardToken: "token_abc", CardBrand: "mada", CardLast4: "1010",
 	}
+	invoices := &fakeCheckoutInvoices{inv: inv}
 	return &moyasarHandlerFixture{
 		inv: inv, payment: payment,
 		reader:   &fakePaymentReader{payment: payment},
-		invoices: &fakeCheckoutInvoices{inv: inv},
-		settler:  &fakePaymentSettler{transitioned: true, savesCard: true},
+		invoices: invoices,
+		settler:  &fakePaymentSettler{transitioned: true, savesCard: true, invoices: invoices},
 	}
 }
 
