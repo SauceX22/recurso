@@ -8,7 +8,7 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-API_URL="http://localhost:8080"
+API_URL="${API_URL:-http://localhost:8080}"
 
 echo "Starting End-to-End Verification..."
 
@@ -392,6 +392,102 @@ if [ "$CN_REFUND" != "processed" ] || [ "$STUB_REFUNDED" != "1000" ]; then
   fail_6d "credit-note refund: refund_status=$CN_REFUND, Moyasar refunded=$STUB_REFUNDED (want processed / 1000)" "$CN_RES"
 fi
 echo -e "${GREEN}  ✅ Credit-note refund went through Moyasar (refunded 1000)${NC}"
+
+# 6e. Saved-card renewal against the Moyasar stub. A subscription created with
+# a start_date one interval back is already due, so the billing-cycle sweep
+# (BILLING_CYCLE_INTERVAL, 5s in docker-compose.yml) renews it within the run
+# and charges the card saved by a checkout payment: POST /v1/payments with the
+# token and a given_id derived from "renewal-<invoice id>".
+echo "Step 6e: Moyasar saved-card renewal, paid and hard-declined (stubbed API)..."
+BACKDATED_START=$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(days=32)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
+
+# backdated_sar_sub <customer id> — prints the new subscription's id.
+backdated_sar_sub() {
+  post_json "$API_URL/v1/subscriptions" "$(jq -n --arg c "$1" --arg p "$PLAN_ID_SAR" --arg s "$BACKDATED_START" \
+    '{customer_id: $c, plan_id: $p, start_date: $s}')" "$API_KEY" | jq -r '.data.id'
+}
+
+# renewal_invoice <subscription id> — the subscription's renewal
+# (subscription_cycle) invoice, "null" when there is none yet.
+renewal_invoice() {
+  get_json "$API_URL/v1/invoices?per_page=250" "$API_KEY" | jq -c --arg sid "$1" \
+    '[.data[] | select(.subscription_id == $sid and .billing_reason == "subscription_cycle")] | first'
+}
+
+# stub_charges <invoice id> — every payment the stub holds for the invoice.
+stub_charges() {
+  curl -s -u sk_test_e2e: -G "$MOYASAR_STUB/v1/payments" --data-urlencode "metadata[invoice_id]=$1" | jq -c '.payments'
+}
+
+# wait_renewal_charge <subscription id> — polls up to 60s for the renewal
+# invoice and a stub charge for it; prints the invoice id ("" on timeout).
+wait_renewal_charge() {
+  local inv_id
+  for _ in $(seq 1 60); do
+    inv_id=$(renewal_invoice "$1" | jq -r '.id // empty')
+    if [ -n "$inv_id" ] && stub_charges "$inv_id" | jq -e 'length > 0' > /dev/null; then
+      sleep 2 # the sweep settles (or gives up on) the charge right after it
+      echo "$inv_id"
+      return
+    fi
+    sleep 1
+  done
+}
+
+# Paid: Sara's card was saved by step 6d's checkout payment (token_e2e_sar).
+SUB_RENEW_OK=$(backdated_sar_sub "$CUST_ID_SAR")
+[ -n "$SUB_RENEW_OK" ] && [ "$SUB_RENEW_OK" != "null" ] || fail_6d "backdated SAR subscription not created"
+RENEW_OK_ID=$(wait_renewal_charge "$SUB_RENEW_OK")
+[ -n "$RENEW_OK_ID" ] || fail_6d "no charged renewal invoice for backdated subscription $SUB_RENEW_OK within 60s" "$(renewal_invoice "$SUB_RENEW_OK")"
+RENEW_OK=$(get_json "$API_URL/v1/invoices/$RENEW_OK_ID" "$API_KEY" | jq -c '.data')
+WANT_GIVEN_ID=$(python3 -c 'import sys, uuid; print(uuid.uuid5(uuid.UUID("6f1c2a8e-3b7d-4e0a-9c51-2d8f4b6e7a90"), "renewal-" + sys.argv[1]))' "$RENEW_OK_ID")
+OK_CHARGES=$(stub_charges "$RENEW_OK_ID")
+if [ "$(echo "$RENEW_OK" | jq -r '.status')" != "paid" ] \
+  || [ "$(echo "$RENEW_OK" | jq -r '.gateway_payment_id')" != "$WANT_GIVEN_ID" ] \
+  || [ "$(echo "$OK_CHARGES" | jq 'length')" != "1" ] \
+  || [ "$(echo "$OK_CHARGES" | jq -r --argjson total "$(echo "$RENEW_OK" | jq '.total')" \
+        '.[0] | "\(.id) \(.status) \(.source.token) \(.amount == $total)"')" != "$WANT_GIVEN_ID paid token_e2e_sar true" ]; then
+  fail_6d "renewal did not settle through one token charge of token_e2e_sar (want gateway_payment_id $WANT_GIVEN_ID); stub charges: $OK_CHARGES" "$RENEW_OK"
+fi
+echo -e "${GREEN}  ✅ Renewal charged the saved Moyasar token once and settled (payment $WANT_GIVEN_ID)${NC}"
+
+# Hard decline: Dina's checkout payment saves a card whose token the stub
+# declines with ISO 8583 54 (expired card), a permanent decline.
+CUST_DECL_RES=$(post_json "$API_URL/v1/customers" '{
+    "name": "Dina Alqahtani",
+    "email": "dina.sar@example.com",
+    "billing_address": {"country": "SA", "postal_code": "11564"}
+  }' "$API_KEY")
+CUST_ID_DECL=$(get_json_value "$CUST_DECL_RES" "data.id")
+SUB_DECL_FIRST=$(post_json "$API_URL/v1/subscriptions" "$(jq -n --arg c "$CUST_ID_DECL" --arg p "$PLAN_ID_SAR" \
+  '{customer_id: $c, plan_id: $p}')" "$API_KEY" | jq -r '.data.id')
+INV_DECL_FIRST=$(get_json "$API_URL/v1/invoices?per_page=250" "$API_KEY" | jq -r --arg sid "$SUB_DECL_FIRST" \
+  '[.data[] | select(.subscription_id == $sid)][0].id')
+DECL_DUE=$(post_json "$API_URL/checkout/$INV_DECL_FIRST/pay" '{}' | jq -r '.data.amount')
+DECL_PAYMENT_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+curl -s -X PUT "$MOYASAR_STUB/_stub/payments/$DECL_PAYMENT_ID" -H 'Content-Type: application/json' \
+  --data @- > /dev/null <<<"$(jq -n --arg inv "$INV_DECL_FIRST" --argjson amount "$DECL_DUE" \
+    '{status: "paid", amount: $amount, currency: "SAR", metadata: {invoice_id: $inv},
+      source: {type: "creditcard", company: "mada", number: "4201-32XX-XXXX-1010", token: "token_e2e_decline_hard"}}')"
+DECL_VERIFY=$(post_json "$API_URL/checkout/$INV_DECL_FIRST/moyasar/verify" "$(jq -n --arg id "$DECL_PAYMENT_ID" '{payment_id: $id}')")
+[ "$(echo "$DECL_VERIFY" | jq -r '.data.status')" = "paid" ] || fail_6d "checkout verify did not settle Dina's first invoice" "$DECL_VERIFY"
+
+SUB_RENEW_DECL=$(backdated_sar_sub "$CUST_ID_DECL")
+[ -n "$SUB_RENEW_DECL" ] && [ "$SUB_RENEW_DECL" != "null" ] || fail_6d "backdated SAR subscription (decline) not created"
+RENEW_DECL_ID=$(wait_renewal_charge "$SUB_RENEW_DECL")
+[ -n "$RENEW_DECL_ID" ] || fail_6d "no charged renewal invoice for backdated subscription $SUB_RENEW_DECL within 60s" "$(renewal_invoice "$SUB_RENEW_DECL")"
+RENEW_DECL=$(get_json "$API_URL/v1/invoices/$RENEW_DECL_ID" "$API_KEY" | jq -c '.data')
+DECL_CHARGES=$(stub_charges "$RENEW_DECL_ID")
+# A declined renewal leaves the invoice open and unpaid for dunning
+# (renewal.go attemptPayment): no payment recorded, nothing settled.
+if [ "$(echo "$RENEW_DECL" | jq -r '.status')" != "open" ] \
+  || [ "$(echo "$RENEW_DECL" | jq -r '.amount_paid')" != "0" ] \
+  || [ "$(echo "$RENEW_DECL" | jq -r '.gateway_payment_id // ""')" != "" ] \
+  || [ "$(echo "$DECL_CHARGES" | jq 'length')" != "1" ] \
+  || [ "$(echo "$DECL_CHARGES" | jq -r '.[0] | "\(.status) \(.source.token) \(.source.response_code)"')" != "failed token_e2e_decline_hard 54" ]; then
+  fail_6d "hard-declined renewal: want one failed charge (code 54) and an open, unpaid invoice; stub charges: $DECL_CHARGES" "$RENEW_DECL"
+fi
+echo -e "${GREEN}  ✅ Hard-declined renewal charged the token once (code 54), invoice left open and unpaid${NC}"
 
 # 7. Audit-grade gate: after everything above, the ledger must reconcile with
 # ZERO discrepancies — the end-to-end version of the invariant harness. Any
