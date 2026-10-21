@@ -64,11 +64,14 @@ type Wallet struct {
 	// RechargeAttempt numbers auto-recharge attempts; it is part of the
 	// charge's idempotency key and advances only once an attempt's outcome is
 	// known. RechargeFailures is the current run of failed attempts, for
-	// backoff. Internal only.
-	RechargeAttempt  int       `json:"-"`
-	RechargeFailures int       `json:"-"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	// backoff. RechargeDeclines counts the answered declines in a row on the
+	// saved method RechargeDeclinesRef, for the soft-decline cap. Internal only.
+	RechargeAttempt     int       `json:"-"`
+	RechargeFailures    int       `json:"-"`
+	RechargeDeclines    int       `json:"-"`
+	RechargeDeclinesRef string    `json:"-"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 	// ClosedAt is set when the wallet is closed/cashed out; a closed wallet has a
 	// zero balance and accepts no further top-ups or drains. nil = open.
 	ClosedAt *time.Time `json:"closed_at,omitempty"`

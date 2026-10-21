@@ -39,7 +39,12 @@ type RechargeOutcome struct {
 	// response the payment may exist, so the next attempt replays the key.
 	Answered bool
 	// Failures is the run of failed attempts including this one; 0 on success.
+	// It sets the backoff.
 	Failures int
+	// Declines is the run of answered declines on DeclinesRef, the saved
+	// method they came from; 0 and "" on success. It drives the decline cap.
+	Declines    int
+	DeclinesRef string
 	// RetryAt keeps the wallet out of the recharge sweep until then; nil
 	// makes it due again at once.
 	RetryAt *time.Time

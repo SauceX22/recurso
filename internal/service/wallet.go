@@ -489,19 +489,29 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 	m, err := s.lookup.GetSavedPaymentMethod(ctx, w.CustomerID)
 	if err != nil {
 		slog.WarnContext(ctx, "wallet auto-recharge: saved payment method lookup failed", "wallet_id", w.ID, "error", err)
-		s.recordRechargeFailure(ctx, w, false, "")
+		s.recordRechargeFailure(ctx, w, "")
 		return false
 	}
 	if !m.Chargeable() {
 		s.notifyRechargeFailure(ctx, w, "no saved payment method")
-		s.recordRechargeFailure(ctx, w, false, "")
+		s.recordRechargeFailure(ctx, w, "")
 		return false
 	}
 	charger, err := s.chargerRouter.ChargerFor(ctx, m, w.Currency)
-	if err != nil {
-		slog.WarnContext(ctx, "wallet auto-recharge: saved payment method can't be charged", "wallet_id", w.ID, "provider", m.Provider, "error", err)
+	if errors.Is(err, ErrSavedMethodNotChargeable) {
+		// The method can never be charged as things stand (e.g. its gateway
+		// no longer collects this currency for the tenant): stop on it, as
+		// for a hard decline, until the customer saves another, and tell
+		// them once instead of on every sweep.
+		slog.WarnContext(ctx, "wallet auto-recharge: saved payment method can't be charged; auto-recharge stops on it", "wallet_id", w.ID, "provider", m.Provider, "error", err)
+		s.recordRechargeFailure(ctx, w, m.PaymentMethodRef)
 		s.notifyRechargeFailure(ctx, w, "payment gateway unavailable")
-		s.recordRechargeFailure(ctx, w, false, "")
+		return false
+	}
+	if err != nil {
+		// Transient (connection store or vault): ours, not the customer's.
+		slog.WarnContext(ctx, "wallet auto-recharge: saved payment method's gateway could not be loaded", "wallet_id", w.ID, "provider", m.Provider, "error", err)
+		s.recordRechargeFailure(ctx, w, "")
 		return false
 	}
 
@@ -516,7 +526,7 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 	amount, current, err := s.wallets.ReserveRechargeAmount(ctx, w.TenantID, w.ID, w.RechargeAttempt, *w.AutoRechargeAmount)
 	if err != nil {
 		slog.WarnContext(ctx, "wallet auto-recharge: could not reserve the attempt", "wallet_id", w.ID, "error", err)
-		s.recordRechargeFailure(ctx, w, false, "")
+		s.recordRechargeFailure(ctx, w, "")
 		return false
 	}
 	if !current {
@@ -535,20 +545,30 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 	if err != nil || result == nil {
 		// No answer: the card may have been charged, so tell no one it failed.
 		logChargeFailure(ctx, "wallet auto-recharge got no answer from the gateway; the same charge is replayed later", result, err, "wallet_id", w.ID, "provider", m.Provider)
-		s.recordRechargeFailure(ctx, w, false, "")
+		s.recordRechargeFailure(ctx, w, "")
 		return false
 	}
 	if !result.Success {
 		logChargeFailure(ctx, "wallet auto-recharge charge declined", result, nil, "wallet_id", w.ID, "provider", m.Provider)
-		failures := w.RechargeFailures + 1
+		// The cap counts declines on this method only: a newly saved method
+		// starts afresh, and no-answer or lookup failures never count.
+		declines := 1
+		if w.RechargeDeclinesRef == m.PaymentMethodRef {
+			declines = w.RechargeDeclines + 1
+		}
 		blocked := ""
-		if result.Permanent || failures >= maxRechargeFailures {
+		if result.Permanent || declines >= maxRechargeFailures {
 			blocked = m.PaymentMethodRef
 		}
-		s.recordRechargeFailure(ctx, w, true, blocked)
+		failures := w.RechargeFailures + 1
+		retryAt := s.now().Add(rechargeBackoff(failures))
+		s.recordRechargeOutcome(ctx, w, port.RechargeOutcome{
+			Answered: true, Failures: failures, RetryAt: &retryAt, BlockedMethodRef: blocked,
+			Declines: declines, DeclinesRef: m.PaymentMethodRef,
+		})
 		// Tell the customer once when declines start, and once when
 		// auto-recharge stops; not on every backed-off retry in between.
-		if failures == 1 || blocked != "" {
+		if declines == 1 || blocked != "" {
 			s.notifyRechargeFailure(ctx, w, "payment failed")
 		}
 		return false
@@ -588,8 +608,8 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 	return true
 }
 
-// maxRechargeFailures caps failed recharges since the last success: the
-// decline that reaches it stops auto-recharge on that method until the
+// maxRechargeFailures caps answered declines in a row on one saved method:
+// the decline that reaches it stops auto-recharge on that method until the
 // customer saves another (card networks limit reattempts on a declined card).
 const maxRechargeFailures = 8
 
@@ -607,15 +627,17 @@ func rechargeBackoff(failures int) time.Duration {
 	}
 }
 
-// recordRechargeFailure backs the wallet off after a failed attempt. answered
-// is whether the gateway declined (the next attempt is a new charge) rather
-// than giving no answer; blockedRef stops auto-recharge on a hard-declined
-// method until the customer saves another.
-func (s *WalletService) recordRechargeFailure(ctx context.Context, w *domain.Wallet, answered bool, blockedRef string) {
+// recordRechargeFailure backs the wallet off after an attempt the gateway
+// did not answer (no answer, nothing to charge, a lookup or routing failure):
+// the attempt keeps its key and the decline count stays as it was.
+// blockedRef stops auto-recharge on a method that can't be charged until the
+// customer saves another.
+func (s *WalletService) recordRechargeFailure(ctx context.Context, w *domain.Wallet, blockedRef string) {
 	failures := w.RechargeFailures + 1
 	retryAt := s.now().Add(rechargeBackoff(failures))
 	s.recordRechargeOutcome(ctx, w, port.RechargeOutcome{
-		Answered: answered, Failures: failures, RetryAt: &retryAt, BlockedMethodRef: blockedRef,
+		Failures: failures, RetryAt: &retryAt, BlockedMethodRef: blockedRef,
+		Declines: w.RechargeDeclines, DeclinesRef: w.RechargeDeclinesRef,
 	})
 }
 

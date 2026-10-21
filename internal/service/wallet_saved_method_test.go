@@ -304,9 +304,9 @@ func TestWalletRecharge_LostResponseReplaysTheChargedAmount(t *testing.T) {
 }
 
 // Soft declines are capped: card networks limit reattempts on a declined
-// card, so after maxRechargeFailures failed attempts since the last success
+// card, so after maxRechargeFailures declines in a row on one method
 // auto-recharge stops on that method until the customer saves another, as
-// for a hard decline. The customer hears about the first failure and about
+// for a hard decline. The customer hears about the first decline and about
 // the stop, not about every daily retry in between.
 func TestWalletRecharge_SoftDeclinesAreCapped(t *testing.T) {
 	for _, tc := range []struct {
@@ -321,6 +321,7 @@ func TestWalletRecharge_SoftDeclinesAreCapped(t *testing.T) {
 	} {
 		svc, repo, _, _ := sarRechargeFixture()
 		repo.dueList[0].RechargeFailures = tc.priorFailures
+		repo.dueList[0].RechargeDeclines, repo.dueList[0].RechargeDeclinesRef = tc.priorFailures, "token_abc"
 		notifier := &recordingNotifier{}
 		svc.SetNotifier(notifier)
 		charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: false, ErrorCode: "insufficient_funds"}}
@@ -330,12 +331,112 @@ func TestWalletRecharge_SoftDeclinesAreCapped(t *testing.T) {
 			t.Fatal(err)
 		}
 		o := repo.outcomes[0]
-		if blocked := o.BlockedMethodRef == "token_abc"; blocked != tc.wantBlocked || !o.Answered || o.Failures != tc.priorFailures+1 {
+		if blocked := o.BlockedMethodRef == "token_abc"; blocked != tc.wantBlocked || !o.Answered || o.Failures != tc.priorFailures+1 ||
+			o.Declines != tc.priorFailures+1 || o.DeclinesRef != "token_abc" {
 			t.Fatalf("after %d prior failures: outcome = %+v, want blocked=%v", tc.priorFailures, o, tc.wantBlocked)
 		}
 		if emailed := len(notifier.to) == 1; emailed != tc.wantEmail || len(notifier.to) > 1 {
 			t.Fatalf("after %d prior failures: emails = %v, want emailed=%v", tc.priorFailures, notifier.to, tc.wantEmail)
 		}
+	}
+}
+
+// The decline cap counts declines on one saved method: a card saved after
+// the cap blocked the previous one starts with a fresh count.
+func TestWalletRecharge_NewMethodGetsAFreshDeclineCount(t *testing.T) {
+	svc, repo, _, _ := sarRechargeFixture()
+	repo.dueList[0].RechargeFailures = maxRechargeFailures // the old card's run
+	repo.dueList[0].RechargeDeclines, repo.dueList[0].RechargeDeclinesRef = maxRechargeFailures, "token_old"
+	notifier := &recordingNotifier{}
+	svc.SetNotifier(notifier)
+	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: false, ErrorCode: "insufficient_funds"}}
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger)) // token_abc, a new card
+
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if o := repo.outcomes[0]; o.BlockedMethodRef != "" || !o.Answered {
+		t.Fatalf("first decline on a new card: outcome = %+v, want answered and not blocked", o)
+	}
+	if len(notifier.to) != 1 {
+		t.Fatalf("emails = %v, want one for the first decline on the new card", notifier.to)
+	}
+}
+
+// Failures that are not declines (no answer, lookup errors) back off but
+// don't count toward the decline cap or the "declines started" email.
+func TestWalletRecharge_NonDeclinesDontSpendTheDeclineCap(t *testing.T) {
+	svc, repo, _, _ := sarRechargeFixture()
+	notifier := &recordingNotifier{}
+	svc.SetNotifier(notifier)
+	charger := &fakeRenewalCharger{err: errors.New("timeout")}
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
+
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(notifier.to) != 0 || repo.outcomes[0].RetryAt == nil {
+		t.Fatalf("timeout: emails=%v outcome=%+v, want no email and a backoff", notifier.to, repo.outcomes[0])
+	}
+	// Seven more timeouts, then a soft decline: the first decline, not a block.
+	repo.dueList[0].RechargeFailures = maxRechargeFailures - 1
+	charger.err, charger.result = nil, &port.PaymentResult{Success: false, ErrorCode: "insufficient_funds"}
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if o := repo.outcomes[1]; o.BlockedMethodRef != "" || !o.Answered || o.Failures != maxRechargeFailures {
+		t.Fatalf("decline after timeouts: outcome = %+v, want not blocked, backoff run kept", o)
+	}
+	if len(notifier.to) != 1 {
+		t.Fatalf("emails = %v, want one for the first decline", notifier.to)
+	}
+}
+
+// A saved method the wallet's currency no longer routes to (a BYO-Stripe
+// tenant's older Moyasar card) can never be charged until the customer saves
+// another: it is blocked at once with one email, not retried and emailed
+// every day.
+func TestWalletRecharge_UnroutableMethodIsBlockedOnce(t *testing.T) {
+	svc, repo, _, _ := sarRechargeFixture()
+	notifier := &recordingNotifier{}
+	svc.SetNotifier(notifier)
+	charger := &fakeRenewalCharger{}
+	router := NewSavedCardGatewayRouter(nil, nil, &fakeRenewalCharger{})
+	router.RegisterProvider(domain.GatewayMoyasar, charger)
+	router.SetCurrencyRouting(fixedRoutes{"SAR": domain.GatewayStripe})
+	svc.SetSavedMethodCharging(moyasarLookup(), router)
+
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if o := repo.outcomes[0]; o.BlockedMethodRef != "token_abc" {
+		t.Fatalf("outcome = %+v, want token_abc blocked", o)
+	}
+	if len(notifier.to) != 1 || len(charger.reqs) != 0 {
+		t.Fatalf("emails=%v charges=%d, want one email and no charge", notifier.to, len(charger.reqs))
+	}
+}
+
+// A transient routing failure (the connection store or vault failed) is
+// ours, not the customer's: back off without asking them to update a card.
+func TestWalletRecharge_TransientChargerErrorBacksOffSilently(t *testing.T) {
+	svc, repo, _, _ := sarRechargeFixture()
+	notifier := &recordingNotifier{}
+	svc.SetNotifier(notifier)
+	connID := uuid.New()
+	lookup := moyasarLookup()
+	lookup.connID = &connID
+	router := NewSavedCardGatewayRouter(&fakeConnOpener{getErr: errors.New("db down")}, nil, nil)
+	svc.SetSavedMethodCharging(lookup, router)
+
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if o := repo.outcomes[0]; o.BlockedMethodRef != "" || o.RetryAt == nil {
+		t.Fatalf("outcome = %+v, want a backoff and no block", o)
+	}
+	if len(notifier.to) != 0 {
+		t.Fatalf("emails = %v, want none for our own outage", notifier.to)
 	}
 }
 
