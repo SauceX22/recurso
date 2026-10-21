@@ -328,3 +328,15 @@ func TestMoyasarWebhook_UnhandledEventsIgnored(t *testing.T) {
 		t.Fatal("unhandled event fetched or settled")
 	}
 }
+
+// A paid payment for a void or draft invoice is refused by settlement (and
+// flagged there for a refund); redelivering it changes nothing, so it is
+// acknowledged.
+func TestMoyasarWebhook_NonPayableInvoiceIsAcked(t *testing.T) {
+	f := newMoyasarFixture(t)
+	f.settler.err = service.ErrInvoiceNotPayable
+	w := f.deliver("ev_void", "payment_paid")
+	if w.Code != http.StatusOK || ackReason(t, w) != "invoice not payable" || f.dedup.marks != 1 {
+		t.Fatalf("got %d body %s marks %d, want 200 ignored \"invoice not payable\" and recorded", w.Code, w.Body.String(), f.dedup.marks)
+	}
+}

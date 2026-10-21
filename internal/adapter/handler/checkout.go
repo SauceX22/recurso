@@ -245,6 +245,12 @@ func (h *CheckoutHandler) InitiatePayment(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, codeInvoiceAlreadyPaid, "invoice already paid")
 		return
 	}
+	// A void or draft invoice is not owed: a payment taken for it could only
+	// be refunded.
+	if !service.InvoicePayable(invoice) {
+		respondError(c, http.StatusConflict, codeConflict, "invoice is not payable")
+		return
+	}
 
 	// Public endpoint: carry the invoice's tenant so BYO routing picks the
 	// seller's own gateway (falls back to the env gateway when unset). The
@@ -574,7 +580,7 @@ func (h *CheckoutHandler) MoyasarVerify(c *gin.Context) {
 	}
 	// A voided or unfinalized invoice is not owed; a written-off
 	// (uncollectible) one still is.
-	if invoice.Status == domain.InvoiceStatusVoid || invoice.Status == domain.InvoiceStatusDraft {
+	if !service.InvoicePayable(invoice) {
 		respondError(c, http.StatusConflict, codeConflict, "invoice is not payable")
 		return
 	}

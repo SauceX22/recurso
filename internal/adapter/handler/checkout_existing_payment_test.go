@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+
+	"github.com/recurso-dev/recurso/internal/core/domain"
 )
 
 // A payment the gateway already captured for the invoice (a renewal whose
@@ -109,5 +111,32 @@ func TestMoyasarVerify_FailedPaymentCheckErrorReportsFailed(t *testing.T) {
 	code, out := f.verifyPayment(t)
 	if code != http.StatusOK || moyData(t, out)["status"] != "failed" {
 		t.Fatalf("status = %d body %v, want failed", code, out)
+	}
+}
+
+// Only an owed invoice (open, past_due, uncollectible) gets a payment form,
+// on every gateway: a buyer who pays a void or draft invoice is charged for
+// nothing, and verify would then refuse the payment.
+func TestCheckoutInitiate_NonPayableInvoiceGetsNoOrder(t *testing.T) {
+	for _, gw := range []string{"moyasar", "stripe", "razorpay"} {
+		for _, status := range []domain.InvoiceStatus{domain.InvoiceStatusVoid, domain.InvoiceStatusDraft} {
+			f := newMoyCheckoutFixture(gw)
+			f.inv.Status = status
+			code, out := f.pay(t)
+			if code != http.StatusConflict || moyErrorCode(out) != codeConflict {
+				t.Fatalf("%s %s: status = %d code = %q, want 409 %s", gw, status, code, moyErrorCode(out), codeConflict)
+			}
+			if f.gw.gotAmount != 0 || f.settler.existingCalls != 0 {
+				t.Fatalf("%s %s: order amount = %d checks = %d, want no order and no gateway check", gw, status, f.gw.gotAmount, f.settler.existingCalls)
+			}
+		}
+	}
+}
+
+func TestCheckoutInitiate_UncollectibleInvoiceIsPayable(t *testing.T) {
+	f := newMoyCheckoutFixture("moyasar")
+	f.inv.Status = domain.InvoiceStatusUncollectible
+	if code, out := f.pay(t); code != http.StatusOK {
+		t.Fatalf("status = %d body %v, want the form", code, out)
 	}
 }

@@ -17,7 +17,21 @@ var (
 	ErrPaymentWrongInvoice  = errors.New("payment does not belong to this invoice")
 	ErrPaymentWrongCurrency = errors.New("payment currency does not match invoice")
 	ErrPaymentShortAmount   = errors.New("payment amount is less than the amount due")
+	// ErrInvoiceNotPayable: the invoice is void or draft, so nothing is owed
+	// and a payment for it must not settle it.
+	ErrInvoiceNotPayable = errors.New("invoice is not payable")
 )
+
+// InvoicePayable reports whether inv is owed and may take a payment: open,
+// past due, or written off (uncollectible). Paid, void and draft invoices
+// are not.
+func InvoicePayable(inv *domain.Invoice) bool {
+	switch inv.Status {
+	case domain.InvoiceStatusOpen, domain.InvoiceStatusPastDue, domain.InvoiceStatusUncollectible:
+		return true
+	}
+	return false
+}
 
 // BindPaymentToInvoice checks that a payment read back from the gateway was
 // made for inv: its metadata names the invoice, the currency matches, and the
@@ -141,7 +155,7 @@ func (s *GatewaySettlementService) SetPaidPaymentLookup(paid paidPaymentFinder, 
 // caller must not take a new payment it could not check against.
 func (s *GatewaySettlementService) SettleExistingPayment(ctx context.Context, inv *domain.Invoice) (bool, error) {
 	if s == nil || s.paid == nil || s.routesTo == nil ||
-		inv.Status == domain.InvoiceStatusPaid || inv.AmountDue <= 0 || s.routesTo(inv.Currency) != s.provider {
+		!InvoicePayable(inv) || inv.AmountDue <= 0 || s.routesTo(inv.Currency) != s.provider {
 		return false, nil
 	}
 	p, err := s.paid.FindPaidPayment(ctx, inv.ID.String(), inv.Currency, inv.AmountDue)
@@ -226,10 +240,17 @@ func (s *GatewaySettlementService) CardOnFile(ctx context.Context, inv *domain.I
 
 // Settle marks inv paid by p. The caller has already confirmed with the
 // gateway that p is captured. It returns whether this call performed the paid
-// transition; an error means the invoice was not settled.
+// transition; an error means the invoice was not settled. A payment for a
+// void or draft invoice is refused with ErrInvoiceNotPayable and flagged for
+// a refund; an already-paid invoice goes through, so a duplicate is caught.
 func (s *GatewaySettlementService) Settle(ctx context.Context, inv *domain.Invoice, p *port.GatewayPayment) (bool, error) {
 	if err := BindPaymentToInvoice(p, inv); err != nil {
 		return false, err
+	}
+	if inv.Status != domain.InvoiceStatusPaid && !InvoicePayable(inv) {
+		s.logger.WarnContext(ctx, "captured payment for an invoice that is not payable — not settled, review for refund",
+			"invoice_id", inv.ID, "invoice_status", inv.Status, "payment_id", p.ID, "amount", p.Amount, "currency", p.Currency)
+		return false, ErrInvoiceNotPayable
 	}
 	tenantCtx := context.WithValue(ctx, domain.TenantIDKey, inv.TenantID)
 	transitioned, err := s.settler.MarkInvoicePaid(tenantCtx, inv.ID)

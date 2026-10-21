@@ -3,6 +3,7 @@ package handler
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 
@@ -174,6 +175,12 @@ func (h *WebhookHandler) handleMoyasarPaymentPaid(c *gin.Context, ev moyasarWebh
 	}
 
 	transitioned, err := h.moyasarSettler.Settle(c.Request.Context(), inv, p)
+	if errors.Is(err, service.ErrInvoiceNotPayable) {
+		// Void or draft: settlement flagged the payment for a refund, and a
+		// redelivery would change nothing.
+		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "invoice not payable"})
+		return
+	}
 	if err != nil {
 		h.logger.Error("failed to settle invoice from Moyasar payment", "invoice_id", inv.ID, "payment_id", p.ID, "error", err)
 		respondInternalError(c, err)
