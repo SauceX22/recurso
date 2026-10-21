@@ -193,11 +193,21 @@ func (h *WebhookHandler) handleMoyasarPaymentPaid(c *gin.Context, ev moyasarWebh
 // handleMoyasarPaymentReversed flags a refund or void of a payment on a
 // settled invoice. Refunds issued from Recurso credit notes also arrive here;
 // one made in the Moyasar dashboard has no credit note and leaves the books
-// overstating cash until someone reconciles it.
+// overstating cash until someone reconciles it. Moyasar refunds have no id,
+// so a refund whose outcome was unknown when issued is resolved from the
+// payment's refunded total read back here.
 func (h *WebhookHandler) handleMoyasarPaymentReversed(c *gin.Context, ev moyasarWebhookEnvelope) {
 	p, inv, ok := h.loadMoyasarInvoice(c, ev)
 	if !ok {
 		return
+	}
+	if ev.Type == "payment_refunded" && h.creditNoteService != nil {
+		if err := h.creditNoteService.ResolveUnknownRefunds(c.Request.Context(), inv, p.ID, p.RefundedAmount); err != nil {
+			// Not recorded as processed, so Moyasar redelivers.
+			h.logger.Error("failed to resolve Moyasar refunds of unknown outcome", "invoice_id", inv.ID, "payment_id", p.ID, "error", err)
+			respondInternalError(c, err)
+			return
+		}
 	}
 	if inv.Status == domain.InvoiceStatusPaid {
 		h.logger.Warn("Moyasar payment refunded or voided on a settled invoice — confirm a matching credit note exists",
