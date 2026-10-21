@@ -69,41 +69,34 @@ func (r *SmartRouter) resolveByName(name string) port.PaymentGateway {
 	return r.Extra[name]
 }
 
-// ProviderFor names the gateway that collects payments in currency, by the
-// same rule as gatewayFor: an override first, then INR to Razorpay and
-// everything else to Stripe. It reports the routing, not whether that gateway
-// is configured.
-func (r *SmartRouter) ProviderFor(currency string) domain.GatewayProvider {
-	cur := strings.ToUpper(currency)
-	if name, ok := r.currencyOverrides[cur]; ok {
-		return domain.GatewayProvider(name)
-	}
+// builtinProvider is the routing without overrides: INR to Razorpay,
+// everything else to Stripe. cur is upper-case.
+func builtinProvider(cur string) domain.GatewayProvider {
 	if cur == "INR" {
 		return domain.GatewayRazorpay
 	}
 	return domain.GatewayStripe
 }
 
+// ProviderFor names the gateway that collects payments in currency: an
+// override first, then the built-in rule. gatewayFor routes by it. It reports
+// the routing, not whether that gateway is configured.
+func (r *SmartRouter) ProviderFor(currency string) domain.GatewayProvider {
+	cur := strings.ToUpper(currency)
+	if name, ok := r.currencyOverrides[cur]; ok {
+		return domain.GatewayProvider(name)
+	}
+	return builtinProvider(cur)
+}
+
 // gatewayFor returns the gateway for a currency, or an error when that
 // gateway was not configured (previously a nil-pointer panic).
 func (r *SmartRouter) gatewayFor(currency string) (port.PaymentGateway, error) {
-	cur := strings.ToUpper(currency)
-	if name, ok := r.currencyOverrides[cur]; ok {
-		if gw := r.resolveByName(name); gw != nil {
-			return gw, nil
-		}
-		return nil, fmt.Errorf("gateway %q for currency %s not configured", name, cur)
+	name := r.ProviderFor(currency)
+	if gw := r.resolveByName(string(name)); gw != nil {
+		return gw, nil
 	}
-	if cur == "INR" {
-		if r.Razorpay == nil {
-			return nil, fmt.Errorf("razorpay gateway not configured for currency %s", currency)
-		}
-		return r.Razorpay, nil
-	}
-	if r.Stripe == nil {
-		return nil, fmt.Errorf("stripe gateway not configured for currency %s", currency)
-	}
-	return r.Stripe, nil
+	return nil, fmt.Errorf("%s gateway for currency %s not configured", name, strings.ToUpper(currency))
 }
 
 func (r *SmartRouter) CreateOrder(ctx context.Context, amount int64, currency string, receipt string, invoiceID string) (*port.PaymentOrder, error) {
