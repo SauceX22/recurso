@@ -312,6 +312,17 @@ func TestClassifyMoyasarDecline(t *testing.T) {
 			t.Errorf("%s must be soft", rc)
 		}
 	}
+	// The code keys the dunning bandit's context, so each ISO code must land
+	// on its documented code, not just the right permanence.
+	for rc, want := range map[string]string{
+		"51": "insufficient_funds", "61": "insufficient_funds", "65": "insufficient_funds",
+		"33": "expired_card", "54": "expired_card", "41": "lost_or_stolen", "43": "lost_or_stolen",
+		"05": "card_declined", "": "card_declined",
+	} {
+		if got, _ := classifyMoyasarDecline(rc); got != want {
+			t.Errorf("classifyMoyasarDecline(%q) = %q, want %q", rc, got, want)
+		}
+	}
 }
 
 // MOYASAR_API_URL points the adapter at a stub for the e2e suite.
@@ -597,24 +608,53 @@ func TestMoyasarChargeReplayOfHardDeclineIsPermanent(t *testing.T) {
 	}
 }
 
+// When the replay read-back itself fails (anything but a 404), the adapter
+// can't know whether the earlier attempt charged: it surfaces an error and
+// never classifies the create's 400 as a hard decline of the card, even when
+// that 400 names the token.
 func TestMoyasarChargeAlreadyCreatedFetchFails(t *testing.T) {
 	givenID := moyasarGivenID("renewal-inv-1")
-	srv, rec := moyasarTestServer(t, map[string]moyasarReply{
-		"POST /payments": {http.StatusBadRequest,
-			`{"type":"invalid_request_error","message":"Payment is already created.","errors":null}`},
-		"GET /payments/" + givenID: {http.StatusBadGateway, ``},
-	})
-	g := testMoyasar(srv.URL)
+	for _, status := range []int{http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+				"POST /payments": {http.StatusBadRequest,
+					`{"type":"invalid_request_error","message":"Validation Failed","errors":{"source.token":["has already been used"]}}`},
+				"GET /payments/" + givenID: {status, `{"type":"api_error","message":"try later","errors":null}`},
+			})
+			g := testMoyasar(srv.URL)
 
-	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
-	if err == nil {
-		t.Fatal("a failed read-back must surface an error, not a guessed result")
+			res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
+			if err == nil {
+				t.Fatal("a failed read-back must surface an error, not a guessed result")
+			}
+			if res == nil || res.Success || res.Permanent || res.ErrorCode != "gateway_error" {
+				t.Fatalf("res = %+v, want a non-permanent gateway_error", res)
+			}
+			if n := rec.count(http.MethodPost); n != 1 {
+				t.Fatalf("POST count = %d, want 1", n)
+			}
+		})
 	}
-	if res == nil || res.Success || res.ErrorCode != "gateway_error" {
-		t.Fatalf("res = %+v, want gateway_error", res)
-	}
-	if n := rec.count(http.MethodPost); n != 1 {
-		t.Fatalf("POST count = %d, want 1", n)
+}
+
+// Every way Moyasar can name the card in a rejection is recognised, and a
+// rejection of another field is not.
+func TestMoyasarAPIErrorAboutCard(t *testing.T) {
+	for _, tc := range []struct {
+		fields []string
+		msg    string
+		want   bool
+	}{
+		{[]string{"source"}, "", true},
+		{[]string{"source.company"}, "", true},
+		{[]string{"token"}, "", true},
+		{nil, "The token is inactive", true},
+		{[]string{"callback_url"}, "Validation Failed", false},
+	} {
+		e := &moyasarAPIError{Fields: tc.fields, Message: tc.msg}
+		if got := e.aboutCard(); got != tc.want {
+			t.Errorf("aboutCard(fields=%v msg=%q) = %v, want %v", tc.fields, tc.msg, got, tc.want)
+		}
 	}
 }
 
@@ -689,16 +729,21 @@ func TestMoyasarChargeRequestRejectedIsAnErrorNotADecline(t *testing.T) {
 	}
 }
 
-// Throttling is transient and says nothing about the card: keep it an error
-// so the worker retries the same attempt shortly.
-func TestMoyasarChargeRateLimitedIsError(t *testing.T) {
-	srv, _ := moyasarTestServer(t, map[string]moyasarReply{
-		"POST /payments": {http.StatusTooManyRequests, `{"type":"rate_limit_error","message":"Too many requests","errors":null}`},
-	})
-	g := testMoyasar(srv.URL)
-
-	if _, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"}); err == nil {
-		t.Fatal("429 must be an error")
+// Auth failures, throttling and server errors are never about the card, even
+// when the message says "token" (a revoked API token): a hard decline would
+// hand every SAR invoice to email dunning and block every saved card. They
+// stay errors, so the worker retries the same attempt.
+func TestMoyasarChargeAuthThrottleAndServerErrorsAreNeverDeclines(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv, _ := moyasarTestServer(t, map[string]moyasarReply{
+				"POST /payments": {status, `{"type":"authentication_error","message":"Invalid API token","errors":null}`},
+			})
+			res, err := testMoyasar(srv.URL).ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
+			if err == nil || res == nil || res.Permanent {
+				t.Fatalf("res = %+v, err = %v; want an error, not a permanent decline", res, err)
+			}
+		})
 	}
 }
 
