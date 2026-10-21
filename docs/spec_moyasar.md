@@ -116,8 +116,8 @@ over. A hard decline records the declined method (`declined_method_ref`) and
 doesn't count as a retry (the scheduler's email counter stays in step); when
 the scheduler hands the invoice back, that method is not charged again until
 the customer saves another. A lookup or router failure is not "no method": it
-takes the infrastructure retry. Infrastructure errors back off from 5 minutes
-(doubling, 6h cap) and hand the invoice to email dunning after 6 in a row.
+takes the infrastructure retry. Infrastructure errors back off from 5 minutes,
+doubling up to 160 min, then email dunning: the invoice is handed off after 6 in a row.
 Every post-attempt write is conditional on the invoice still being open or
 past_due, so a payment that lands during the charge is never reverted.
 

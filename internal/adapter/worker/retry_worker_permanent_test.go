@@ -322,16 +322,19 @@ func (noInvoiceRepo) GetByIDPublic(context.Context, uuid.UUID) (*domain.Invoice,
 }
 
 // A retry that collects closes the invoice's dunning campaign, which lifts the
-// payment wall; left open, the paying customer stays walled.
+// payment wall (left open, the paying customer stays walled), and rewards the
+// action that preceded it.
 func TestRetryWorker_SuccessClosesDunningCampaign(t *testing.T) {
 	inv := pastDueSARInvoice(1)
+	inv.DunningActionID, inv.DunningContextKey = "3d", "SAR:insufficient_funds"
 	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
 	charger := &fakeSavedCharger{name: "moyasar"}
 	router := service.NewSavedCardGatewayRouter(nil, nil, nil)
 	router.RegisterProvider(domain.GatewayMoyasar, charger)
 	campaigns := &fakeCampaignRepo{exec: &domain.DunningCampaignExecution{ID: uuid.New(), InvoiceID: inv.ID, Status: domain.DunningExecStatusActive}}
 
-	w := NewRetryWorker(repo, &countingDecider{}, &mockGateway{}, &mockNotifier{})
+	decider := &countingDecider{}
+	w := NewRetryWorker(repo, decider, &mockGateway{}, &mockNotifier{})
 	w.SetSavedMethodCharging(&fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_ok"}, router)
 	w.SetSettler(&fakeSettler{transitioned: true})
 	w.SetDunningCampaignService(service.NewDunningCampaignService(campaigns, noInvoiceRepo{}, nil, nil, nil))
@@ -339,6 +342,10 @@ func TestRetryWorker_SuccessClosesDunningCampaign(t *testing.T) {
 
 	if len(campaigns.updated) != 1 || campaigns.updated[0].Status != domain.DunningExecStatusRecovered {
 		t.Fatalf("campaign updates = %+v, want one marked recovered", campaigns.updated)
+	}
+	if len(decider.outcomes) != 1 || decider.outcomes[0].Outcome != "success" || decider.outcomes[0].Reward != 1 ||
+		decider.outcomes[0].ActionID != "3d" || decider.outcomes[0].RetryInterval != 72*3600 {
+		t.Fatalf("outcomes = %+v, want one success for the 3d action", decider.outcomes)
 	}
 }
 
@@ -352,16 +359,19 @@ func (f *failingSettler) MarkInvoicePaid(context.Context, uuid.UUID) (bool, erro
 // A charge that succeeded but could not be settled leaves the retry state
 // alone, so the next poll replays the same key and settles. Clearing it (or
 // closing the campaign, or recording the payment) on an unpaid invoice strands
-// it: past_due, no next retry, no dunning action.
+// it: past_due, no next retry, no dunning action. The bandit is rewarded once,
+// by the replay that settles, not by every attempt that fails to settle.
 func TestRetryWorker_SettleFailureLeavesRetryStateForReplay(t *testing.T) {
 	inv := pastDueSARInvoice(1)
+	inv.DunningActionID, inv.DunningContextKey = "3d", "SAR:insufficient_funds"
 	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
 	charger := &fakeSavedCharger{name: "moyasar"}
 	router := service.NewSavedCardGatewayRouter(nil, nil, nil)
 	router.RegisterProvider(domain.GatewayMoyasar, charger)
 	campaigns := &fakeCampaignRepo{exec: &domain.DunningCampaignExecution{ID: uuid.New(), InvoiceID: inv.ID, Status: domain.DunningExecStatusActive}}
 
-	w := NewRetryWorker(repo, &countingDecider{}, &mockGateway{}, &mockNotifier{})
+	decider := &countingDecider{}
+	w := NewRetryWorker(repo, decider, &mockGateway{}, &mockNotifier{})
 	w.SetSavedMethodCharging(&fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_ok"}, router)
 	settler := &failingSettler{}
 	w.SetSettler(settler)
@@ -374,5 +384,8 @@ func TestRetryWorker_SettleFailureLeavesRetryStateForReplay(t *testing.T) {
 	if len(repo.cleared) != 0 || len(repo.claimed) != 0 || len(repo.updated) != 0 || len(campaigns.updated) != 0 {
 		t.Fatalf("after a failed settle: cleared=%v claimed=%v updated=%d campaign=%d; want nothing written",
 			repo.cleared, repo.claimed, len(repo.updated), len(campaigns.updated))
+	}
+	if len(decider.outcomes) != 0 {
+		t.Fatalf("outcomes = %+v for an unsettled charge, want none", decider.outcomes)
 	}
 }

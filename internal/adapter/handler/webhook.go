@@ -246,7 +246,7 @@ func (h *WebhookHandler) recordDunningFailure(ctx context.Context, invoiceID uui
 		InvoiceID:     inv.ID,
 		ContextKey:    inv.DunningContextKey,
 		ActionID:      inv.DunningActionID,
-		RetryInterval: getDunningActionSeconds(inv.DunningActionID),
+		RetryInterval: service.DunningActionIntervalSeconds(inv.DunningActionID),
 		Outcome:       "failure",
 		Reward:        0.0,
 		CreatedAt:     time.Now(),
@@ -287,15 +287,6 @@ func (h *WebhookHandler) recordDunningSuccess(ctx context.Context, invoiceID uui
 		}
 	}
 	service.NewDunningSuccessRecorder(campaigns, outcomes).Record(ctx, inv)
-}
-
-func getDunningActionSeconds(actionID string) int64 {
-	for _, a := range domain.DefaultDunningActions {
-		if a.ID == actionID {
-			return int64(a.Interval.Seconds())
-		}
-	}
-	return 86400
 }
 
 func formatInvoiceAmount(amountPaise int64, currency string) string {
