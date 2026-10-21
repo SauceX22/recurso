@@ -268,8 +268,9 @@ func TestSavedCardGatewayRouter_ErrorKinds(t *testing.T) {
 	}
 }
 
-// A BYO connection whose stored secret opens to "" never builds a charger: an
-// empty API key would send the charge unauthenticated.
+// A BYO connection whose stored secret opens to "" never builds a charger (an
+// empty API key would send the charge unauthenticated), and it can never be
+// charged as configured, so callers fall back instead of retrying it.
 func TestSavedCardGatewayRouter_EmptySecretBuildsNothing(t *testing.T) {
 	connID := uuid.New()
 	built := 0
@@ -278,8 +279,8 @@ func TestSavedCardGatewayRouter_EmptySecretBuildsNothing(t *testing.T) {
 	r := NewSavedCardGatewayRouter(opener, build, &namedCharger{name: "platform"})
 
 	c, err := r.ChargerFor(context.Background(), stripeMethod(&connID), "USD")
-	if err == nil || c != nil || built != 0 {
-		t.Fatalf("charger=%v err=%v built=%d; want an error and no charger built", c, err, built)
+	if !errors.Is(err, ErrSavedMethodNotChargeable) || c != nil || built != 0 {
+		t.Fatalf("charger=%v err=%v built=%d; want ErrSavedMethodNotChargeable and no charger built", c, err, built)
 	}
 }
 

@@ -143,8 +143,11 @@ func (r *SavedCardGatewayRouter) ChargerFor(ctx context.Context, m domain.SavedP
 		return nil, fmt.Errorf("%w: saved-card gateway connection %s: %s connections can't charge saved methods", ErrSavedMethodNotChargeable, connID, conn.Provider)
 	}
 	secret, err := r.conns.OpenSecret(conn)
-	if err != nil || secret == "" {
+	if err != nil {
 		return nil, fmt.Errorf("open saved-card gateway secret for %s: %w", connID, err)
+	}
+	if secret == "" {
+		return nil, fmt.Errorf("%w: saved-card gateway connection %s has no secret", ErrSavedMethodNotChargeable, connID)
 	}
 	return build(secret), nil
 }
