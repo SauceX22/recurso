@@ -94,6 +94,7 @@ func (r *GatewayResolver) build(conns []*domain.GatewayConnection) *SmartRouter 
 	razorpay := r.env.Razorpay
 	stripe := r.env.Stripe
 	var gocardless port.PaymentGateway
+	own := map[domain.GatewayProvider]bool{} // providers on the tenant's own account
 
 	for _, conn := range conns {
 		if !conn.HasSecret() {
@@ -103,6 +104,7 @@ func (r *GatewayResolver) build(conns []*domain.GatewayConnection) *SmartRouter 
 		if err != nil || secret == "" {
 			continue
 		}
+		own[conn.Provider] = true
 		switch conn.Provider {
 		case domain.GatewayRazorpay:
 			razorpay = r.buildRazorpay(conn.PublicKey, secret)
@@ -124,8 +126,17 @@ func (r *GatewayResolver) build(conns []*domain.GatewayConnection) *SmartRouter 
 	// the same routing rules for currencies they haven't overridden. COPY the
 	// maps — the env router's are shared across every tenant build, and a
 	// tenant-specific gateway must never leak into them.
+	//
+	// Except: an override to a platform-only gateway (one a tenant can't
+	// connect, so it always collects into the platform's merchant account)
+	// is dropped for a currency whose built-in gateway is on the tenant's
+	// own account. Their SAR stays on their own Stripe instead of landing in
+	// the platform's Moyasar account with no payout to them.
 	overrides := make(map[string]string, len(r.env.currencyOverrides)+2)
 	for c, name := range r.env.currencyOverrides {
+		if platformOnlyGateways[domain.GatewayProvider(name)] && own[builtinProvider(c)] {
+			continue
+		}
 		overrides[c] = name
 	}
 	extra := make(map[string]port.PaymentGateway, len(r.env.Extra)+1)
@@ -147,6 +158,12 @@ func (r *GatewayResolver) build(conns []*domain.GatewayConnection) *SmartRouter 
 	router.Extra = extra
 	return router
 }
+
+// platformOnlyGateways are the extra gateways only the platform can
+// configure (no BYO connection type), whose payments always land in the
+// platform's account. Adyen has the same exposure but predates this rule and
+// keeps its routing.
+var platformOnlyGateways = map[domain.GatewayProvider]bool{domain.GatewayMoyasar: true}
 
 // StripeFor returns the concrete Stripe gateway for a tenant (BYO), or the env
 // Stripe gateway. Used by checkout verify / saved-card flows that call
