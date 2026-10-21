@@ -18,6 +18,25 @@ type PlanRepository interface {
 	Update(ctx context.Context, plan *domain.Plan) error
 }
 
+// InvoiceRetryState is the retry worker's bookkeeping for an unpaid invoice
+// after one attempt. Every field is written; DunningManagedBy "" keeps the
+// current owner.
+type InvoiceRetryState struct {
+	Status            domain.InvoiceStatus
+	NextRetryAt       *time.Time
+	RetryCount        int
+	DunningActionID   string
+	DunningContextKey string
+	LastPaymentError  string
+	DunningManagedBy  string
+	// DeclinedMethodRef is the saved method a hard decline came from; "" when
+	// the last attempt wasn't a hard decline.
+	DeclinedMethodRef string
+	// RetryInfraFailures counts consecutive attempts that ended in a gateway
+	// or lookup error rather than an answer.
+	RetryInfraFailures int
+}
+
 type InvoiceRepository interface {
 	SumUnscheduledDeferral(ctx context.Context, tenantID uuid.UUID) (int64, error)
 	Create(ctx context.Context, invoice *domain.Invoice) error
@@ -106,9 +125,22 @@ type InvoiceRepository interface {
 	UpdateRetryInfo(ctx context.Context, invoiceID uuid.UUID, nextRetry time.Time, retryCount int) error
 	UpdateRetryInfoWithDunning(ctx context.Context, invoiceID uuid.UUID, nextRetry time.Time, retryCount int, managedBy string) error
 	MarkAsUncollectible(ctx context.Context, invoiceID uuid.UUID) error
+	// UpdateRetryState writes the retry worker's bookkeeping after an attempt,
+	// only while the invoice is still unpaid (open or past_due): a payment that
+	// settled it meanwhile is never reverted. Returns false when the invoice
+	// was no longer unpaid and nothing was written.
+	UpdateRetryState(ctx context.Context, tenantID, invoiceID uuid.UUID, s InvoiceRetryState) (bool, error)
+	// ClearRetryState drops a settled invoice's retry schedule and dunning
+	// action. It touches no status or amount.
+	ClearRetryState(ctx context.Context, tenantID, invoiceID uuid.UUID) error
 	// SetGatewayPaymentID records the gateway-side payment identifier that
 	// settled the invoice (needed later for API refunds).
 	SetGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, gatewayPaymentID string) error
+	// ClaimGatewayPaymentID records paymentID as the payment that settled the
+	// invoice unless a different one is already recorded, and reports whether
+	// paymentID is now the recorded one. Conditional in SQL, so two concurrent
+	// settlers cannot both win.
+	ClaimGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (bool, error)
 	GetOverdueInvoices(ctx context.Context) ([]domain.OverdueInvoice, error)
 	// ClaimOverdueForDunning atomically leases up to `limit` overdue
 	// scheduler-managed invoices for the calling instance by pushing

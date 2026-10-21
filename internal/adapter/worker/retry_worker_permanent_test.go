@@ -86,8 +86,10 @@ func TestRetryWorker_PermanentDeclineHandsInvoiceToEmailDunning(t *testing.T) {
 	}
 	got := repo.updated[0]
 	assertHandedToEmailDunning(t, got)
-	if got.LastPaymentError != "expired_card" || got.RetryCount != 2 {
-		t.Fatalf("LastPaymentError=%q RetryCount=%d, want expired_card/2", got.LastPaymentError, got.RetryCount)
+	// The scheduler counts its emails off RetryCount; counting this attempt
+	// too would skip the level-2 email.
+	if got.LastPaymentError != "expired_card" || got.RetryCount != 1 {
+		t.Fatalf("LastPaymentError=%q RetryCount=%d, want expired_card/1", got.LastPaymentError, got.RetryCount)
 	}
 	if decider.decides != 0 {
 		t.Fatalf("DecideRetry called %d times after a hard decline, want 0", decider.decides)
@@ -170,8 +172,10 @@ func TestRetryWorker_ProviderSavedMethodCharged(t *testing.T) {
 	router := service.NewSavedCardGatewayRouter(nil, nil, stripe)
 	router.RegisterProvider(domain.GatewayMoyasar, moyasar)
 
+	settler := &fakeSettler{transitioned: true}
 	w := NewRetryWorker(repo, newTestRetryService(), gw, &mockNotifier{})
 	w.SetSavedMethodCharging(&fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_r"}, router)
+	w.SetSettler(settler)
 	w.processRetries(context.Background())
 
 	if moyasar.charges != 1 || gw.calls != 0 || stripe.charges != 0 {
@@ -184,8 +188,8 @@ func TestRetryWorker_ProviderSavedMethodCharged(t *testing.T) {
 	if moyasar.reqs[0] != want {
 		t.Fatalf("charge = %+v, want %+v", moyasar.reqs[0], want)
 	}
-	if repo.updated[0].Status != domain.InvoiceStatusPaid {
-		t.Fatalf("status = %s, want paid", repo.updated[0].Status)
+	if len(settler.settled) != 1 || len(repo.cleared) != 1 {
+		t.Fatalf("settled=%v cleared=%v, want the invoice settled and its retry state cleared", settler.settled, repo.cleared)
 	}
 }
 
@@ -207,32 +211,15 @@ func TestRetryWorker_UnchargeableMethodUsesInteractiveRetry(t *testing.T) {
 	}
 }
 
-// settlingRepo is mockInvoiceRepo plus the reads and writes of a settled
-// retry: the re-read after MarkInvoicePaid and the payment id record.
-type settlingRepo struct {
-	mockInvoiceRepo
-	paymentIDs []string
+type fakeSettler struct {
+	transitioned bool
+	settled      []uuid.UUID
+	tenant       any
 }
 
-func (r *settlingRepo) GetByID(_ context.Context, id uuid.UUID) (*domain.Invoice, error) {
-	for _, inv := range r.invoices {
-		if inv.ID == id {
-			cp := *inv
-			cp.Status = domain.InvoiceStatusPaid
-			return &cp, nil
-		}
-	}
-	return nil, nil
-}
-
-func (r *settlingRepo) SetGatewayPaymentID(_ context.Context, _, _ uuid.UUID, id string) error {
-	r.paymentIDs = append(r.paymentIDs, id)
-	return nil
-}
-
-type fakeSettler struct{ transitioned bool }
-
-func (f fakeSettler) MarkInvoicePaid(context.Context, uuid.UUID) (bool, error) {
+func (f *fakeSettler) MarkInvoicePaid(ctx context.Context, id uuid.UUID) (bool, error) {
+	f.settled = append(f.settled, id)
+	f.tenant = ctx.Value(domain.TenantIDKey)
 	return f.transitioned, nil
 }
 
@@ -254,18 +241,18 @@ func TestRetryWorker_RecordsSettlingPaymentID(t *testing.T) {
 			if tc.creditedAll {
 				inv.CreditApplied = inv.Total
 			}
-			repo := &settlingRepo{mockInvoiceRepo: mockInvoiceRepo{invoices: []*domain.Invoice{inv}}}
+			repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
 			moyasar := &fakeSavedCharger{name: "moyasar"}
 			router := service.NewSavedCardGatewayRouter(nil, nil, nil)
 			router.RegisterProvider(domain.GatewayMoyasar, moyasar)
 
 			w := NewRetryWorker(repo, newTestRetryService(), &mockGateway{}, &mockNotifier{})
 			w.SetSavedMethodCharging(&fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_r"}, router)
-			w.SetSettler(fakeSettler{transitioned: tc.transitioned})
+			w.SetSettler(&fakeSettler{transitioned: tc.transitioned})
 			w.processRetries(context.Background())
 
-			if len(repo.paymentIDs) != len(tc.want) || (len(tc.want) == 1 && repo.paymentIDs[0] != tc.want[0]) {
-				t.Fatalf("recorded payment ids = %v, want %v", repo.paymentIDs, tc.want)
+			if len(repo.claimed) != len(tc.want) || (len(tc.want) == 1 && repo.claimed[0] != tc.want[0]) {
+				t.Fatalf("claimed payment ids = %v, want %v", repo.claimed, tc.want)
 			}
 		})
 	}

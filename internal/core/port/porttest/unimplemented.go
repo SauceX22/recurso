@@ -874,8 +874,20 @@ func (UnimplementedInvoiceRepository) MarkAsUncollectible(context.Context, uuid.
 	panic("porttest: InvoiceRepository.MarkAsUncollectible is not implemented")
 }
 
+func (UnimplementedInvoiceRepository) UpdateRetryState(context.Context, uuid.UUID, uuid.UUID, port.InvoiceRetryState) (bool, error) {
+	panic("porttest: InvoiceRepository.UpdateRetryState is not implemented")
+}
+
+func (UnimplementedInvoiceRepository) ClearRetryState(context.Context, uuid.UUID, uuid.UUID) error {
+	panic("porttest: InvoiceRepository.ClearRetryState is not implemented")
+}
+
 func (UnimplementedInvoiceRepository) SetGatewayPaymentID(context.Context, uuid.UUID, uuid.UUID, string) error {
 	panic("porttest: InvoiceRepository.SetGatewayPaymentID is not implemented")
+}
+
+func (UnimplementedInvoiceRepository) ClaimGatewayPaymentID(context.Context, uuid.UUID, uuid.UUID, string) (bool, error) {
+	panic("porttest: InvoiceRepository.ClaimGatewayPaymentID is not implemented")
 }
 
 func (UnimplementedInvoiceRepository) GetOverdueInvoices(context.Context) ([]domain.OverdueInvoice, error) {

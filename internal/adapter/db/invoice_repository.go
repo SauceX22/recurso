@@ -280,7 +280,8 @@ func (r *InvoiceRepository) getByIDInternal(ctx context.Context, id uuid.UUID, t
 			COALESCE(last_payment_error, ''), COALESCE(dunning_managed_by, 'scheduler'),
 			COALESCE(payment_wall_active, FALSE),
 			COALESCE(gateway_payment_id, ''),
-			COALESCE(billing_reason, ''), entity_id, COALESCE(tax_type, '')
+			COALESCE(billing_reason, ''), entity_id, COALESCE(tax_type, ''),
+			COALESCE(declined_method_ref, ''), retry_infra_failures
 		FROM invoices WHERE id = $1
 	`
 	args := []interface{}{id}
@@ -305,6 +306,7 @@ func (r *InvoiceRepository) getByIDInternal(ctx context.Context, id uuid.UUID, t
 		&inv.PaymentWallActive,
 		&inv.GatewayPaymentID,
 		&inv.BillingReason, &entityID, &inv.TaxType,
+		&inv.DeclinedMethodRef, &inv.RetryInfraFailures,
 	)
 
 	inv.HSNCode = hsnCode.String
@@ -387,6 +389,48 @@ func (r *InvoiceRepository) Update(ctx context.Context, inv *domain.Invoice) err
 	return nil
 }
 
+// UpdateRetryState writes only the retry bookkeeping columns, and only while
+// the invoice is unpaid. The worker charges between its claim and this write,
+// and a checkout or webhook may settle the invoice in that window; a full-row
+// write from the claimed copy would put it back to past_due with the old
+// amount_paid, and the next settlement would post the payment twice.
+func (r *InvoiceRepository) UpdateRetryState(ctx context.Context, tenantID, invoiceID uuid.UUID, s port.InvoiceRetryState) (bool, error) {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE invoices
+		SET status = $3, next_retry_at = $4, retry_count = $5,
+		    dunning_action_id = $6, dunning_context_key = $7, last_payment_error = $8,
+		    dunning_managed_by = COALESCE($9, dunning_managed_by),
+		    declined_method_ref = $10, retry_infra_failures = $11,
+		    updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2 AND status IN ('open', 'past_due')`,
+		invoiceID, tenantID, s.Status, s.NextRetryAt, s.RetryCount,
+		nilIfEmpty(s.DunningActionID), nilIfEmpty(s.DunningContextKey), nilIfEmpty(s.LastPaymentError),
+		nilIfEmpty(s.DunningManagedBy), nilIfEmpty(s.DeclinedMethodRef), s.RetryInfraFailures)
+	if err != nil {
+		return false, fmt.Errorf("failed to update invoice retry state: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to read rows affected: %w", err)
+	}
+	return n == 1, nil
+}
+
+// ClearRetryState drops a settled invoice's retry schedule and dunning action;
+// status and amounts belong to MarkPaid.
+func (r *InvoiceRepository) ClearRetryState(ctx context.Context, tenantID, invoiceID uuid.UUID) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE invoices
+		SET next_retry_at = NULL, dunning_action_id = NULL, dunning_context_key = NULL,
+		    last_payment_error = NULL, declined_method_ref = NULL, retry_infra_failures = 0,
+		    updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2`, invoiceID, tenantID)
+	if err != nil {
+		return fmt.Errorf("failed to clear invoice retry state: %w", err)
+	}
+	return nil
+}
+
 // MarkPaid atomically settles an invoice via a single conditional UPDATE. The
 // `AND status <> 'paid'` guard means only the first of several concurrent
 // settlers (inline checkout, gateway webhook, retry worker, offline payment)
@@ -450,7 +494,8 @@ const retryInvoiceColumns = `
 	signed_qr_code, e_invoice_status, tds_amount,
 	created_at, due_date, paid_at, next_retry_at, retry_count,
 	COALESCE(dunning_action_id, ''), COALESCE(dunning_context_key, ''),
-	COALESCE(last_payment_error, ''), COALESCE(dunning_managed_by, 'scheduler')`
+	COALESCE(last_payment_error, ''), COALESCE(dunning_managed_by, 'scheduler'),
+	COALESCE(declined_method_ref, ''), retry_infra_failures`
 
 // ClaimDueForRetry atomically leases up to `limit` due retry invoices for THIS
 // worker instance and returns them, pushing each claimed row's next_retry_at
@@ -507,6 +552,7 @@ func scanRetryInvoices(rows *sql.Rows) ([]*domain.Invoice, error) {
 			&inv.CreatedAt, &dueDate, &inv.PaidAt, &inv.NextRetryAt, &inv.RetryCount,
 			&dunAction, &dunCtx,
 			&lastErr, &dunMgr,
+			&inv.DeclinedMethodRef, &inv.RetryInfraFailures,
 		); err != nil {
 			return nil, err
 		}

@@ -853,7 +853,6 @@ func main() {
 	savedCardRouter.SetCurrencyRouting(paymentGateway)
 	retryWorker.SetSavedMethodCharging(customerRepo, savedCardRouter)
 	retryWorker.SetDunningCampaignService(dunningCampaignService)
-	retryWorker.SetRecoveryRecorder(dunningRecoveryService)
 	// Successful retries settle through the same ledger-posting MarkInvoicePaid
 	// as checkout and the payment webhooks (idempotent across all three).
 	retryWorker.SetSettler(subscriptionService)

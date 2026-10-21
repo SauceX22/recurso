@@ -121,6 +121,11 @@ type Invoice struct {
 	DunningContextKey string `json:"dunning_context_key,omitempty" db:"dunning_context_key"`
 	LastPaymentError  string `json:"last_payment_error,omitempty" db:"last_payment_error"`
 	DunningManagedBy  string `json:"dunning_managed_by,omitempty" db:"dunning_managed_by"`
+	// DeclinedMethodRef is the saved method a hard decline came from; the
+	// retry worker won't charge it again. RetryInfraFailures counts the retry
+	// worker's consecutive gateway/lookup errors, for backoff. Internal only.
+	DeclinedMethodRef  string `json:"-" db:"declined_method_ref"`
+	RetryInfraFailures int    `json:"-" db:"retry_infra_failures"`
 
 	// Dunning Campaign (payment wall)
 	PaymentWallActive bool `json:"payment_wall_active" db:"payment_wall_active"`
