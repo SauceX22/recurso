@@ -81,16 +81,16 @@ type dunningOutcomeRecorder interface {
 // so the order of effects and the duplicate-payment rules are the same no
 // matter which arrives first.
 type GatewaySettlementService struct {
-	provider  domain.GatewayProvider
-	settler   paidInvoiceMarker
-	payments  gatewayPaymentClaimer
-	subs      settlementSubscriptionReader
-	cards     gatewayMethodSaver
-	tokens    cardTokenReader
-	recovery  *DunningSuccessRecorder
-	paid      paidPaymentFinder
-	routesTo  func(currency string) domain.GatewayProvider
-	logger    *slog.Logger
+	provider domain.GatewayProvider
+	settler  paidInvoiceMarker
+	payments gatewayPaymentClaimer
+	subs     settlementSubscriptionReader
+	cards    gatewayMethodSaver
+	tokens   cardTokenReader
+	recovery *DunningSuccessRecorder
+	paid     paidPaymentFinder
+	routesTo func(currency string) domain.GatewayProvider
+	logger   *slog.Logger
 }
 
 // NewGatewaySettlementService builds the settlement path for one gateway.
