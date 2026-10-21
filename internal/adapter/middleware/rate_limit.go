@@ -30,6 +30,27 @@ import (
 // none. Expired in-memory entries are pruned once per window so a long outage
 // does not grow the map without bound.
 func RateLimitMiddleware(rdb *redis.Client, scope string, limit int, window time.Duration) gin.HandlerFunc {
+	return rateLimit(rdb, scope, limit, window, func(c *gin.Context) string {
+		// Key based on IP or Tenant if available
+		if tenantID, exists := c.Get("tenant_id"); exists {
+			return fmt.Sprintf("ratelimit:%s:tenant:%v", scope, tenantID)
+		}
+		return fmt.Sprintf("ratelimit:%s:%s", scope, c.ClientIP())
+	})
+}
+
+// ParamRateLimitMiddleware limits a route per value of the path parameter
+// param, across all callers: a public endpoint that spends a shared upstream
+// quota per resource (e.g. a gateway read-back per invoice) must stay bounded
+// however many IPs ask. It complements, never replaces, the per-IP limiter;
+// scope follows the same rule as RateLimitMiddleware.
+func ParamRateLimitMiddleware(rdb *redis.Client, scope, param string, limit int, window time.Duration) gin.HandlerFunc {
+	return rateLimit(rdb, scope, limit, window, func(c *gin.Context) string {
+		return fmt.Sprintf("ratelimit:%s:%s:%s", scope, param, c.Param(param))
+	})
+}
+
+func rateLimit(rdb *redis.Client, scope string, limit int, window time.Duration, keyFor func(*gin.Context) string) gin.HandlerFunc {
 	var (
 		mu        sync.Mutex
 		counters  = make(map[string]*rateLimitEntry)
@@ -59,11 +80,7 @@ func RateLimitMiddleware(rdb *redis.Client, scope string, limit int, window time
 	}
 
 	return func(c *gin.Context) {
-		// Key based on IP or Tenant if available
-		key := fmt.Sprintf("ratelimit:%s:%s", scope, c.ClientIP())
-		if tenantID, exists := c.Get("tenant_id"); exists {
-			key = fmt.Sprintf("ratelimit:%s:tenant:%v", scope, tenantID)
-		}
+		key := keyFor(c)
 
 		var count int64
 		if rdb != nil {

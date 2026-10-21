@@ -349,6 +349,45 @@ func TestMoyasarVerify_MissingPaymentID400(t *testing.T) {
 	}
 }
 
+// A void or draft invoice must never be settled to paid; a written-off
+// (uncollectible) one is still collectable.
+func TestMoyasarVerify_OnlyPayableInvoicesSettle(t *testing.T) {
+	for _, tc := range []struct {
+		status domain.InvoiceStatus
+		code   int
+	}{
+		{domain.InvoiceStatusVoid, http.StatusConflict},
+		{domain.InvoiceStatusDraft, http.StatusConflict},
+		{domain.InvoiceStatusUncollectible, http.StatusOK},
+		{domain.InvoiceStatusPastDue, http.StatusOK},
+	} {
+		t.Run(string(tc.status), func(t *testing.T) {
+			f := newMoyCheckoutFixture("moyasar")
+			f.inv.Status = tc.status
+			code, out := f.verifyPayment(t)
+			if code != tc.code {
+				t.Fatalf("status = %d body %v, want %d", code, out, tc.code)
+			}
+			if tc.code == http.StatusConflict && (len(f.reader.gotIDs) != 0 || len(f.settler.settled) != 0) {
+				t.Errorf("unpayable invoice fetched %d / settled %d", len(f.reader.gotIDs), len(f.settler.settled))
+			}
+		})
+	}
+}
+
+// Moyasar payment ids are UUIDs; anything else is refused before the
+// secret-key read-back.
+func TestMoyasarVerify_MalformedPaymentID400(t *testing.T) {
+	f := newMoyCheckoutFixture("moyasar")
+	code, out := f.verify(t, map[string]string{"payment_id": "../tokens/x"})
+	if code != http.StatusBadRequest || moyErrorCode(out) != codeValidationFailed {
+		t.Fatalf("status = %d code = %q, want 400 validation_failed", code, moyErrorCode(out))
+	}
+	if len(f.reader.gotIDs) != 0 {
+		t.Error("fetched a malformed payment id")
+	}
+}
+
 func TestMoyasarVerify_SettleError500(t *testing.T) {
 	f := newMoyCheckoutFixture("moyasar")
 	f.settler.err = errors.New("db down")

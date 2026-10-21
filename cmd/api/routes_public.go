@@ -13,6 +13,7 @@ import (
 	"github.com/recurso-dev/recurso/internal/adapter/handler"
 	"github.com/recurso-dev/recurso/internal/adapter/httperr"
 	"github.com/recurso-dev/recurso/internal/adapter/metrics"
+	"github.com/recurso-dev/recurso/internal/adapter/middleware"
 	"github.com/recurso-dev/recurso/internal/service"
 	"github.com/redis/go-redis/v9"
 )
@@ -158,7 +159,11 @@ func registerPublicRoutes(r *gin.Engine, h *publicHandlers) {
 	r.POST("/checkout/:id/pay", h.publicLimit, h.checkoutHandler.InitiatePayment)
 	r.GET("/checkout/:id/success", h.publicLimit, h.checkoutHandler.CheckoutSuccess)
 	r.POST("/checkout/:id/razorpay/verify", h.publicLimit, h.checkoutHandler.RazorpayVerify)
-	r.POST("/checkout/:id/moyasar/verify", h.publicLimit, h.checkoutHandler.MoyasarVerify)
+	// Each verify spends a secret-key read-back against the gateway quota that
+	// renewals and retries share, so it is also bounded per invoice: rotating
+	// IPs past the per-IP limit gains nothing.
+	verifyPerInvoice := middleware.ParamRateLimitMiddleware(h.rdb, "checkout_verify", "id", 10, time.Minute)
+	r.POST("/checkout/:id/moyasar/verify", h.publicLimit, verifyPerInvoice, h.checkoutHandler.MoyasarVerify)
 	r.POST("/payments/order", h.publicLimit, h.paymentHandler.CreateOrder)
 	// Recurso Cloud waitlist (ENG-12): public demand capture from the website.
 	r.POST("/waitlist", h.publicLimit, h.waitlistHandler.Join)

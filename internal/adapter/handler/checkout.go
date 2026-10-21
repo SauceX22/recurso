@@ -550,6 +550,12 @@ func (h *CheckoutHandler) MoyasarVerify(c *gin.Context) {
 		respondCheckoutStatus(c, invoice, "paid")
 		return
 	}
+	// A voided or unfinalized invoice is not owed; a written-off
+	// (uncollectible) one still is.
+	if invoice.Status == domain.InvoiceStatusVoid || invoice.Status == domain.InvoiceStatusDraft {
+		respondError(c, http.StatusConflict, codeConflict, "invoice is not payable")
+		return
+	}
 	// Without the settlement path the buyer must never be told "paid".
 	if h.moyasar == nil || h.moyasarSettler == nil {
 		respondError(c, http.StatusServiceUnavailable, codeCheckoutUnavailable, "moyasar checkout isn't available on this deployment")
@@ -561,6 +567,12 @@ func (h *CheckoutHandler) MoyasarVerify(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, codeValidationFailed, "payment_id is required")
+		return
+	}
+	// Moyasar payment ids are UUIDs; refuse anything else before spending a
+	// secret-key read-back on it.
+	if _, err := uuid.Parse(req.PaymentID); err != nil {
+		respondError(c, http.StatusBadRequest, codeValidationFailed, "payment_id is not a valid payment id")
 		return
 	}
 

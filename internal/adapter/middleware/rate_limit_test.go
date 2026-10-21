@@ -96,3 +96,30 @@ func TestRateLimitMiddleware_RedisErrorFallsBackToLocal(t *testing.T) {
 		t.Fatalf("3rd with redis down: got %d, want 429 (fallback must still limit)", got)
 	}
 }
+
+// TestParamRateLimitMiddleware_BucketsPerParamAcrossClients bounds a public
+// route per resource: every caller shares one bucket per :id (rotating IPs
+// gains nothing), and another :id keeps its own budget.
+func TestParamRateLimitMiddleware_BucketsPerParamAcrossClients(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/checkout/:id/verify", ParamRateLimitMiddleware(nil, "test-verify", "id", 2, time.Minute), func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	call := func(id, ip string) int {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/checkout/"+id+"/verify", nil)
+		req.RemoteAddr = ip + ":1234"
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	if call("inv-1", "203.0.113.1") != http.StatusOK || call("inv-1", "203.0.113.2") != http.StatusOK {
+		t.Fatal("first two requests for inv-1 should pass")
+	}
+	if got := call("inv-1", "203.0.113.3"); got != http.StatusTooManyRequests {
+		t.Fatalf("third request for inv-1 from a new IP: got %d, want 429", got)
+	}
+	if got := call("inv-2", "203.0.113.1"); got != http.StatusOK {
+		t.Fatalf("inv-2 shares inv-1's bucket: got %d, want 200", got)
+	}
+}
