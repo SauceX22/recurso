@@ -343,9 +343,12 @@ func (r *unknownRefundNotes) List(context.Context, uuid.UUID, domain.CreditNoteF
 	return r.notes, r.listErr
 }
 
-func (r *unknownRefundNotes) UpdateRefund(_ context.Context, id uuid.UUID, status domain.CreditNoteRefundStatus, _ *string, _ string) error {
+func (r *unknownRefundNotes) ResolvePendingRefund(_ context.Context, id uuid.UUID, _ string, status domain.CreditNoteRefundStatus, _ string) (bool, error) {
+	if _, done := r.updates[id]; done {
+		return false, nil
+	}
 	r.updates[id] = status
-	return nil
+	return true, nil
 }
 
 func (r *unknownRefundNotes) SumActiveRefundsForInvoice(context.Context, uuid.UUID) (int64, error) {

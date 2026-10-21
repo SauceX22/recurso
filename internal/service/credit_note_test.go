@@ -33,6 +33,9 @@ type mockCreditNoteRepo struct {
 	getErr          error
 	updateStatusErr error
 	statusUpdates   int
+	// listed, when set, is what List reads: copies of these rows as they
+	// stood, so two callers can both read a note before either changes it.
+	listed []domain.CreditNote
 }
 
 // GetByID resolves a credit note from those created (or the seeded existing one).
@@ -86,7 +89,15 @@ func (m *mockCreditNoteRepo) Create(ctx context.Context, cn *domain.CreditNote) 
 }
 
 func (m *mockCreditNoteRepo) List(ctx context.Context, tenantID uuid.UUID, filter domain.CreditNoteFilter) ([]*domain.CreditNote, error) {
-	return m.created, nil
+	if m.listed == nil {
+		return m.created, nil
+	}
+	out := make([]*domain.CreditNote, len(m.listed))
+	for i := range m.listed {
+		c := m.listed[i]
+		out[i] = &c
+	}
+	return out, nil
 }
 
 func (m *mockCreditNoteRepo) UpdateRefund(ctx context.Context, id uuid.UUID, status domain.CreditNoteRefundStatus, refundID *string, message string) error {
@@ -95,6 +106,25 @@ func (m *mockCreditNoteRepo) UpdateRefund(ctx context.Context, id uuid.UUID, sta
 	}
 	m.updates = append(m.updates, cnRefundUpdate{id: id, status: status, refundID: refundID, message: message})
 	return nil
+}
+
+// ResolvePendingRefund mirrors the real repo's conditional update: it moves
+// the stored note only while it is pending under refundID.
+func (m *mockCreditNoteRepo) ResolvePendingRefund(ctx context.Context, id uuid.UUID, refundID string, status domain.CreditNoteRefundStatus, message string) (bool, error) {
+	if m.updateErr != nil {
+		return false, m.updateErr
+	}
+	for _, cn := range m.created {
+		if cn.ID == id {
+			if cn.RefundStatus != domain.RefundStatusPending || cn.RefundID == nil || *cn.RefundID != refundID {
+				return false, nil
+			}
+			cn.RefundStatus = status
+			m.updates = append(m.updates, cnRefundUpdate{id: id, status: status, refundID: cn.RefundID, message: message})
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (m *mockCreditNoteRepo) SumActiveRefundsForInvoice(ctx context.Context, invoiceID uuid.UUID) (int64, error) {

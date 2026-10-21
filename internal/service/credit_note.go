@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"sort"
 	"strings"
 	"time"
 
@@ -82,6 +81,9 @@ type CreditNoteRepository interface {
 	Create(ctx context.Context, creditNote *domain.CreditNote) error
 	List(ctx context.Context, tenantID uuid.UUID, filter domain.CreditNoteFilter) ([]*domain.CreditNote, error)
 	UpdateRefund(ctx context.Context, id uuid.UUID, status domain.CreditNoteRefundStatus, refundID *string, message string) error
+	// ResolvePendingRefund moves a refund still pending under refundID to
+	// status; resolved=false means another caller already moved it.
+	ResolvePendingRefund(ctx context.Context, id uuid.UUID, refundID string, status domain.CreditNoteRefundStatus, message string) (resolved bool, err error)
 	SumActiveRefundsForInvoice(ctx context.Context, invoiceID uuid.UUID) (int64, error)
 	// CreateRefundWithinLimit atomically enforces the over-refund limit and
 	// inserts the refund note under an invoice-row lock, so concurrent refund
@@ -555,10 +557,16 @@ func (s *CreditNoteService) postRefund(ctx context.Context, tenantID uuid.UUID, 
 
 // ResolveUnknownRefunds settles inv's refunds of paymentID whose outcome was
 // unknown, from refundedTotal, the gateway's read-back of everything refunded
-// on the payment (called on the gateway's refund webhook). Oldest first, the
-// part of refundedTotal beyond the refunds already processed was applied: those
-// notes move to processed and are booked now. A note it does not cover was
-// never applied: it moves to refund_failed, releasing its refundable amount.
+// on the payment (called on the gateway's refund webhook). The total is one
+// number with no refund ids, so it settles a refund only when that is
+// unambiguous: exactly one unknown refund, no other refund of the invoice in
+// flight (it may already be in the total), and the total beyond the processed
+// refunds equal to its amount. That note moves to processed and is booked now.
+// Anything else (several unknowns, a dashboard refund in the total, nothing
+// beyond the processed refunds yet) leaves every note pending, holding its
+// refundable amount, and logs an error for an operator to confirm on the
+// gateway; a total alone never fails a note. The pending -> processed move is
+// conditional, so a redelivered or concurrent webhook books it once.
 // A payment that is not inv's recorded one resolves nothing.
 func (s *CreditNoteService) ResolveUnknownRefunds(ctx context.Context, inv *domain.Invoice, paymentID string, refundedTotal int64) error {
 	if paymentID == "" || paymentID != inv.GatewayPaymentID {
@@ -570,9 +578,20 @@ func (s *CreditNoteService) ResolveUnknownRefunds(ctx context.Context, inv *doma
 	}
 	var processed int64
 	var unknown []*domain.CreditNote
+	inFlight := 0
 	for _, cn := range notes {
-		if cn.Type != domain.CreditNoteTypeRefund || cn.InvoiceID == nil || *cn.InvoiceID != inv.ID ||
-			cn.Status == domain.CreditNoteStatusVoid || cn.RefundID == nil || !strings.HasPrefix(*cn.RefundID, paymentID+":") {
+		if cn.Type != domain.CreditNoteTypeRefund || cn.InvoiceID == nil || *cn.InvoiceID != inv.ID || cn.Status == domain.CreditNoteStatusVoid {
+			continue
+		}
+		if cn.RefundID == nil {
+			// Being sent to the gateway now: its refund id is not stored yet.
+			if cn.Status != domain.CreditNoteStatusPending &&
+				(cn.RefundStatus == domain.RefundStatusPending || cn.RefundStatus == domain.RefundStatusNone) {
+				inFlight++
+			}
+			continue
+		}
+		if !strings.HasPrefix(*cn.RefundID, paymentID+":") {
 			continue
 		}
 		switch {
@@ -582,27 +601,36 @@ func (s *CreditNoteService) ResolveUnknownRefunds(ctx context.Context, inv *doma
 			unknown = append(unknown, cn)
 		}
 	}
-	sort.SliceStable(unknown, func(i, j int) bool { return unknown[i].CreatedAt.Before(unknown[j].CreatedAt) })
+	if len(unknown) == 0 {
+		return nil
+	}
 
 	applied := refundedTotal - processed
-	for _, cn := range unknown {
-		status := domain.RefundStatusFailed
-		message := fmt.Sprintf("the gateway reports %d refunded on payment %s, which does not include this refund; it was not applied", refundedTotal, paymentID)
-		if cn.Amount <= applied {
-			applied -= cn.Amount
-			status = domain.RefundStatusProcessed
-			message = fmt.Sprintf("the gateway reports %d refunded on payment %s, which includes this refund", refundedTotal, paymentID)
+	if len(unknown) != 1 || inFlight != 0 || applied != unknown[0].Amount {
+		ids := make([]string, len(unknown))
+		for i, cn := range unknown {
+			ids[i] = cn.ID.String()
 		}
-		if err := s.repo.UpdateRefund(ctx, cn.ID, status, cn.RefundID, message); err != nil {
-			return fmt.Errorf("failed to resolve refund %s on credit note %s: %w", *cn.RefundID, cn.ID, err)
-		}
-		cn.RefundStatus = status
-		if status == domain.RefundStatusProcessed {
-			s.postRefund(ctx, inv.TenantID, inv, cn)
-		}
-		s.logger.InfoContext(ctx, "unknown refund outcome resolved", "credit_note_id", cn.ID, "invoice_id", inv.ID,
-			"refund_id", *cn.RefundID, "refund_status", status, "gateway_refunded_total", refundedTotal)
+		s.logger.ErrorContext(ctx, "refunds of unknown outcome left pending: the gateway's refunded total does not say which were applied — confirm each on the gateway dashboard",
+			"invoice_id", inv.ID, "payment_id", paymentID, "credit_note_ids", ids, "gateway_refunded_total", refundedTotal,
+			"processed_total", processed, "refunds_in_flight", inFlight)
+		return nil
 	}
+
+	cn := unknown[0]
+	message := fmt.Sprintf("the gateway reports %d refunded on payment %s, which includes this refund", refundedTotal, paymentID)
+	resolved, err := s.repo.ResolvePendingRefund(ctx, cn.ID, *cn.RefundID, domain.RefundStatusProcessed, message)
+	if err != nil {
+		return fmt.Errorf("failed to resolve refund %s on credit note %s: %w", *cn.RefundID, cn.ID, err)
+	}
+	if !resolved {
+		// Another delivery resolved it first and booked it.
+		return nil
+	}
+	cn.RefundStatus = domain.RefundStatusProcessed
+	s.postRefund(ctx, inv.TenantID, inv, cn)
+	s.logger.InfoContext(ctx, "unknown refund outcome resolved", "credit_note_id", cn.ID, "invoice_id", inv.ID,
+		"refund_id", *cn.RefundID, "refund_status", cn.RefundStatus, "gateway_refunded_total", refundedTotal)
 	return nil
 }
 

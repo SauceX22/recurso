@@ -74,10 +74,19 @@ the refund is `pending` (`<payment id>:unknown:<uuid>`), never failed: it holds
 the refundable amount so it can't be re-issued, and nothing is booked (no
 ledger refund, tax reversal or rev-rec unwind) while the outcome is unknown.
 The `payment_refunded` webhook resolves it from the payment's `refunded` total
-(`CreditNoteService.ResolveUnknownRefunds`): oldest first, what that total
-covers beyond the processed refunds becomes `processed` and is booked then; the
-rest becomes `refund_failed`. Refunds of one payment are serialized within a
-process.
+(`CreditNoteService.ResolveUnknownRefunds`), but only when that is unambiguous,
+since the total has no refund ids: exactly one unknown refund on the payment, no
+other refund of the invoice in flight (credit note with no refund id yet), and
+`refunded` minus the processed refunds equal to its amount. That note becomes
+`processed` and is booked then. Every other case (several unknowns, a dashboard
+refund inside the total, nothing beyond the processed refunds yet) leaves all
+the notes `pending` and logs an ERROR naming the payment and credit notes for an
+operator to confirm on the Moyasar dashboard; the total alone never marks a
+note `refund_failed`. The `pending → processed` write is conditional
+(`WHERE refund_status='pending' AND refund_id=…`), and only the call that wins
+it books the ledger, tax reversal and rev-rec unwind, so a redelivered or
+concurrent webhook books the refund once. Refunds of one payment are serialized
+within a process.
 
 ### Saved methods and routing
 
@@ -260,7 +269,8 @@ names only cards and Apple Pay). A refusal or 3DS demand returns `failed` or
 - A refund of unknown outcome that Moyasar never applied gets no
   `payment_refunded` webhook, so it stays `pending` (unbooked, refundable
   amount held) until a later refund of the same payment triggers one or an
-  operator resolves it; there is no operator action or reconciler yet.
+  operator resolves it. The same holds for any ambiguous case above (ERROR
+  logged); there is no operator action or reconciler yet.
 
 ## Founder-gated: sandbox verification before dropping EXPERIMENTAL
 
