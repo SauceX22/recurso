@@ -1,5 +1,5 @@
 import { StrictMode } from "react";
-import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, cleanup, fireEvent, act } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router";
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import axios from "axios";
@@ -178,6 +178,21 @@ describe("Checkout — Moyasar embedded form", () => {
     expect(MOYASAR_JS_INTEGRITY).toMatch(/^sha384-[A-Za-z0-9+/]{64}$/);
   });
 
+  it("renders the server's card-on-file terms as the consent, tied to the form", async () => {
+    mockFetch(
+      payResponse({
+        card_on_file: { merchant: "Acme Gym", amount: 9900, currency: "SAR", interval: "month", interval_count: 1 },
+      })
+    );
+    renderAt();
+    await startPayment();
+    const consent = await screen.findByText(
+      /authorise Acme Gym to save this card and charge it SAR 99\.00 every month until you cancel/
+    );
+    expect(consent).toHaveTextContent(/replaces any card already saved/);
+    expect(document.querySelector(".mysr-form")).toHaveAttribute("aria-describedby", consent.id);
+  });
+
   it("does not save the card or show consent when the server says save_card is false", async () => {
     mockFetch(payResponse({ save_card: false }));
     renderAt();
@@ -268,8 +283,8 @@ describe("Checkout — Moyasar embedded form", () => {
     await startPayment();
     const init = await loadMoyasar();
     await waitFor(() => expect(init).toHaveBeenCalled());
-    // Give any duplicate effect pass a chance to run.
-    await new Promise((r) => setTimeout(r, 20));
+    // Flush any duplicate effect pass before counting.
+    await act(async () => {});
     expect(init).toHaveBeenCalledTimes(1);
     expect(document.querySelectorAll(`script[src="${MOYASAR_JS}"]`)).toHaveLength(1);
   });
@@ -282,8 +297,7 @@ describe("Checkout — Moyasar embedded form", () => {
     unmount();
     const init = vi.fn();
     window.Moyasar = { init };
-    moyasarScript().dispatchEvent(new Event("load"));
-    await new Promise((r) => setTimeout(r, 20));
+    await act(async () => moyasarScript().dispatchEvent(new Event("load")));
     expect(init).not.toHaveBeenCalled();
   });
 
@@ -296,6 +310,10 @@ describe("Checkout — Moyasar embedded form", () => {
     const shell = container.querySelector("[dir]");
     expect(shell).toHaveAttribute("dir", "rtl");
     expect(shell).toHaveAttribute("lang", "ar");
+    // Money keeps its own direction inside the RTL layout.
+    expect(screen.getByTestId("amount-due")).toHaveAttribute("dir", "ltr");
+    expect(screen.getByText("المدفوع والرصيد المطبَّق").nextElementSibling).toHaveAttribute("dir", "ltr");
+    expect(pay.textContent).toMatch(/^ادفع \u2068.*80\.00\u2069$/);
     fireEvent.click(pay);
     const init = await loadMoyasar();
     await waitFor(() => expect(init).toHaveBeenCalledTimes(1));
@@ -378,6 +396,21 @@ describe("Checkout — Moyasar return verification", () => {
     expect(verify).not.toHaveBeenCalled();
   });
 
+  it("keeps the stored payment and the URL when it unmounts before verify resolves", async () => {
+    mockFetch(payResponse());
+    sessionStorage.setItem(moyasarPaymentKey(INVOICE_ID), PAYMENT_ID);
+    let resolveVerify;
+    vi.spyOn(endpoints, "verifyMoyasarCheckout").mockImplementation(
+      () => new Promise((r) => (resolveVerify = r))
+    );
+    const { unmount } = renderAt(`?gateway=moyasar&id=${PAYMENT_ID}&status=paid`);
+    await waitFor(() => expect(resolveVerify).toBeTypeOf("function"));
+    unmount();
+    await act(async () => resolveVerify({ data: { data: { status: "paid" } } }));
+    expect(sessionStorage.getItem(moyasarPaymentKey(INVOICE_ID))).toBe(PAYMENT_ID);
+    expect(window.location.search).toContain(`id=${PAYMENT_ID}`);
+  });
+
   it("verifies once under StrictMode", async () => {
     mockFetch(payResponse());
     const verify = vi
@@ -437,11 +470,13 @@ describe("Checkout — Moyasar return verification", () => {
   });
 
   it.each([
-    [{ response: { status: 400, data: { error: { code: "validation_failed" } } } }, /doesn't match invoice INV-42.*79cced57/],
-    [{ response: { status: 404, data: { error: { code: "not_found" } } } }, /couldn't find this invoice/],
-    [{ response: { status: 503, data: { error: { code: "internal_error" } } } }, /card payments aren't available/i],
-    [{ message: "Network Error" }, /couldn't reach the server/],
-  ])("maps verify error %# to buyer copy without leaking the server message", async (err, copy) => {
+    [{ response: { status: 400, data: { error: { code: "payment_mismatch" } } } }, /doesn't match invoice INV-42.*79cced57/, false],
+    [{ response: { status: 400, data: { error: { code: "validation_failed" } } } }, /couldn't confirm this payment for invoice INV-42.*79cced57/, false],
+    [{ response: { status: 404, data: { error: { code: "not_found" } } } }, /couldn't find this invoice/, false],
+    [{ response: { status: 503, data: { error: { code: "checkout_unavailable" } } } }, /card payments aren't available/i, false],
+    [{ response: { status: 500, data: { error: { code: "internal_error" } } } }, /went through, but we couldn't record it/, true],
+    [{ message: "Network Error" }, /couldn't reach the server/, true],
+  ])("maps verify error %# to buyer copy without leaking the server message", async (err, copy, retryable) => {
     mockFetch(payResponse());
     vi.spyOn(endpoints, "verifyMoyasarCheckout").mockRejectedValue({
       ...err,
@@ -453,6 +488,10 @@ describe("Checkout — Moyasar return verification", () => {
     renderAt(`?gateway=moyasar&id=${PAYMENT_ID}&status=paid`);
     expect(await screen.findByText(copy)).toBeInTheDocument();
     expect(screen.queryByText(/does not belong/)).not.toBeInTheDocument();
-    expect(screen.getByRole("alert")).toBeInTheDocument();
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(copy);
+    expect(alert.querySelector("button")).toBeNull();
+    // Check again is offered only where re-checking can change the answer.
+    expect(!!screen.queryByRole("button", { name: /check again/i })).toBe(retryable);
   });
 });

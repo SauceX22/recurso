@@ -71,15 +71,31 @@ describe("PortalDashboard payment-method update", () => {
     stubPortal({ name: "Test Cust", payment_method_provider: "stripe", card_update_supported: true });
     renderDashboard();
     expect(await screen.findByRole("button", { name: /update payment method/i })).toBeInTheDocument();
-    expect(screen.queryByText(/pay your next open invoice/i)).toBeNull();
+    expect(screen.queryByText(/pay your open renewal invoice/i)).toBeNull();
   });
 
-  it("replaces the update button with pay-an-invoice guidance for a Moyasar card", async () => {
+  it("falls back to the earliest open invoice when the server names none", async () => {
     stubPortal({ name: "Test Cust", payment_method_provider: "moyasar", card_update_supported: false });
     renderDashboard();
-    expect(await screen.findByText(/pay your next open invoice/i)).toBeInTheDocument();
+    expect(await screen.findByText(/pay your open renewal invoice/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /update payment method/i })).toBeNull();
     expect(screen.getByRole("link", { name: /pay INV-3/i })).toHaveAttribute("href", "/checkout/i3");
+  });
+
+  it("links to the invoice the server says will save the card", async () => {
+    // INV-3 is the earliest open invoice, but only INV-4 renews a subscription.
+    stubPortal({ name: "Test Cust", card_update_supported: false, card_update_invoice_id: "i4" });
+    renderDashboard();
+    expect(await screen.findByRole("link", { name: /pay INV-4/i })).toHaveAttribute("href", "/checkout/i4");
+    expect(screen.queryByRole("link", { name: /pay INV-3/i })).toBeNull();
+  });
+
+  it("says when there is no invoice to pay, with no dead link", async () => {
+    stubPortal({ name: "Test Cust", card_update_supported: false, card_update_invoice_id: null });
+    renderDashboard();
+    expect(await screen.findByText(/no renewal invoice to pay yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/contact the business that bills you/i)).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /^pay /i })).toBeNull();
   });
 });
 

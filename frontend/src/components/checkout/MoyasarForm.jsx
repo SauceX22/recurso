@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import * as Sentry from "@sentry/react";
 
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/patterns/LoadingSkeleton";
+import { saveCardConsentText } from "@/lib/checkoutCopy";
 import { loadStylesheet, useExternalScript } from "@/lib/useExternalScript";
 import {
   MOYASAR_CSS,
@@ -10,6 +12,7 @@ import {
   MOYASAR_JS_INTEGRITY,
   rememberMoyasarPayment,
 } from "./moyasarAssets";
+import "./MoyasarForm.css";
 
 const DEFAULT_METHODS = ["creditcard"];
 const DEFAULT_NETWORKS = ["mada", "visa", "mastercard"];
@@ -27,8 +30,13 @@ const moyasarReady = () => !!window.Moyasar;
  */
 export default function MoyasarForm({ order, invoiceId, locale, t }) {
   const containerRef = useRef(null);
+  const consentId = useId();
   const initedRef = useRef(false);
   const [formError, setFormError] = useState(null);
+  // initFailed: Moyasar.init refused the config. attempt re-runs the init
+  // effect when the buyer retries.
+  const [initFailed, setInitFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
 
   const invoiceBinding = order.metadata?.invoice_id;
   const saveCard = order.save_card === true;
@@ -44,34 +52,56 @@ export default function MoyasarForm({ order, invoiceId, locale, t }) {
   }, [invoiceBinding]);
 
   useEffect(() => {
-    // The ref guard keeps StrictMode's second effect pass (and any re-render)
-    // from mounting the form twice into the same node.
+    // init clears the container and renders the card inputs into it. The guard
+    // stops a parent re-render (a new `order` or `t` object) from wiping a
+    // half-filled form and mounting it again.
     if (status !== "ready" || initedRef.current) return;
     const el = containerRef.current;
     if (!el || !window.Moyasar) return;
     initedRef.current = true;
     el.innerHTML = "";
-    window.Moyasar.init({
-      element: el,
-      amount: order.amount,
-      currency: order.currency,
-      description: order.description,
-      publishable_api_key: order.moyasar_publishable_key,
-      callback_url:
-        order.callback_url ||
-        `${window.location.origin}/checkout/${encodeURIComponent(invoiceId)}?gateway=moyasar`,
-      methods: order.methods || DEFAULT_METHODS,
-      supported_networks: order.supported_networks || DEFAULT_NETWORKS,
-      metadata: { invoice_id: invoiceBinding },
-      language: locale === "ar" ? "ar" : "en",
-      credit_card: { save_card: saveCard },
-      // Fires once the payment exists, before any 3DS redirect.
-      on_completed: (payment) => {
-        if (payment?.id) rememberMoyasarPayment(invoiceId, payment.id);
-      },
-      on_failure: () => setFormError(t.cardFailed),
-    });
-  }, [status, order, invoiceId, invoiceBinding, locale, saveCard, t]);
+    try {
+      window.Moyasar.init({
+        element: el,
+        amount: order.amount,
+        currency: order.currency,
+        description: order.description,
+        publishable_api_key: order.moyasar_publishable_key,
+        callback_url:
+          order.callback_url ||
+          `${window.location.origin}/checkout/${encodeURIComponent(invoiceId)}?gateway=moyasar`,
+        methods: order.methods || DEFAULT_METHODS,
+        supported_networks: order.supported_networks || DEFAULT_NETWORKS,
+        metadata: { invoice_id: invoiceBinding },
+        language: locale === "ar" ? "ar" : "en",
+        credit_card: { save_card: saveCard },
+        // Moyasar rejects any callback that isn't a native async function (it
+        // checks the constructor name or the "async" source prefix). Keep them
+        // async, and never add a build transform that down-levels async.
+        on_initiating: async () => setFormError(null),
+        // Fires once the payment exists, before any 3DS redirect.
+        on_completed: async (payment) => {
+          if (payment?.id) rememberMoyasarPayment(invoiceId, payment.id);
+        },
+        on_failure: async () => setFormError(t.cardFailed),
+      });
+    } catch (err) {
+      // A config the library refuses must not crash the page: show the
+      // load-error state and let Retry init again.
+      initedRef.current = false;
+      // The state records the outcome of the external init call this effect
+      // just made; there is no render-time way to know it.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setInitFailed(true);
+      Sentry.captureException(err);
+    }
+  }, [status, attempt, order, invoiceId, invoiceBinding, locale, saveCard, t]);
+
+  const handleRetry = () => {
+    if (!initFailed) return retry();
+    setInitFailed(false);
+    setAttempt((n) => n + 1);
+  };
 
   // The server binds the payment to the invoice through this metadata; without
   // it the payment could never settle, so don't take the card at all.
@@ -86,13 +116,16 @@ export default function MoyasarForm({ order, invoiceId, locale, t }) {
     );
   }
 
-  if (status === "error") {
+  if (status === "error" || initFailed) {
     return (
-      <div role="alert" className="space-y-3">
-        <div className="rounded-lg bg-destructive/5 px-3 py-3 text-sm text-destructive ring-1 ring-inset ring-destructive/20">
+      <div className="space-y-3">
+        <div
+          role="alert"
+          className="rounded-lg bg-destructive/5 px-3 py-3 text-sm text-destructive ring-1 ring-inset ring-destructive/20"
+        >
           {t.cardFormLoadError}
         </div>
-        <Button onClick={retry} size="lg" variant="outline" className="w-full">
+        <Button onClick={handleRetry} size="lg" variant="outline" className="w-full">
           {t.retry}
         </Button>
       </div>
@@ -102,8 +135,11 @@ export default function MoyasarForm({ order, invoiceId, locale, t }) {
   return (
     <div className="space-y-3">
       {saveCard && (
-        <p className="rounded-lg bg-muted px-3 py-3 text-sm text-foreground ring-1 ring-inset ring-border">
-          {t.saveCardConsent}
+        <p
+          id={consentId}
+          className="rounded-lg bg-muted px-3 py-3 text-sm text-foreground ring-1 ring-inset ring-border"
+        >
+          {saveCardConsentText(t, order.card_on_file)}
         </p>
       )}
       {formError && (
@@ -123,6 +159,8 @@ export default function MoyasarForm({ order, invoiceId, locale, t }) {
         ref={containerRef}
         className="mysr-form"
         aria-label={t.cardForm}
+        aria-describedby={saveCard ? consentId : undefined}
+        data-own-consent={saveCard || undefined}
         hidden={status !== "ready"}
       />
     </div>

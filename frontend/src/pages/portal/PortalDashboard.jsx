@@ -18,7 +18,12 @@ import {
 
 import { API_ROOT as API_BASE, portalCsrfHeader } from "../../lib/api";
 import PortalPaymentMethod from "./PortalPaymentMethod";
-import { CARD_UPDATE_VIA_INVOICE, cardUpdateViaInvoice } from "./cardUpdate";
+import {
+  CARD_UPDATE_NO_INVOICE,
+  CARD_UPDATE_VIA_INVOICE,
+  cardUpdateInvoice,
+  cardUpdateViaInvoice,
+} from "./cardUpdate";
 import { formatCurrency, formatDate, shortId } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -291,9 +296,7 @@ const PortalDashboard = () => {
   // Some gateways can only save a card during a payment, so for those the card
   // is replaced by paying the next open invoice, not through the setup dialog.
   const updateCardByPaying = cardUpdateViaInvoice(profile);
-  const nextOpenInvoice = invoices
-    .filter((inv) => inv.status === "open" || inv.status === "past_due")
-    .sort((a, b) => String(a.due_date || "").localeCompare(String(b.due_date || "")))[0];
+  const cardInvoice = updateCardByPaying ? cardUpdateInvoice(profile, invoices) : null;
 
   if (loading) {
     return (
@@ -364,13 +367,13 @@ const PortalDashboard = () => {
         {updateCardByPaying && (
           <div className="mt-6 flex flex-col gap-3 rounded-lg border border-border bg-background px-4 py-3 text-sm text-foreground sm:flex-row sm:items-center sm:justify-between">
             <span className="flex items-center gap-2">
-              <CreditCard className="h-4 w-4 text-muted-foreground" />
-              {CARD_UPDATE_VIA_INVOICE}
+              <CreditCard className="h-4 w-4 shrink-0 text-muted-foreground" />
+              {cardInvoice ? CARD_UPDATE_VIA_INVOICE : CARD_UPDATE_NO_INVOICE}
             </span>
-            {nextOpenInvoice && (
-              <Button asChild size="sm" variant="outline">
-                <a href={`/checkout/${nextOpenInvoice.id}`}>
-                  Pay {nextOpenInvoice.invoice_number || "open invoice"}
+            {cardInvoice && (
+              <Button asChild size="sm" variant="outline" className="shrink-0">
+                <a href={`/checkout/${encodeURIComponent(cardInvoice.id)}`}>
+                  Pay {cardInvoice.invoiceNumber || "renewal invoice"}
                 </a>
               </Button>
             )}
