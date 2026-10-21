@@ -525,6 +525,7 @@ export default function Checkout() {
           </span>
           <span
             data-testid="amount-due"
+            dir="ltr"
             className="text-lg font-bold tabular-nums text-foreground"
           >
             {money(amountDue)}
@@ -647,7 +648,10 @@ function SummaryRow({ label, value, strong }) {
   return (
     <div className="flex justify-between">
       <span className="text-sm text-muted-foreground">{label}</span>
+      {/* Values are amounts, invoice numbers and ISO dates: left-to-right
+          even on an Arabic page, so "-SAR 20.00" keeps its minus in front. */}
       <span
+        dir="ltr"
         className={
           strong
             ? "text-sm font-semibold text-foreground"

@@ -310,6 +310,10 @@ describe("Checkout — Moyasar embedded form", () => {
     const shell = container.querySelector("[dir]");
     expect(shell).toHaveAttribute("dir", "rtl");
     expect(shell).toHaveAttribute("lang", "ar");
+    // Money keeps its own direction inside the RTL layout.
+    expect(screen.getByTestId("amount-due")).toHaveAttribute("dir", "ltr");
+    expect(screen.getByText("المدفوع والرصيد المطبَّق").nextElementSibling).toHaveAttribute("dir", "ltr");
+    expect(pay.textContent).toMatch(/^ادفع ⁨.*80\.00⁩$/);
     fireEvent.click(pay);
     const init = await loadMoyasar();
     await waitFor(() => expect(init).toHaveBeenCalledTimes(1));
