@@ -185,6 +185,29 @@ unregistered gateway is fatal; `DEMO_MODE` skips Moyasar. In
 configured; Moyasar (`sk_live_`), GoCardless and Adyen set it only without
 them, and a live/test mix is a boot warning.
 
+## Self-hosting runbook
+
+1. **Don't run the repo `docker-compose.yml` as production.** It is the e2e
+   stack: it defaults `MOYASAR_API_URL` to the e2e stub, uses `sk_test_e2e`
+   keys and runs the renewal sweep every 5s. Set your own env, and leave
+   `MOYASAR_API_URL` unset.
+2. **Moyasar account:** the **Tokenization** feature must be enabled for the
+   merchant (without it no card is saved and renewals never auto-charge).
+   Register the webhook `https://<api host>/webhooks/moyasar` (Settings →
+   Webhooks) with `MOYASAR_WEBHOOK_SECRET` as its shared secret, for at least
+   `payment_paid`, `payment_failed` and `payment_refunded`.
+3. **Env:** `MOYASAR_SECRET_KEY`, `MOYASAR_PUBLISHABLE_KEY`,
+   `MOYASAR_WEBHOOK_SECRET`, `GATEWAY_CURRENCY_OVERRIDES=SAR=moyasar`, and
+   `DASHBOARD_URL` = the public https origin buyers open checkout links on.
+4. **Serve the dashboard and API on one origin** through `frontend/nginx.conf`:
+   `/checkout/:id` is both the SPA page and the invoice API, split on Accept.
+5. **SAR plans** are created through the API (`POST /v1/plans`); the plan form
+   offers USD/INR/EUR/GBP only.
+6. **Refunds** are `POST /v1/credit-notes` with `type: "refund"` and the
+   `invoice_id`; the dashboard has no refund action for any gateway.
+7. **VAT:** 15% KSA VAT needs the KSA VAT change and the tenant's legal entity
+   country set to `SA`; without it SAR invoices carry no VAT.
+
 ## Residency
 
 Operator-configured gateway egress, like Stripe/Adyen: not residency-blocked.

@@ -476,18 +476,25 @@ SUB_RENEW_DECL=$(backdated_sar_sub "$CUST_ID_DECL")
 [ -n "$SUB_RENEW_DECL" ] && [ "$SUB_RENEW_DECL" != "null" ] || fail_6d "backdated SAR subscription (decline) not created"
 RENEW_DECL_ID=$(wait_renewal_charge "$SUB_RENEW_DECL")
 [ -n "$RENEW_DECL_ID" ] || fail_6d "no charged renewal invoice for backdated subscription $SUB_RENEW_DECL within 60s" "$(renewal_invoice "$SUB_RENEW_DECL")"
-RENEW_DECL=$(get_json "$API_URL/v1/invoices/$RENEW_DECL_ID" "$API_KEY" | jq -c '.data')
+# The decline is recorded just after the charge returns, so poll briefly.
+for _ in $(seq 1 10); do
+  RENEW_DECL=$(get_json "$API_URL/v1/invoices/$RENEW_DECL_ID" "$API_KEY" | jq -c '.data')
+  [ "$(echo "$RENEW_DECL" | jq -r '.last_payment_error // ""')" = "expired_card" ] && break
+  sleep 1
+done
 DECL_CHARGES=$(stub_charges "$RENEW_DECL_ID")
 # A declined renewal leaves the invoice open and unpaid for dunning
-# (renewal.go attemptPayment): no payment recorded, nothing settled.
+# (renewal.go attemptPayment): no payment recorded, nothing settled, and the
+# hard decline recorded so dunning's retry won't charge the same card.
 if [ "$(echo "$RENEW_DECL" | jq -r '.status')" != "open" ] \
+  || [ "$(echo "$RENEW_DECL" | jq -r '.last_payment_error // ""')" != "expired_card" ] \
   || [ "$(echo "$RENEW_DECL" | jq -r '.amount_paid')" != "0" ] \
   || [ "$(echo "$RENEW_DECL" | jq -r '.gateway_payment_id // ""')" != "" ] \
   || [ "$(echo "$DECL_CHARGES" | jq 'length')" != "1" ] \
   || [ "$(echo "$DECL_CHARGES" | jq -r '.[0] | "\(.status) \(.source.token) \(.source.response_code)"')" != "failed token_e2e_decline_hard 54" ]; then
   fail_6d "hard-declined renewal: want one failed charge (code 54) and an open, unpaid invoice; stub charges: $DECL_CHARGES" "$RENEW_DECL"
 fi
-echo -e "${GREEN}  ✅ Hard-declined renewal charged the token once (code 54), invoice left open and unpaid${NC}"
+echo -e "${GREEN}  ✅ Hard-declined renewal charged the token once (code 54), invoice left open and unpaid, decline recorded${NC}"
 
 # 7. Audit-grade gate: after everything above, the ledger must reconcile with
 # ZERO discrepancies — the end-to-end version of the invariant harness. Any
