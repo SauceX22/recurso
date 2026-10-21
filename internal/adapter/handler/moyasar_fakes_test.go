@@ -8,6 +8,7 @@ import (
 	"github.com/recurso-dev/recurso/internal/core/domain"
 	"github.com/recurso-dev/recurso/internal/core/port"
 	"github.com/recurso-dev/recurso/internal/core/port/porttest"
+	"github.com/recurso-dev/recurso/internal/service"
 )
 
 // Shared fakes for the Moyasar checkout and webhook tests. The handlers own
@@ -64,6 +65,7 @@ type fakePaymentSettler struct {
 	transitioned bool
 	err          error
 	savesCard    bool
+	terms        *service.CardOnFileTerms
 	settled      []settleCall
 
 	// The already-captured payment check; existing marks the invoice paid
@@ -94,7 +96,9 @@ func (f *fakePaymentSettler) Settle(_ context.Context, inv *domain.Invoice, p *p
 	return f.transitioned, nil
 }
 
-func (f *fakePaymentSettler) SavesCard(context.Context, *domain.Invoice) bool { return f.savesCard }
+func (f *fakePaymentSettler) CardOnFile(context.Context, *domain.Invoice) (bool, *service.CardOnFileTerms) {
+	return f.savesCard, f.terms
+}
 
 // moyasarHandlerFixture is an open SAR invoice with 80.00 still due and a
 // paid payment of exactly that bound to it.

@@ -15,6 +15,7 @@ import (
 	"github.com/recurso-dev/recurso/internal/core/domain"
 	"github.com/recurso-dev/recurso/internal/core/port"
 	"github.com/recurso-dev/recurso/internal/core/port/porttest"
+	"github.com/recurso-dev/recurso/internal/service"
 )
 
 type moyCheckoutGateway struct {
@@ -147,6 +148,43 @@ func TestCheckoutInitiate_MoyasarSaveCardFollowsSettlement(t *testing.T) {
 			}
 			if got := moyData(t, out)["save_card"]; got != saves {
 				t.Fatalf("save_card = %v, want %v", got, saves)
+			}
+		})
+	}
+}
+
+// The consent terms ride on the pay response only when the payment saves the
+// card and the terms are complete; the page falls back otherwise.
+func TestCheckoutInitiate_CardOnFileTerms(t *testing.T) {
+	terms := &service.CardOnFileTerms{Merchant: "Acme Arabia", Amount: 11500, Currency: "SAR", Interval: "month", IntervalCount: 1}
+	cases := []struct {
+		name  string
+		saves bool
+		terms *service.CardOnFileTerms
+		want  map[string]any
+	}{
+		{"saves with terms", true, terms, map[string]any{"merchant": "Acme Arabia", "amount": float64(11500), "currency": "SAR", "interval": "month", "interval_count": float64(1)}},
+		{"saves without terms", true, nil, nil},
+		{"does not save", false, nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newMoyCheckoutFixture("moyasar")
+			f.settler.savesCard, f.settler.terms = tc.saves, tc.terms
+			code, out := f.pay(t)
+			if code != http.StatusOK {
+				t.Fatalf("status = %d, body %v", code, out)
+			}
+			d := moyData(t, out)
+			got, present := d["card_on_file"]
+			if tc.want == nil {
+				if present {
+					t.Fatalf("card_on_file = %v, want absent", got)
+				}
+				return
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Fatalf("card_on_file = %v, want %v", got, tc.want)
 			}
 		})
 	}

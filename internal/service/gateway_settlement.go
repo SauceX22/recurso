@@ -50,6 +50,12 @@ type settlementSubscriptionReader interface {
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.Subscription, error)
 }
 
+// settlementPlanReader reads a plan under the tenant in ctx. Satisfied by
+// *db.PlanRepository.
+type settlementPlanReader interface {
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.Plan, error)
+}
+
 // gatewayMethodSaver stores a reusable gateway card as the customer's
 // off-session method. Satisfied by *db.CustomerRepository.
 type gatewayMethodSaver interface {
@@ -81,16 +87,18 @@ type dunningOutcomeRecorder interface {
 // so the order of effects and the duplicate-payment rules are the same no
 // matter which arrives first.
 type GatewaySettlementService struct {
-	provider domain.GatewayProvider
-	settler  paidInvoiceMarker
-	payments gatewayPaymentClaimer
-	subs     settlementSubscriptionReader
-	cards    gatewayMethodSaver
-	tokens   cardTokenReader
-	recovery *DunningSuccessRecorder
-	paid     paidPaymentFinder
-	routesTo func(currency string) domain.GatewayProvider
-	logger   *slog.Logger
+	provider  domain.GatewayProvider
+	settler   paidInvoiceMarker
+	payments  gatewayPaymentClaimer
+	subs      settlementSubscriptionReader
+	cards     gatewayMethodSaver
+	tokens    cardTokenReader
+	recovery  *DunningSuccessRecorder
+	paid      paidPaymentFinder
+	routesTo  func(currency string) domain.GatewayProvider
+	plans     settlementPlanReader
+	merchants TenantLookup
+	logger    *slog.Logger
 }
 
 // NewGatewaySettlementService builds the settlement path for one gateway.
@@ -151,14 +159,69 @@ func (s *GatewaySettlementService) SettleExistingPayment(ctx context.Context, in
 // charges: only an invoice of a subscription that will renew again has
 // consented future charges. One-off invoices never save.
 func (s *GatewaySettlementService) SavesCard(ctx context.Context, inv *domain.Invoice) bool {
+	return s.renewingSubscription(ctx, inv) != nil
+}
+
+// renewingSubscription returns inv's subscription when paying inv may save
+// the card for its renewals, else nil.
+func (s *GatewaySettlementService) renewingSubscription(ctx context.Context, inv *domain.Invoice) *domain.Subscription {
 	if s == nil || s.cards == nil || s.subs == nil || inv.SubscriptionID == nil {
-		return false
+		return nil
 	}
 	sub, err := s.subs.GetByID(context.WithValue(ctx, domain.TenantIDKey, inv.TenantID), *inv.SubscriptionID)
-	if err != nil || sub == nil {
-		return false
+	if err != nil || sub == nil || sub.Status == domain.SubscriptionStatusCanceled || sub.CancelAtPeriodEnd {
+		return nil
 	}
-	return sub.Status != domain.SubscriptionStatusCanceled && !sub.CancelAtPeriodEnd
+	return sub
+}
+
+// CardOnFileTerms is the stored-credential agreement a checkout shows before
+// a payment that saves the card: who charges, how much, and how often, until
+// the customer cancels. Amount is this invoice's total in minor units, what
+// a renewal of the same plan charges; usage, discounts and plan changes can
+// move later renewals.
+type CardOnFileTerms struct {
+	Merchant      string `json:"merchant"`
+	Amount        int64  `json:"amount"`
+	Currency      string `json:"currency"`
+	Interval      string `json:"interval"`
+	IntervalCount int    `json:"interval_count"`
+}
+
+// SetCardOnFileTerms wires the plan and merchant reads the consent terms
+// need. Unset, checkouts save cards with the page's generic consent text.
+func (s *GatewaySettlementService) SetCardOnFileTerms(plans settlementPlanReader, merchants TenantLookup) {
+	s.plans = plans
+	s.merchants = merchants
+}
+
+// CardOnFile reports whether paying inv saves the card (as SavesCard) and,
+// when it does, the terms to disclose. terms is nil when any part of them
+// cannot be read: the page then shows its generic consent rather than a
+// half-filled agreement.
+func (s *GatewaySettlementService) CardOnFile(ctx context.Context, inv *domain.Invoice) (bool, *CardOnFileTerms) {
+	sub := s.renewingSubscription(ctx, inv)
+	if sub == nil {
+		return false, nil
+	}
+	if s.plans == nil || s.merchants == nil {
+		return true, nil
+	}
+	plan, err := s.plans.GetByID(context.WithValue(ctx, domain.TenantIDKey, inv.TenantID), sub.PlanID)
+	if err != nil || plan == nil || plan.IntervalUnit == "" {
+		return true, nil
+	}
+	tenant, err := s.merchants.GetByID(ctx, inv.TenantID)
+	if err != nil || tenant == nil || tenant.Name == "" {
+		return true, nil
+	}
+	return true, &CardOnFileTerms{
+		Merchant:      tenant.Name,
+		Amount:        inv.Total,
+		Currency:      strings.ToUpper(inv.Currency),
+		Interval:      string(plan.IntervalUnit),
+		IntervalCount: max(plan.IntervalCount, 1),
+	}
 }
 
 // Settle marks inv paid by p. The caller has already confirmed with the

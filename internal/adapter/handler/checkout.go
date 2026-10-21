@@ -360,8 +360,12 @@ func (h *CheckoutHandler) InitiatePayment(c *gin.Context) {
 		// The embedded form creates the payment in the browser, so it needs a
 		// description and the invoice_id metadata the server-side read-back
 		// binds on. save_card is the consent the page must disclose before
-		// payment.
-		data["save_card"] = h.moyasarSettler.SavesCard(payCtx, invoice)
+		// payment; card_on_file carries its terms when they are complete.
+		saves, terms := h.moyasarSettler.CardOnFile(payCtx, invoice)
+		data["save_card"] = saves
+		if saves && terms != nil {
+			data["card_on_file"] = terms
+		}
 		data["moyasar_publishable_key"] = h.moyasarPublishableKey
 		data["description"] = "Invoice " + invoice.InvoiceNumber
 		data["metadata"] = gin.H{"invoice_id": invoice.ID.String()}
