@@ -7,41 +7,69 @@ import (
 )
 
 // gatewayModeFromEnv reports the payment mode of the configured gateways:
-// "test" when any configured gateway runs in test mode, "live" when all run
+// "test" when a mode-setting gateway runs in test mode, "live" when all run
 // live, "none" when no real gateway is configured (mock). It drives the
 // dashboard's "Test mode" chip and which API keys (live or test) the server
-// accepts. overrideGateways is false when the currency-override gateways
-// (GoCardless, Adyen, Moyasar) are not registered, as in demo mode.
-func gatewayModeFromEnv(getenv func(string) string, overrideGateways bool) string {
-	var modes []bool // true = live
+// accepts. Stripe and Razorpay set the mode when either is configured; the
+// currency-override gateways (GoCardless, Adyen, Moyasar) set it only on a
+// server without them, so a sandbox override key (the way a new gateway is
+// verified) can't flip a live server to "test" and lock out every live API
+// key. Any live/test mix is returned as a warning naming the gateways.
+// overrideGateways is false when the override gateways are not registered,
+// as in demo mode.
+func gatewayModeFromEnv(getenv func(string) string, overrideGateways bool) (mode string, warnings []string) {
+	type gatewayMode struct {
+		name string
+		live bool
+	}
+	var primary, extra []gatewayMode
 	if k := getenv("STRIPE_SECRET_KEY"); k != "" {
-		modes = append(modes, !strings.HasPrefix(k, "sk_test"))
+		primary = append(primary, gatewayMode{"Stripe", !strings.HasPrefix(k, "sk_test")})
 	}
 	if k := getenv("RAZORPAY_KEY_ID"); k != "" {
-		modes = append(modes, !strings.HasPrefix(k, "rzp_test"))
+		primary = append(primary, gatewayMode{"Razorpay", !strings.HasPrefix(k, "rzp_test")})
 	}
 	if overrideGateways {
 		if getenv("GOCARDLESS_ACCESS_TOKEN") != "" {
 			// Same rule as NewGoCardlessGateway: live unless "sandbox".
-			modes = append(modes, !strings.EqualFold(getenv("GOCARDLESS_ENV"), "sandbox"))
+			extra = append(extra, gatewayMode{"GoCardless", !strings.EqualFold(getenv("GOCARDLESS_ENV"), "sandbox")})
 		}
 		if getenv("ADYEN_API_KEY") != "" {
 			// Same rule as NewAdyenGateway: the live endpoint needs a prefix.
-			modes = append(modes, !strings.EqualFold(getenv("ADYEN_ENV"), "test") && getenv("ADYEN_LIVE_URL_PREFIX") != "")
+			extra = append(extra, gatewayMode{"Adyen", !strings.EqualFold(getenv("ADYEN_ENV"), "test") && getenv("ADYEN_LIVE_URL_PREFIX") != ""})
 		}
 		if k := getenv("MOYASAR_SECRET_KEY"); k != "" {
-			modes = append(modes, strings.HasPrefix(k, moyasarLivePrefix))
+			extra = append(extra, gatewayMode{"Moyasar", strings.HasPrefix(k, moyasarLivePrefix)})
 		}
 	}
-	if len(modes) == 0 {
-		return "none"
+	all := append(append([]gatewayMode{}, primary...), extra...)
+	if len(all) == 0 {
+		return "none", nil
 	}
-	for _, live := range modes {
-		if !live {
-			return "test"
+	deciding := primary
+	if len(deciding) == 0 {
+		deciding = extra
+	}
+	mode = "live"
+	for _, g := range deciding {
+		if !g.live {
+			mode = "test"
 		}
 	}
-	return "live"
+	var live, test []string
+	for _, g := range all {
+		if g.live {
+			live = append(live, g.name)
+		} else {
+			test = append(test, g.name)
+		}
+	}
+	if len(live) > 0 && len(test) > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"payment gateways mix live (%s) and test (%s) mode; the server runs in %s mode and accepts only %s API keys",
+			strings.Join(live, ", "), strings.Join(test, ", "), mode, mode))
+	}
+	return mode, warnings
 }
 
 const (

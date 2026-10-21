@@ -8,29 +8,43 @@ func envOf(m map[string]string) func(string) string {
 
 // A server whose only real gateway is one of the override gateways must
 // still know its mode: otherwise a Moyasar-only live deployment reads "none"
-// and refuses every live API key.
+// and refuses every live API key. When Stripe or Razorpay is configured, they
+// alone set the mode: an override gateway in the other mode (a sandbox
+// Moyasar key on a live Stripe server) must not flip the server to "test" and
+// lock out every live API key; it is reported as a warning instead.
 func TestGatewayModeFromEnv(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		env  map[string]string
-		want string
+		name         string
+		env          map[string]string
+		want         string
+		wantWarnings int
 	}{
-		{"nothing configured", nil, "none"},
-		{"stripe test", map[string]string{"STRIPE_SECRET_KEY": "sk_test_1"}, "test"},
-		{"stripe live", map[string]string{"STRIPE_SECRET_KEY": "sk_live_1"}, "live"},
-		{"razorpay test", map[string]string{"RAZORPAY_KEY_ID": "rzp_test_1"}, "test"},
-		{"moyasar live only", map[string]string{"MOYASAR_SECRET_KEY": "sk_live_1"}, "live"},
-		{"moyasar test only", map[string]string{"MOYASAR_SECRET_KEY": "sk_test_1"}, "test"},
-		{"stripe live, moyasar test", map[string]string{"STRIPE_SECRET_KEY": "sk_live_1", "MOYASAR_SECRET_KEY": "sk_test_1"}, "test"},
-		{"gocardless live", map[string]string{"GOCARDLESS_ACCESS_TOKEN": "live_x", "GOCARDLESS_ENV": "live"}, "live"},
-		{"gocardless sandbox", map[string]string{"GOCARDLESS_ACCESS_TOKEN": "sandbox_x", "GOCARDLESS_ENV": "sandbox"}, "test"},
-		{"adyen live", map[string]string{"ADYEN_API_KEY": "k", "ADYEN_ENV": "live", "ADYEN_LIVE_URL_PREFIX": "abc"}, "live"},
-		{"adyen test", map[string]string{"ADYEN_API_KEY": "k", "ADYEN_ENV": "test"}, "test"},
-		{"adyen live without prefix runs on test", map[string]string{"ADYEN_API_KEY": "k", "ADYEN_ENV": "live"}, "test"},
+		{"nothing configured", nil, "none", 0},
+		{"stripe test", map[string]string{"STRIPE_SECRET_KEY": "sk_test_1"}, "test", 0},
+		{"stripe live", map[string]string{"STRIPE_SECRET_KEY": "sk_live_1"}, "live", 0},
+		{"razorpay test", map[string]string{"RAZORPAY_KEY_ID": "rzp_test_1"}, "test", 0},
+		{"stripe live, razorpay test", map[string]string{"STRIPE_SECRET_KEY": "sk_live_1", "RAZORPAY_KEY_ID": "rzp_test_1"}, "test", 1},
+		{"moyasar live only", map[string]string{"MOYASAR_SECRET_KEY": "sk_live_1"}, "live", 0},
+		{"moyasar test only", map[string]string{"MOYASAR_SECRET_KEY": "sk_test_1"}, "test", 0},
+		{"stripe live, moyasar test", map[string]string{"STRIPE_SECRET_KEY": "sk_live_1", "MOYASAR_SECRET_KEY": "sk_test_1"}, "live", 1},
+		{"stripe live, gocardless sandbox", map[string]string{"STRIPE_SECRET_KEY": "sk_live_1", "GOCARDLESS_ACCESS_TOKEN": "x", "GOCARDLESS_ENV": "sandbox"}, "live", 1},
+		{"stripe live, adyen without prefix", map[string]string{"STRIPE_SECRET_KEY": "sk_live_1", "ADYEN_API_KEY": "k", "ADYEN_ENV": "live"}, "live", 1},
+		{"razorpay test, moyasar live", map[string]string{"RAZORPAY_KEY_ID": "rzp_test_1", "MOYASAR_SECRET_KEY": "sk_live_1"}, "test", 1},
+		{"stripe live, moyasar live", map[string]string{"STRIPE_SECRET_KEY": "sk_live_1", "MOYASAR_SECRET_KEY": "sk_live_1"}, "live", 0},
+		{"moyasar live, adyen test", map[string]string{"MOYASAR_SECRET_KEY": "sk_live_1", "ADYEN_API_KEY": "k", "ADYEN_ENV": "test"}, "test", 1},
+		{"gocardless live", map[string]string{"GOCARDLESS_ACCESS_TOKEN": "live_x", "GOCARDLESS_ENV": "live"}, "live", 0},
+		{"gocardless sandbox", map[string]string{"GOCARDLESS_ACCESS_TOKEN": "sandbox_x", "GOCARDLESS_ENV": "sandbox"}, "test", 0},
+		{"adyen live", map[string]string{"ADYEN_API_KEY": "k", "ADYEN_ENV": "live", "ADYEN_LIVE_URL_PREFIX": "abc"}, "live", 0},
+		{"adyen test", map[string]string{"ADYEN_API_KEY": "k", "ADYEN_ENV": "test"}, "test", 0},
+		{"adyen live without prefix runs on test", map[string]string{"ADYEN_API_KEY": "k", "ADYEN_ENV": "live"}, "test", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := gatewayModeFromEnv(envOf(tc.env), true); got != tc.want {
+			got, warnings := gatewayModeFromEnv(envOf(tc.env), true)
+			if got != tc.want {
 				t.Fatalf("gatewayModeFromEnv = %q, want %q", got, tc.want)
+			}
+			if len(warnings) != tc.wantWarnings {
+				t.Fatalf("warnings = %q, want %d", warnings, tc.wantWarnings)
 			}
 		})
 	}
@@ -73,7 +87,7 @@ func TestValidateMoyasarConfig(t *testing.T) {
 // make the server live.
 func TestGatewayModeFromEnvIgnoresUnregisteredGateways(t *testing.T) {
 	env := envOf(map[string]string{"MOYASAR_SECRET_KEY": "sk_live_1", "GOCARDLESS_ACCESS_TOKEN": "live_x", "ADYEN_API_KEY": "k"})
-	if got := gatewayModeFromEnv(env, false); got != "none" {
+	if got, _ := gatewayModeFromEnv(env, false); got != "none" {
 		t.Fatalf("gatewayModeFromEnv = %q, want none", got)
 	}
 }

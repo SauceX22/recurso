@@ -1704,7 +1704,10 @@ func main() {
 	platformRepo := db.NewPlatformRepository(database)
 	platformChargeRepo := db.NewCloudChargeRepository(database)
 
-	gatewayMode := gatewayModeFromEnv(os.Getenv, !demo.Enabled())
+	gatewayMode, modeWarnings := gatewayModeFromEnv(os.Getenv, !demo.Enabled())
+	for _, w := range modeWarnings {
+		slog.Warn("PAYMENT GATEWAY MODE MISMATCH", "problem", w)
+	}
 
 	// Public Routes — stricter rate limit (20 req/min per IP) for endpoints
 	// worth brute-forcing (credentials, tokens, payment initiation).
