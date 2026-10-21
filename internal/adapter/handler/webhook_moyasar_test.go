@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -326,5 +327,67 @@ func TestMoyasarWebhook_UnhandledEventsIgnored(t *testing.T) {
 	}
 	if len(f.settler.settled) != 0 || len(f.reader.gotIDs) != 0 {
 		t.Fatal("unhandled event fetched or settled")
+	}
+}
+
+// unknownRefundNotes serves one refund note of unknown outcome and records
+// how it is resolved. Every other repository method is unused here.
+type unknownRefundNotes struct {
+	service.CreditNoteRepository
+	notes   []*domain.CreditNote
+	listErr error
+	updates map[uuid.UUID]domain.CreditNoteRefundStatus
+}
+
+func (r *unknownRefundNotes) List(context.Context, uuid.UUID, domain.CreditNoteFilter) ([]*domain.CreditNote, error) {
+	return r.notes, r.listErr
+}
+
+func (r *unknownRefundNotes) UpdateRefund(_ context.Context, id uuid.UUID, status domain.CreditNoteRefundStatus, _ *string, _ string) error {
+	r.updates[id] = status
+	return nil
+}
+
+func (r *unknownRefundNotes) SumActiveRefundsForInvoice(context.Context, uuid.UUID) (int64, error) {
+	return 0, nil
+}
+
+// M3: Moyasar's payment_refunded webhook carries the payment's refunded
+// total, which resolves a refund whose outcome was unknown when it was issued.
+func TestMoyasarWebhook_RefundResolvesUnknownRefund(t *testing.T) {
+	f := newMoyasarFixture(t)
+	f.inv.Status = domain.InvoiceStatusPaid
+	f.inv.GatewayPaymentID = f.payment.ID
+	f.payment.RefundedAmount = 3000
+	refundID := f.payment.ID + ":unknown:" + uuid.NewString()
+	note := &domain.CreditNote{ID: uuid.New(), TenantID: f.inv.TenantID, CustomerID: f.inv.CustomerID, InvoiceID: &f.inv.ID,
+		Type: domain.CreditNoteTypeRefund, Status: domain.CreditNoteStatusIssued, Amount: 3000,
+		RefundStatus: domain.RefundStatusPending, RefundID: &refundID}
+	notes := &unknownRefundNotes{notes: []*domain.CreditNote{note}, updates: map[uuid.UUID]domain.CreditNoteRefundStatus{}}
+	f.h.SetCreditNoteService(service.NewCreditNoteService(notes, nil, nil, nil))
+
+	if w := f.deliver("ev_refunded", "payment_refunded"); w.Code != http.StatusOK {
+		t.Fatalf("got %d want 200 (body %s)", w.Code, w.Body.String())
+	}
+	if notes.updates[note.ID] != domain.RefundStatusProcessed {
+		t.Fatalf("unknown refund resolved to %q, want processed", notes.updates[note.ID])
+	}
+
+	// A failure to read the notes is retried: the event is not recorded.
+	notes.listErr = errors.New("db down")
+	if w := f.deliver("ev_refunded_2", "payment_refunded"); w.Code != http.StatusInternalServerError || f.dedup.marks != 1 {
+		t.Fatalf("got %d marks %d, want 500 and the event left unprocessed", w.Code, f.dedup.marks)
+	}
+}
+
+// A paid payment for a void or draft invoice is refused by settlement (and
+// flagged there for a refund); redelivering it changes nothing, so it is
+// acknowledged.
+func TestMoyasarWebhook_NonPayableInvoiceIsAcked(t *testing.T) {
+	f := newMoyasarFixture(t)
+	f.settler.err = service.ErrInvoiceNotPayable
+	w := f.deliver("ev_void", "payment_paid")
+	if w.Code != http.StatusOK || ackReason(t, w) != "invoice not payable" || f.dedup.marks != 1 {
+		t.Fatalf("got %d body %s marks %d, want 200 ignored \"invoice not payable\" and recorded", w.Code, w.Body.String(), f.dedup.marks)
 	}
 }

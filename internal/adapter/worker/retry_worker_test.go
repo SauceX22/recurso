@@ -56,9 +56,9 @@ func (m *mockInvoiceRepo) ClearRetryState(_ context.Context, _, invoiceID uuid.U
 	return nil
 }
 
-func (m *mockInvoiceRepo) ClaimGatewayPaymentID(_ context.Context, _, _ uuid.UUID, id string) (bool, error) {
+func (m *mockInvoiceRepo) ClaimGatewayPaymentID(_ context.Context, _, _ uuid.UUID, id string) (bool, bool, error) {
 	m.claimed = append(m.claimed, id)
-	return true, nil
+	return true, true, nil
 }
 
 // Stubs for interface compliance

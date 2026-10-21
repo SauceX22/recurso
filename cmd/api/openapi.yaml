@@ -3877,7 +3877,9 @@ paths:
       operationId: showCheckout
       tags: [Checkout]
       summary: Fetch checkout data for an invoice
-      description: Returns the invoice summary rendered by the hosted checkout page. Public and rate-limited.
+      description: >
+        Returns the invoice summary rendered by the hosted checkout page, read
+        from Recurso only (no gateway call). Public and rate-limited per IP.
       security: []
       parameters:
         - $ref: '#/components/parameters/PathID'
@@ -3912,7 +3914,9 @@ paths:
         `card_on_file`). Before handing out the Moyasar form the server checks
         the gateway for a payment already captured for the invoice and
         settles it instead (400 `invoice_already_paid`); if it cannot check,
-        it answers 502 rather than risk a second capture. Settlement is always verified server-side —
+        it answers 502 rather than risk a second capture. Only open, past_due
+        and uncollectible invoices are payable (409 otherwise, on every
+        gateway). Limited per invoice as well as per IP. Settlement is always verified server-side —
         see `/checkout/{id}/success`, `/checkout/{id}/razorpay/verify` and
         `/checkout/{id}/moyasar/verify`.
       security: []
@@ -4013,6 +4017,18 @@ paths:
                 $ref: '#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: The invoice is void or draft and cannot be paid (`conflict`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Too many payment attempts for this invoice or from this client (`rate_limited`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '502':
           description: '`gateway_unavailable`: the gateway could not be asked whether the invoice was already paid (Moyasar); retry shortly.'
           content:
@@ -4151,7 +4167,7 @@ paths:
         the given payment is not paid but an earlier payment for the invoice
         was captured, that one is settled and `paid` reported. Void and draft
         invoices are refused (409); uncollectible ones stay payable. Limited
-        per invoice as well as per IP. The browser alone can never mark an
+        per invoice and payment id as well as per IP. The browser alone can never mark an
         invoice paid.
       security: []
       parameters:
@@ -4212,7 +4228,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
-          description: Too many verifications for this invoice or from this client (`rate_limited`).
+          description: Too many verifications of this payment for this invoice, or from this client (`rate_limited`).
           content:
             application/json:
               schema:

@@ -226,7 +226,8 @@ func (f *fakeSettler) MarkInvoicePaid(ctx context.Context, id uuid.UUID) (bool, 
 }
 
 // The payment a retry settles with is the invoice's refund target, recorded
-// only when that payment settled the invoice and a real charge was made.
+// through the conditional claim (it never overwrites another payment)
+// whenever a real charge was made.
 func TestRetryWorker_RecordsSettlingPaymentID(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -235,7 +236,7 @@ func TestRetryWorker_RecordsSettlingPaymentID(t *testing.T) {
 		want         []string
 	}{
 		{"settled by this charge", true, false, []string{"pay_moyasar"}},
-		{"already settled elsewhere", false, false, nil},
+		{"already settled elsewhere", false, false, []string{"pay_moyasar"}},
 		{"nothing was charged", true, true, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

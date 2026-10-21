@@ -138,9 +138,10 @@ type InvoiceRepository interface {
 	SetGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, gatewayPaymentID string) error
 	// ClaimGatewayPaymentID records paymentID as the payment that settled the
 	// invoice unless a different one is already recorded, and reports whether
-	// paymentID is now the recorded one. Conditional in SQL, so two concurrent
-	// settlers cannot both win.
-	ClaimGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (bool, error)
+	// paymentID is now the recorded one, and whether no payment was recorded
+	// before this call. Conditional in SQL, so two concurrent settlers cannot
+	// both win.
+	ClaimGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (claimed, wasEmpty bool, err error)
 	GetOverdueInvoices(ctx context.Context) ([]domain.OverdueInvoice, error)
 	// ClaimOverdueForDunning atomically leases up to `limit` overdue
 	// scheduler-managed invoices for the calling instance by pushing

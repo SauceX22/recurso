@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/json"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/recurso-dev/recurso/internal/adapter/db"
 	"github.com/recurso-dev/recurso/internal/adapter/handler"
 	"github.com/recurso-dev/recurso/internal/adapter/httperr"
@@ -155,15 +159,20 @@ func registerPublicRoutes(r *gin.Engine, h *publicHandlers) {
 		log.Fatalf("Failed to register OpenAPI routes: %v", err)
 	}
 
+	// Showing the page reads only the database. Paying checks the gateway for
+	// an earlier capture with the secret key (and creates an order), spending
+	// quota that renewals and retries share, so it is also bounded per invoice:
+	// rotating IPs past the per-IP limit cannot spend it without bound.
+	payPerInvoice := middleware.ParamRateLimitMiddleware(h.rdb, "checkout_pay", "id", 10, time.Minute)
 	r.GET("/checkout/:id", h.publicLimit, h.checkoutHandler.ShowCheckout)
-	r.POST("/checkout/:id/pay", h.publicLimit, h.checkoutHandler.InitiatePayment)
+	r.POST("/checkout/:id/pay", h.publicLimit, payPerInvoice, h.checkoutHandler.InitiatePayment)
 	r.GET("/checkout/:id/success", h.publicLimit, h.checkoutHandler.CheckoutSuccess)
 	r.POST("/checkout/:id/razorpay/verify", h.publicLimit, h.checkoutHandler.RazorpayVerify)
-	// Each verify spends a secret-key read-back against the gateway quota that
-	// renewals and retries share, so it is also bounded per invoice: rotating
-	// IPs past the per-IP limit gains nothing.
-	verifyPerInvoice := middleware.ParamRateLimitMiddleware(h.rdb, "checkout_verify", "id", 10, time.Minute)
-	r.POST("/checkout/:id/moyasar/verify", h.publicLimit, verifyPerInvoice, h.checkoutHandler.MoyasarVerify)
+	// Each verify spends a secret-key read-back, so it is bounded per invoice
+	// and payment: re-posting one payment from rotating IPs gains nothing, and
+	// another caller's verifies (other payment ids) never use up the buyer's.
+	verifyPerPayment := middleware.ParamRateLimitMiddleware(h.rdb, "checkout_verify", verifyKeyParam, 10, time.Minute)
+	r.POST("/checkout/:id/moyasar/verify", h.publicLimit, verifyKey, verifyPerPayment, h.checkoutHandler.MoyasarVerify)
 	r.POST("/payments/order", h.publicLimit, h.paymentHandler.CreateOrder)
 	// Recurso Cloud waitlist (ENG-12): public demand capture from the website.
 	r.POST("/waitlist", h.publicLimit, h.waitlistHandler.Join)
@@ -184,4 +193,33 @@ func registerPublicRoutes(r *gin.Engine, h *publicHandlers) {
 	// the handler verifies. Locally this was a hard 401; in production it only
 	// worked when the operator's dashboard cookie happened to ride along.
 	r.GET("/v1/accounting/callback/:provider", h.publicLimit, h.accountingHandler.OAuthCallback)
+}
+
+// verifyKeyParam is the path parameter verifyKey adds: "<invoice id>:<payment id>".
+const verifyKeyParam = "verify_key"
+
+// maxVerifyBody bounds what verifyKey reads; a verify body is one payment id.
+const maxVerifyBody = 4 << 10
+
+// verifyKey adds the verify_key parameter the per-payment verify limiter keys
+// on, from :id and the body's payment_id, and restores the body for the
+// handler. A payment id that is not a UUID is refused before any gateway
+// call, so all of those share one bucket.
+func verifyKey(c *gin.Context) {
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxVerifyBody))
+	if err != nil {
+		httperr.Abort(c, http.StatusBadRequest, httperr.CodeValidationFailed, "failed to read request body")
+		return
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	var req struct {
+		PaymentID string `json:"payment_id"`
+	}
+	paymentID := ""
+	if json.Unmarshal(body, &req) == nil {
+		if id, err := uuid.Parse(req.PaymentID); err == nil {
+			paymentID = id.String()
+		}
+	}
+	c.Params = append(c.Params, gin.Param{Key: verifyKeyParam, Value: c.Param("id") + ":" + paymentID})
 }

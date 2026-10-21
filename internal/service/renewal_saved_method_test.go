@@ -212,13 +212,14 @@ type recordedPayment struct {
 	paymentID           string
 }
 
-func (f *fakePaymentRecorder) ClaimGatewayPaymentID(_ context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (bool, error) {
+func (f *fakePaymentRecorder) ClaimGatewayPaymentID(_ context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (bool, bool, error) {
 	f.calls = append(f.calls, recordedPayment{tenantID, invoiceID, paymentID})
 	if f.recorded != "" && f.recorded != paymentID {
-		return false, nil
+		return false, false, nil
 	}
+	wasEmpty := f.recorded == ""
 	f.recorded = paymentID
-	return true, nil
+	return true, wasEmpty, nil
 }
 
 // The payment that settles a renewal is the invoice's refund target; without
@@ -240,21 +241,21 @@ func TestRenewalSavedMethod_RecordsSettlingPaymentID(t *testing.T) {
 	}
 }
 
-// When something else already settled the invoice, this charge did not: its
-// id must not overwrite the refund target.
+// When another payment already settled the invoice, this charge did not: its
+// id must not overwrite the refund target (the claim is conditional).
 func TestRenewalSavedMethod_DoesNotRecordPaymentThatDidNotSettle(t *testing.T) {
 	svc, _, sub := sarRenewalFixture()
 	moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: "pay_late"}}
 	already := false
 	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(moyasar), &fakeRenewalSettler{transitioned: &already})
-	rec := &fakePaymentRecorder{}
+	rec := &fakePaymentRecorder{recorded: "pay_first"}
 	svc.SetPaymentRecorder(rec)
 
 	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 		t.Fatal(err)
 	}
-	if len(rec.calls) != 0 {
-		t.Fatalf("recorded = %+v, want nothing", rec.calls)
+	if rec.recorded != "pay_first" {
+		t.Fatalf("refund target = %q, want pay_first kept", rec.recorded)
 	}
 }
 

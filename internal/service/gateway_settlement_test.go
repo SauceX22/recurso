@@ -42,16 +42,17 @@ type fakePaymentClaimer struct {
 	calls    []claimCall
 }
 
-func (f *fakePaymentClaimer) ClaimGatewayPaymentID(_ context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (bool, error) {
+func (f *fakePaymentClaimer) ClaimGatewayPaymentID(_ context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (bool, bool, error) {
 	f.calls = append(f.calls, claimCall{tenantID, invoiceID, paymentID})
 	if f.err != nil {
-		return false, f.err
+		return false, false, f.err
 	}
 	if f.recorded == "" || f.recorded == paymentID {
+		wasEmpty := f.recorded == ""
 		f.recorded = paymentID
-		return true, nil
+		return true, wasEmpty, nil
 	}
-	return false, nil
+	return false, false, nil
 }
 
 type fakeSettlementSubs struct {
@@ -249,24 +250,47 @@ func TestGatewaySettlement_SecondPaymentIsFlaggedNotRecorded(t *testing.T) {
 }
 
 // The webhook and the checkout return both settle the same payment; the one
-// that did not transition still records it (it owns the invoice) but must
-// not count the recovery twice.
+// that did not transition finds it already recorded: it is not a duplicate,
+// but must not count the recovery twice.
 func TestGatewaySettlement_RedeliveryOfRecordedPayment(t *testing.T) {
-	for name, recorded := range map[string]string{"already recorded": "pay-1", "never recorded": ""} {
-		t.Run(name, func(t *testing.T) {
-			f := newSettlementFixture()
-			f.settler.transitioned = false
-			f.claims.recorded = recorded
-			if _, err := f.svc.Settle(context.Background(), f.inv, f.payment); err != nil {
-				t.Fatal(err)
-			}
-			if f.claims.recorded != "pay-1" || len(f.cards.calls) != 1 {
-				t.Fatalf("recorded=%q cards=%d, want pay-1 and the card saved", f.claims.recorded, len(f.cards.calls))
-			}
-			if len(f.outcomes.outcomes) != 0 || len(f.campaigns.invoices) != 0 {
-				t.Fatal("redelivery recorded the dunning recovery again")
-			}
-		})
+	logs := captureDefaultLog(t)
+	f := newSettlementFixture()
+	f.settler.transitioned = false
+	f.claims.recorded = "pay-1"
+	if _, err := f.svc.Settle(context.Background(), f.inv, f.payment); err != nil {
+		t.Fatal(err)
+	}
+	if f.claims.recorded != "pay-1" || len(f.cards.calls) != 1 {
+		t.Fatalf("recorded=%q cards=%d, want pay-1 and the card saved", f.claims.recorded, len(f.cards.calls))
+	}
+	if len(f.outcomes.outcomes) != 0 || len(f.campaigns.invoices) != 0 {
+		t.Fatal("redelivery recorded the dunning recovery again")
+	}
+	if strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("redelivery of the settling payment flagged as a duplicate; logs:\n%s", logs)
+	}
+}
+
+// M5: the invoice was settled another way (marked paid offline) and then the
+// customer also paid through the checkout link. The payment is recorded as
+// the refund target, but it is flagged as a duplicate charge and its card is
+// not saved.
+func TestGatewaySettlement_PaymentOnInvoiceSettledAnotherWayIsFlagged(t *testing.T) {
+	logs := captureDefaultLog(t)
+	f := newSettlementFixture()
+	f.inv.Status = domain.InvoiceStatusPaid
+	f.settler.transitioned = false
+	if _, err := f.svc.Settle(context.Background(), f.inv, f.payment); err != nil {
+		t.Fatal(err)
+	}
+	if f.claims.recorded != "pay-1" {
+		t.Fatalf("recorded = %q, want pay-1 as the refund target", f.claims.recorded)
+	}
+	if len(f.cards.calls) != 0 {
+		t.Fatalf("duplicate payment saved its card: %+v", f.cards.calls)
+	}
+	if out := logs.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "duplicate charge") || !strings.Contains(out, "payment_id=pay-1") {
+		t.Fatalf("payment on an invoice settled another way not flagged; logs:\n%s", out)
 	}
 }
 
