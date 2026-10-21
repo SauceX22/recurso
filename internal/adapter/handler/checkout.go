@@ -236,17 +236,20 @@ func (h *CheckoutHandler) InitiatePayment(c *gin.Context) {
 		return
 	}
 
-	if invoice.Status == domain.InvoiceStatusPaid {
+	// An open invoice whose partial payments and credit cover it has nothing
+	// left to collect; a zero-amount order is refused by every gateway.
+	if invoice.Status == domain.InvoiceStatusPaid || invoice.AmountDue <= 0 {
 		respondError(c, http.StatusBadRequest, codeInvoiceAlreadyPaid, "invoice already paid")
 		return
 	}
 
 	// Public endpoint: carry the invoice's tenant so BYO routing picks the
-	// seller's own gateway (falls back to the env gateway when unset).
+	// seller's own gateway (falls back to the env gateway when unset). The
+	// order is for the balance still owed, as the retry worker charges.
 	payCtx := context.WithValue(c.Request.Context(), domain.TenantIDKey, invoice.TenantID)
 	order, err := h.paymentGateway.CreateOrder(
 		payCtx,
-		invoice.Total,
+		invoice.AmountDue,
 		invoice.Currency,
 		invoice.InvoiceNumber,
 		invoice.ID.String(),
@@ -316,11 +319,10 @@ func (h *CheckoutHandler) InitiatePayment(c *gin.Context) {
 		"razorpay_key_id": razorpayKeyID,
 	}
 	if gatewayName == string(domain.GatewayMoyasar) {
-		// The embedded form creates the payment in the browser, so it needs the
-		// outstanding balance (verify requires amount >= due), a description,
-		// and the invoice_id metadata the server-side read-back binds on.
-		// save_card is the consent the page must disclose before payment.
-		data["amount"] = invoice.AmountDue
+		// The embedded form creates the payment in the browser, so it needs a
+		// description and the invoice_id metadata the server-side read-back
+		// binds on. save_card is the consent the page must disclose before
+		// payment.
 		data["save_card"] = h.moyasarSettler.SavesCard(payCtx, invoice)
 		data["moyasar_publishable_key"] = h.moyasarPublishableKey
 		data["description"] = "Invoice " + invoice.InvoiceNumber

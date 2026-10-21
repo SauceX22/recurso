@@ -191,6 +191,40 @@ func TestCheckoutInitiate_StripeResponseHasNoMoyasarKeys(t *testing.T) {
 	}
 }
 
+// Every gateway's order is for what the buyer still owes after partial
+// payments and applied credit, not the invoice total, the way the retry
+// worker charges.
+func TestCheckoutInitiate_OrderIsForAmountDue(t *testing.T) {
+	for gw, currency := range map[string]string{"stripe": "USD", "razorpay": "INR", "moyasar": "SAR"} {
+		t.Run(gw, func(t *testing.T) {
+			f := newMoyCheckoutFixture(gw)
+			f.inv.Currency = currency
+			code, out := f.pay(t)
+			if code != http.StatusOK {
+				t.Fatalf("status = %d, body %v", code, out)
+			}
+			if f.gw.gotAmount != f.inv.AmountDue {
+				t.Errorf("order created for %d, want the amount due %d (total %d)", f.gw.gotAmount, f.inv.AmountDue, f.inv.Total)
+			}
+			if got := moyData(t, out)["amount"]; got != float64(f.inv.AmountDue) {
+				t.Errorf("response amount = %v, want %d", got, f.inv.AmountDue)
+			}
+		})
+	}
+}
+
+func TestCheckoutInitiate_NothingDueCreatesNoOrder(t *testing.T) {
+	f := newMoyCheckoutFixture("stripe")
+	f.inv.Currency, f.inv.AmountDue = "USD", 0
+	code, out := f.pay(t)
+	if code != http.StatusBadRequest || moyErrorCode(out) != codeInvoiceAlreadyPaid {
+		t.Fatalf("status = %d code = %q, want 400 %s", code, moyErrorCode(out), codeInvoiceAlreadyPaid)
+	}
+	if f.gw.gotAmount != 0 {
+		t.Errorf("created an order for %d", f.gw.gotAmount)
+	}
+}
+
 func TestMoyasarVerify_PaidSettles(t *testing.T) {
 	f := newMoyCheckoutFixture("moyasar")
 	code, out := f.verifyPayment(t)
