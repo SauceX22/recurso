@@ -71,8 +71,13 @@ a transport error or 5xx the payment is re-read (with a detached context) and
 the refund succeeds if `refunded` grew by the amount. `RefundID` =
 `<payment id>:<refunded total>`. If the read-back fails or doesn't show it yet,
 the refund is `pending` (`<payment id>:unknown:<uuid>`), never failed: it holds
-the refundable amount so it can't be re-issued; an operator confirms it on the
-Moyasar dashboard. Refunds of one payment are serialized within a process.
+the refundable amount so it can't be re-issued, and nothing is booked (no
+ledger refund, tax reversal or rev-rec unwind) while the outcome is unknown.
+The `payment_refunded` webhook resolves it from the payment's `refunded` total
+(`CreditNoteService.ResolveUnknownRefunds`): oldest first, what that total
+covers beyond the processed refunds becomes `processed` and is booked then; the
+rest becomes `refund_failed`. Refunds of one payment are serialized within a
+process.
 
 ### Saved methods and routing
 
@@ -96,11 +101,16 @@ EUR on GoCardless), as before. A refusal leaves the invoice to dunning.
 Checkout verify and the webhook share `Settle`: `BindPaymentToInvoice`
 (metadata invoice id, currency, amount net of refunds ≥ `AmountDue`) →
 `MarkInvoicePaid` under the invoice's tenant (ledger legs, ADR-002) →
-`ClaimGatewayPaymentID` (another payment on a settled invoice is logged as a
-duplicate charge) → save the card → on the paid transition, close the dunning
-campaign and reward the retry bandit. Renewal and retry-worker successes
-settle synchronously and record the payment id with the same conditional claim
-(`RecordSettlingPayment`), warning when it loses.
+`RecordSettlingPayment` → save the card → on the paid transition, close the
+dunning campaign and reward the retry bandit. A void or draft invoice is never
+settled: the payment is logged for refund review (`InvoicePayable`: open,
+past_due, uncollectible). Renewal and retry-worker successes settle
+synchronously and use the same `RecordSettlingPayment`: it always attempts the
+conditional `ClaimGatewayPaymentID` and logs a possible duplicate charge only
+when the claim loses to another payment, or when the invoice was settled
+another way (offline) with no payment recorded; finding the same payment
+already recorded (the webhook settled it first) is not a duplicate, and only a
+non-duplicate saves its card.
 
 **Card consent.** `SavesCard` is true only for a subscription that will renew
 (not canceled, not `cancel_at_period_end`); one-off invoices never save.
@@ -134,24 +144,29 @@ changes.
 only after a 2xx (store down → 503). Only `data.id` is read: the payment is
 re-fetched with the secret key and the invoice found by its metadata.
 `payment_paid` settles a bound `paid` read-back (still `initiated` → 503 for
-redelivery). `payment_refunded`/`payment_voided` on a paid invoice log a WARN
-to confirm a credit note exists. `payment_failed` and others are acked.
+redelivery); a void or draft invoice is acked as `invoice not payable`.
+`payment_refunded` resolves refunds of unknown outcome (above);
+`payment_refunded`/`payment_voided` on a paid invoice log a WARN to confirm a
+credit note exists. `payment_failed` and others are acked.
 
 ### Hosted checkout
 
-`GET /checkout/:id` shows `amount_due`; `POST /checkout/:id/pay` creates every
-gateway's order for `AmountDue`, and for SAR returns `gateway:"moyasar"`,
+`GET /checkout/:id` shows `amount_due` from the database only (no gateway
+call). `POST /checkout/:id/pay` answers 409 for a void or draft invoice on every
+gateway, is limited per invoice as well as per IP, creates every gateway's
+order for `AmountDue`, and for SAR returns `gateway:"moyasar"`,
 `save_card`, `card_on_file` (`{merchant, amount, currency, interval,
 interval_count}`, the consent terms, when the card is saved), the publishable
-key, `description` and `metadata:{invoice_id}`. Before showing or handing out
-the form, `SettleExistingPayment` asks Moyasar for a paid payment bound to the
+key, `description` and `metadata:{invoice_id}`. Before handing out the form,
+`SettleExistingPayment` asks Moyasar for a paid payment bound to the
 invoice and settles it, so a renewal whose answer was lost is never paid twice
 (`/pay` fails closed with 502 if it can't check). `MoyasarForm.jsx` loads the pinned,
 SRI-checked assets (`moyasarAssets.js`) and mounts `Moyasar.init` (mada, visa,
 mastercard; `callback_url` `/checkout/<id>?gateway=moyasar`). The return calls
 `POST /checkout/:id/moyasar/verify {payment_id}`, which reads back, binds and
 settles only `paid`; void and draft invoices answer 409, and the route is
-limited per invoice as well as per IP. The browser never marks an invoice paid.
+limited per invoice and payment id (so other callers' verifies cannot lock the
+buyer out) as well as per IP. The browser never marks an invoice paid.
 
 **Arabic/RTL.** `lib/checkoutCopy.js` has English and Arabic copy, picked from
 the browser language; Arabic sets `dir="rtl"` and the form's `language: "ar"`.
@@ -238,8 +253,10 @@ names only cards and Apple Pay). A refusal or 3DS demand returns `failed` or
 - `CreatePlan.jsx` offers only USD/INR/EUR/GBP; SAR plans need the API.
 - Refund serialization is per process; two instances refunding the same
   payment at once can still misread each other's amount.
-- A `pending` refund is confirmed by an operator; the `payment_refunded`
-  webhook doesn't resolve it yet.
+- A refund of unknown outcome that Moyasar never applied gets no
+  `payment_refunded` webhook, so it stays `pending` (unbooked, refundable
+  amount held) until a later refund of the same payment triggers one or an
+  operator resolves it; there is no operator action or reconciler yet.
 
 ## Founder-gated: sandbox verification before dropping EXPERIMENTAL
 
