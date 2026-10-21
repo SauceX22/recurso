@@ -164,3 +164,27 @@ func logChargeFailure(ctx context.Context, msg string, result *port.PaymentResul
 	}
 	slog.WarnContext(ctx, msg, attrs...)
 }
+
+// RecordSettlingPayment records paymentID, an off-session charge that just
+// succeeded on inv, as the invoice's refund target. transitioned is whether
+// settling inv after the charge marked it paid. The claim is conditional, so
+// it never overwrites a payment that settled the invoice first; a charge on an
+// invoice that was already settled, or a lost claim, may be a second payment
+// for it and is logged for an operator to review.
+func RecordSettlingPayment(ctx context.Context, claimer gatewayPaymentClaimer, inv *domain.Invoice, transitioned bool, paymentID string) {
+	if paymentID == "" {
+		return
+	}
+	logger := slog.With("invoice_id", inv.ID, "payment_id", paymentID)
+	if !transitioned {
+		logger.WarnContext(ctx, "off-session charge succeeded on an invoice that was already settled; review for refund if it was another payment")
+		return
+	}
+	claimed, err := claimer.ClaimGatewayPaymentID(ctx, inv.TenantID, inv.ID, paymentID)
+	switch {
+	case err != nil:
+		logger.ErrorContext(ctx, "failed to record the settling payment id; refunds need it", "error", err)
+	case !claimed:
+		logger.WarnContext(ctx, "invoice already records another settling payment; duplicate charge, review for refund")
+	}
+}

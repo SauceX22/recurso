@@ -194,9 +194,11 @@ func TestRenewalSavedMethod_LookupErrorLeavesInvoiceOpen(t *testing.T) {
 	}
 }
 
-// fakePaymentRecorder records SetGatewayPaymentID calls.
+// fakePaymentRecorder records ClaimGatewayPaymentID calls; a non-empty
+// recorded id is a payment that already holds the slot.
 type fakePaymentRecorder struct {
-	calls []recordedPayment
+	calls    []recordedPayment
+	recorded string
 }
 
 type recordedPayment struct {
@@ -204,9 +206,13 @@ type recordedPayment struct {
 	paymentID           string
 }
 
-func (f *fakePaymentRecorder) SetGatewayPaymentID(_ context.Context, tenantID, invoiceID uuid.UUID, paymentID string) error {
+func (f *fakePaymentRecorder) ClaimGatewayPaymentID(_ context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (bool, error) {
 	f.calls = append(f.calls, recordedPayment{tenantID, invoiceID, paymentID})
-	return nil
+	if f.recorded != "" && f.recorded != paymentID {
+		return false, nil
+	}
+	f.recorded = paymentID
+	return true, nil
 }
 
 // The payment that settles a renewal is the invoice's refund target; without

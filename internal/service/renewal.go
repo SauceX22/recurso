@@ -35,12 +35,6 @@ type renewalInvoicer interface {
 	GenerateFinalUsageInvoice(ctx context.Context, sub *domain.Subscription, endedAt time.Time) (*domain.Invoice, error)
 }
 
-// gatewayPaymentRecorder records the gateway payment that settled an invoice;
-// *db.InvoiceRepository.
-type gatewayPaymentRecorder interface {
-	SetGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, gatewayPaymentID string) error
-}
-
 // renewalSettler settles a paid invoice through the ledger path;
 // *SubscriptionService.MarkInvoicePaid.
 type renewalSettler interface {
@@ -60,7 +54,7 @@ type RenewalService struct {
 	settler       renewalSettler
 	// payments records the settling payment id as the invoice's refund
 	// target. nil-safe.
-	payments gatewayPaymentRecorder
+	payments gatewayPaymentClaimer
 
 	now func() time.Time // injectable for tests
 }
@@ -84,7 +78,7 @@ func (s *RenewalService) SetSavedMethodCharging(lookup savedMethodLookup, router
 
 // SetPaymentRecorder wires recording of the gateway payment that settles a
 // renewal invoice, so refunds don't depend on a webhook. nil-safe.
-func (s *RenewalService) SetPaymentRecorder(r gatewayPaymentRecorder) {
+func (s *RenewalService) SetPaymentRecorder(r gatewayPaymentClaimer) {
 	s.payments = r
 }
 
@@ -237,23 +231,7 @@ func (s *RenewalService) attemptPayment(ctx context.Context, inv *domain.Invoice
 			"invoice_id", inv.ID, "payment_id", result.PaymentID, "error", err)
 		return
 	}
-	recordSettlingPayment(ctx, s.payments, inv, transitioned, result.PaymentID)
-}
-
-// recordSettlingPayment stores paymentID as inv's refund target when that
-// payment settled it. If the invoice was already settled, the charge may be a
-// second payment for it, which an operator must review.
-func recordSettlingPayment(ctx context.Context, r gatewayPaymentRecorder, inv *domain.Invoice, transitioned bool, paymentID string) {
-	if !transitioned {
-		slog.WarnContext(ctx, "off-session charge succeeded on an invoice that was already settled; review for refund if it was another payment",
-			"invoice_id", inv.ID, "payment_id", paymentID)
-		return
-	}
-	if r == nil || paymentID == "" {
-		return
-	}
-	if err := r.SetGatewayPaymentID(ctx, inv.TenantID, inv.ID, paymentID); err != nil {
-		slog.ErrorContext(ctx, "failed to record the settling payment id; refunds need it",
-			"invoice_id", inv.ID, "payment_id", paymentID, "error", err)
+	if s.payments != nil {
+		RecordSettlingPayment(ctx, s.payments, inv, transitioned, result.PaymentID)
 	}
 }
