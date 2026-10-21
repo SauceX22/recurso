@@ -593,18 +593,96 @@ func TestMoyasarChargeLookupFailureDoesNotCharge(t *testing.T) {
 	}
 }
 
-// The read-back of a replay goes through the same decline mapping.
+// A replayed key whose earlier attempt charged another card (the customer
+// saved a new one since) is stale: the old card's hard decline says nothing
+// about the new card, and reporting it would block the new card. The adapter
+// charges the new card once, under a key bound to it, so a replay of that
+// charge reads it back rather than charging again. The earlier payment
+// wasn't paid (a paid one for the invoice is found first), so the customer is
+// never charged twice.
+func TestMoyasarChargeReplayOfAnotherCardChargesThisCard(t *testing.T) {
+	oldID := moyasarGivenID("retry-inv-1-3")
+	for _, tc := range []struct {
+		name string
+		// alreadyCharged: the charge on the new card was made by an earlier
+		// run whose answer was lost, so its POST is refused as a replay too.
+		alreadyCharged bool
+	}{
+		{"first run charges the new card", false},
+		{"rerun reads the new card's charge back", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var posts []map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/payments":
+					_, _ = w.Write([]byte(moyasarNoPayments))
+				case r.Method == http.MethodGet && r.URL.Path == "/payments/"+oldID:
+					_, _ = w.Write([]byte(moyasarPaymentJSON(oldID, "failed", "41", "LOST CARD")))
+				case r.Method == http.MethodGet:
+					id := strings.TrimPrefix(r.URL.Path, "/payments/")
+					_, _ = w.Write([]byte(strings.Replace(moyasarPaymentJSON(id, "paid", "00", "APPROVED"), "token_abc", "token_new", 1)))
+				case r.Method == http.MethodPost && r.URL.Path == "/payments":
+					var body map[string]any
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					mu.Lock()
+					posts = append(posts, body)
+					mu.Unlock()
+					if body["given_id"] == oldID || tc.alreadyCharged {
+						w.WriteHeader(http.StatusBadRequest)
+						_, _ = w.Write([]byte(`{"type":"invalid_request_error","message":"Payment is already created.","errors":null}`))
+						return
+					}
+					_, _ = w.Write([]byte(strings.Replace(moyasarPaymentJSON(body["given_id"].(string), "paid", "00", "APPROVED"), "token_abc", "token_new", 1)))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			res, err := testMoyasar(srv.URL).ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_new", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "retry-inv-1-3"})
+			if err != nil || res == nil || !res.Success || res.Permanent {
+				t.Fatalf("res = %+v, err = %v; want the new card's paid charge, not the old card's decline", res, err)
+			}
+			if len(posts) != 2 {
+				t.Fatalf("POSTs = %d, want 2 (the replay, then one charge on the new card)", len(posts))
+			}
+			newID, _ := posts[1]["given_id"].(string)
+			if newID == oldID || res.PaymentID != newID {
+				t.Fatalf("second charge given_id = %q (old %q), result payment %q; want a new id bound to the new card", newID, oldID, res.PaymentID)
+			}
+			if src, _ := posts[1]["source"].(map[string]any); src["token"] != "token_new" {
+				t.Fatalf("second charge source = %v, want token_new", posts[1]["source"])
+			}
+		})
+	}
+}
+
+// The read-back of a replay goes through the same decline mapping, when it
+// was this card or the read-back doesn't name a card (nothing says it's stale).
 func TestMoyasarChargeReplayOfHardDeclineIsPermanent(t *testing.T) {
 	givenID := moyasarGivenID("renewal-inv-1")
-	srv, _ := moyasarTestServer(t, map[string]moyasarReply{
-		"POST /payments":           {http.StatusBadRequest, `{"type":"invalid_request_error","message":"Payment is already created.","errors":null}`},
-		"GET /payments/" + givenID: {http.StatusOK, moyasarPaymentJSON(givenID, "failed", "54", "EXPIRED CARD")},
-	})
-	g := testMoyasar(srv.URL)
+	for name, payment := range map[string]string{
+		"same card":     moyasarPaymentJSON(givenID, "failed", "54", "EXPIRED CARD"),
+		"card not read": strings.Replace(moyasarPaymentJSON(givenID, "failed", "54", "EXPIRED CARD"), `"token_abc"`, `""`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+				"POST /payments":           {http.StatusBadRequest, `{"type":"invalid_request_error","message":"Payment is already created.","errors":null}`},
+				"GET /payments/" + givenID: {http.StatusOK, payment},
+			})
+			g := testMoyasar(srv.URL)
 
-	res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
-	if err != nil || res.Success || !res.Permanent {
-		t.Fatalf("res = %+v, err = %v; want a permanent decline", res, err)
+			res, err := g.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{MethodRef: "token_abc", Amount: 10000, Currency: "SAR", InvoiceID: "inv-1", IdempotencyKey: "renewal-inv-1"})
+			if err != nil || res.Success || !res.Permanent {
+				t.Fatalf("res = %+v, err = %v; want a permanent decline", res, err)
+			}
+			if n := rec.count(http.MethodPost); n != 1 {
+				t.Fatalf("POST count = %d, want 1", n)
+			}
+		})
 	}
 }
 

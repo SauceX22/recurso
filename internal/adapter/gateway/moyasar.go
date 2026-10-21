@@ -256,6 +256,10 @@ func moyasarGivenID(idempotencyKey string) string {
 	return uuid.NewSHA1(moyasarNamespace, []byte(idempotencyKey)).String()
 }
 
+// cardKeySuffix binds an idempotency key to a card when the key's earlier
+// attempt charged another one. Fixed forever, like moyasarNamespace.
+func cardKeySuffix(methodRef string) string { return "/card:" + methodRef }
+
 // ChargeSavedPaymentMethod charges a saved card token off-session (renewal,
 // dunning retry, wallet top-up). CustomerRef is unused: Moyasar has no
 // customer object, the token alone identifies the card. Idempotency rides on
@@ -322,6 +326,17 @@ func (g *MoyasarGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.
 			// Never created: the 400 is a genuine rejection, handled below.
 		case ferr != nil:
 			return &port.PaymentResult{Success: false, ErrorCode: "gateway_error", ErrorMsg: ferr.Error()}, ferr
+		case existing.Status != "paid" && existing.Source.Token != "" && existing.Source.Token != req.MethodRef &&
+			!strings.HasSuffix(req.IdempotencyKey, cardKeySuffix(req.MethodRef)):
+			// The earlier attempt charged another card (the customer saved a
+			// new one since): its decline says nothing about this card. It
+			// wasn't paid (a paid one for the invoice was found above), so
+			// charge this card once, under a key bound to it that a replay
+			// of this charge reuses.
+			slog.WarnContext(ctx, "moyasar: idempotency key replayed an attempt on another card; charging the current card",
+				"payment_id", existing.ID, "status", existing.Status)
+			req.IdempotencyKey += cardKeySuffix(req.MethodRef)
+			return g.ChargeSavedPaymentMethod(ctx, req)
 		case existing.Amount != req.Amount || !strings.EqualFold(existing.Currency, req.Currency):
 			return &port.PaymentResult{
 				Success:   false,
