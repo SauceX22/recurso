@@ -5,6 +5,7 @@ import {
   detectCheckoutLocale,
   saveCardConsentText,
   verifyErrorMessage,
+  verifyErrorRetryable,
 } from "../checkoutCopy";
 import { formatCurrency } from "../utils";
 
@@ -89,9 +90,23 @@ describe("saveCardConsentText", () => {
 describe("verifyErrorMessage", () => {
   const t = checkoutCopy("en");
   it("maps a plain status/code object", () => {
-    expect(verifyErrorMessage(t, { status: 400, code: "validation_failed" }, { invoiceNumber: "INV-1", paymentId: "pay_1" }))
-      .toBe(t.errMismatch("INV-1", "pay_1"));
+    const ids = { invoiceNumber: "INV-1", paymentId: "pay_1" };
+    expect(verifyErrorMessage(t, { status: 400, code: "payment_mismatch" }, ids)).toBe(t.errMismatch("INV-1", "pay_1"));
+    // A malformed request or a bad signature is not proof of a mismatch.
+    expect(verifyErrorMessage(t, { status: 400, code: "validation_failed" }, ids)).toBe(t.errNotConfirmed("INV-1", "pay_1"));
+    expect(verifyErrorMessage(t, { status: 500, code: "internal_error" })).toBe(t.errSettle);
     expect(verifyErrorMessage(t, { status: 502 })).toBe(t.errProvider);
     expect(verifyErrorMessage(t, undefined)).toBe(t.errNetwork);
+  });
+
+  it.each([
+    [undefined, true],
+    [{ status: 500 }, true],
+    [{ status: 502 }, true],
+    [{ status: 503 }, false],
+    [{ status: 404 }, false],
+    [{ response: { status: 400, data: { error: { code: "payment_mismatch" } } } }, false],
+  ])("Check again is offered for %j: %s", (err, want) => {
+    expect(verifyErrorRetryable(err)).toBe(want);
   });
 });

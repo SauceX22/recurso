@@ -466,11 +466,13 @@ describe("Checkout — Moyasar return verification", () => {
   });
 
   it.each([
-    [{ response: { status: 400, data: { error: { code: "validation_failed" } } } }, /doesn't match invoice INV-42.*79cced57/],
-    [{ response: { status: 404, data: { error: { code: "not_found" } } } }, /couldn't find this invoice/],
-    [{ response: { status: 503, data: { error: { code: "internal_error" } } } }, /card payments aren't available/i],
-    [{ message: "Network Error" }, /couldn't reach the server/],
-  ])("maps verify error %# to buyer copy without leaking the server message", async (err, copy) => {
+    [{ response: { status: 400, data: { error: { code: "payment_mismatch" } } } }, /doesn't match invoice INV-42.*79cced57/, false],
+    [{ response: { status: 400, data: { error: { code: "validation_failed" } } } }, /couldn't confirm this payment for invoice INV-42.*79cced57/, false],
+    [{ response: { status: 404, data: { error: { code: "not_found" } } } }, /couldn't find this invoice/, false],
+    [{ response: { status: 503, data: { error: { code: "checkout_unavailable" } } } }, /card payments aren't available/i, false],
+    [{ response: { status: 500, data: { error: { code: "internal_error" } } } }, /went through, but we couldn't record it/, true],
+    [{ message: "Network Error" }, /couldn't reach the server/, true],
+  ])("maps verify error %# to buyer copy without leaking the server message", async (err, copy, retryable) => {
     mockFetch(payResponse());
     vi.spyOn(endpoints, "verifyMoyasarCheckout").mockRejectedValue({
       ...err,
@@ -482,6 +484,10 @@ describe("Checkout — Moyasar return verification", () => {
     renderAt(`?gateway=moyasar&id=${PAYMENT_ID}&status=paid`);
     expect(await screen.findByText(copy)).toBeInTheDocument();
     expect(screen.queryByText(/does not belong/)).not.toBeInTheDocument();
-    expect(screen.getByRole("alert")).toBeInTheDocument();
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(copy);
+    expect(alert.querySelector("button")).toBeNull();
+    // Check again is offered only where re-checking can change the answer.
+    expect(!!screen.queryByRole("button", { name: /check again/i })).toBe(retryable);
   });
 });

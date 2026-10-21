@@ -75,6 +75,10 @@ const en = {
     "We couldn't reach the server to confirm your payment. Check your connection, then check again. Checking doesn't charge you again.",
   errMismatch: (n, ref) =>
     `This payment doesn't match invoice ${n}. If you were charged, contact the sender and quote payment reference ${ref}.`,
+  errNotConfirmed: (n, ref) =>
+    `We couldn't confirm this payment for invoice ${n}. If you were charged, contact the sender and quote payment reference ${ref}.`,
+  errSettle:
+    "Your payment went through, but we couldn't record it yet. Check again in a minute. You won't be charged twice.",
   errNotFound: "We couldn't find this invoice. Check the payment link in your email, or contact the sender.",
   errUnavailable:
     "Card payments aren't available for this invoice right now. Contact the sender to arrange payment.",
@@ -148,6 +152,10 @@ const ar = {
     "تعذر الاتصال بالخادم لتأكيد الدفع. تحقق من اتصالك ثم تحقق مرة أخرى. التحقق لا يخصم أي مبلغ إضافي.",
   errMismatch: (n, ref) =>
     `هذا الدفع لا يطابق الفاتورة ${n}. إذا تم خصم المبلغ منك، فتواصل مع المرسل واذكر مرجع الدفع ${ref}.`,
+  errNotConfirmed: (n, ref) =>
+    `تعذر تأكيد عملية الدفع هذه للفاتورة ${isolate(n)}. إذا تم خصم المبلغ منك، فتواصل مع الجهة المُصدِرة للفاتورة واذكر مرجع الدفع ${isolate(ref)}.`,
+  errSettle:
+    "تمت عملية الدفع، لكن تعذر تسجيلها حتى الآن. تحقق مرة أخرى بعد دقيقة. لن يُخصم المبلغ منك مرتين.",
   errNotFound: "لم نتمكن من العثور على هذه الفاتورة. تحقق من رابط الدفع في بريدك الإلكتروني، أو تواصل مع المرسل.",
   errUnavailable: "الدفع بالبطاقة غير متاح لهذه الفاتورة حاليًا. تواصل مع المرسل لترتيب الدفع.",
   errProvider:
@@ -220,13 +228,30 @@ export function saveCardConsentText(t, terms) {
 // action. `err` is an axios-style error ({ response: { status, data } }) or a
 // plain { status, code } object; a missing response means the network failed.
 export function verifyErrorMessage(t, err, { invoiceNumber, paymentId } = {}) {
-  const status = err?.response?.status ?? err?.status;
-  const code = err?.response?.data?.error?.code ?? err?.code;
+  const { status, code } = verifyErrorParts(err);
   if (!status) return t.errNetwork;
   if (status === 503) return t.errUnavailable;
   if (status === 404 || code === "not_found") return t.errNotFound;
-  if (status === 400 || code === "validation_failed") {
-    return t.errMismatch(invoiceNumber || "", paymentId || "");
-  }
+  if (code === "payment_mismatch") return t.errMismatch(invoiceNumber || "", paymentId || "");
+  // Any other refusal (a bad signature, a malformed request) isn't proof of
+  // a mismatch, only that this payment couldn't be confirmed.
+  if (status >= 400 && status < 500) return t.errNotConfirmed(invoiceNumber || "", paymentId || "");
+  // The provider reported the payment, but recording it failed on our side.
+  if (status === 500) return t.errSettle;
   return t.errProvider;
+}
+
+// verifyErrorRetryable reports whether checking again could give a different
+// answer: a network failure, or a server or provider error other than the
+// gateway being switched off.
+export function verifyErrorRetryable(err) {
+  const { status } = verifyErrorParts(err);
+  return !status || (status >= 500 && status !== 503);
+}
+
+function verifyErrorParts(err) {
+  return {
+    status: err?.response?.status ?? err?.status,
+    code: err?.response?.data?.error?.code ?? err?.code,
+  };
 }

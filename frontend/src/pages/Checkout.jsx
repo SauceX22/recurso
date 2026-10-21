@@ -24,8 +24,9 @@ import {
   checkoutCopy,
   detectCheckoutLocale,
   verifyErrorMessage,
+  verifyErrorRetryable,
 } from "@/lib/checkoutCopy";
-import { loadExternalScript } from "@/lib/useExternalScript";
+import { SCRIPT_TIMEOUT_MS, loadExternalScript } from "@/lib/useExternalScript";
 
 const RAZORPAY_JS = "https://checkout.razorpay.com/v1/checkout.js";
 
@@ -47,10 +48,29 @@ function readGatewayReturn(invoiceId) {
   return null;
 }
 
-// verifyReturn asks the server for the outcome of a returned payment and
-// resolves { status, paymentStatus }. It throws an axios-style error
-// ({ response: { status, data } }, or no response on a network failure).
+// verifyReturn asks the server for the outcome of a returned or captured
+// payment and resolves { status, paymentStatus }. It throws an axios-style
+// error ({ response: { status, data } }, or no response on a network failure).
 async function verifyReturn(invoiceId, ret) {
+  if (ret.gateway === "razorpay") {
+    // Signature check plus the order↔invoice binding, then settlement.
+    const res = await fetch(`${API_BASE}/checkout/${invoiceId}/razorpay/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        razorpay_order_id: ret.orderId,
+        razorpay_payment_id: ret.paymentId,
+        razorpay_signature: ret.signature,
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    // A captured payment is never "failed" or "processing" here: anything but
+    // paid is a confirmation we couldn't get.
+    if (!res.ok || body.data?.status !== "paid") {
+      throw { response: { status: res.ok ? 502 : res.status, data: body } };
+    }
+    return { status: "paid" };
+  }
   if (ret.gateway === "moyasar") {
     const res = await endpoints.verifyMoyasarCheckout(invoiceId, {
       payment_id: ret.paymentId,
@@ -169,8 +189,9 @@ export default function Checkout() {
 
   // A gateway return is read once, so a verifying screen replaces the Pay
   // button from the very first render: a buyer who just paid must never see
-  // a live Pay button while the server confirms.
-  const [gatewayReturn] = useState(() => readGatewayReturn(id));
+  // a live Pay button while the server confirms. Razorpay's modal reports a
+  // captured payment later, through the same state.
+  const [gatewayReturn, setGatewayReturn] = useState(() => readGatewayReturn(id));
   // open | verifying | verify_error | paid | failed | processing
   const [status, setStatus] = useState(() => (gatewayReturn ? "verifying" : "open"));
   const [paymentStatus, setPaymentStatus] = useState(null);
@@ -229,10 +250,12 @@ export default function Checkout() {
       });
   }, [id, gatewayReturn]);
 
-  const startedRef = useRef(false);
+  // Verify each return once: StrictMode's second effect pass sees the same
+  // object and is skipped.
+  const startedRef = useRef(null);
   useEffect(() => {
-    if (!gatewayReturn || startedRef.current) return;
-    startedRef.current = true;
+    if (!gatewayReturn || startedRef.current === gatewayReturn) return;
+    startedRef.current = gatewayReturn;
     runVerify();
   }, [gatewayReturn, runVerify]);
 
@@ -246,6 +269,7 @@ export default function Checkout() {
   const handleRetryPayment = () => {
     window.history.replaceState(null, "", window.location.pathname);
     forgetMoyasarPayment(id);
+    setGatewayReturn(null);
     setOrder(null);
     setError(null);
     setPaymentStatus(null);
@@ -261,8 +285,11 @@ export default function Checkout() {
 
   const openRazorpay = async (rzpOrder) => {
     if (!rzpOrder) return;
+    // checkout.js is unversioned and often fetched over slow mobile links, so
+    // it gets twice the default timeout.
     const ok = await loadExternalScript(RAZORPAY_JS, {
       isReady: () => !!window.Razorpay,
+      timeoutMs: 2 * SCRIPT_TIMEOUT_MS,
     });
     if (!ok || !window.Razorpay) {
       setError(t.razorpayLoadError);
@@ -276,38 +303,18 @@ export default function Checkout() {
       name: "Recurso",
       description: `Invoice ${invoice?.invoice_number || ""}`,
       theme: { color: "#10b981" },
-      handler: async (resp) => {
-        // Verify server-side (signature + order↔invoice bind) then settle.
-        let vres;
-        try {
-          vres = await fetch(`${API_BASE}/checkout/${id}/razorpay/verify`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              razorpay_order_id: resp.razorpay_order_id,
-              razorpay_payment_id: resp.razorpay_payment_id,
-              razorpay_signature: resp.razorpay_signature,
-            }),
-          });
-        } catch {
-          setError(t.errNetwork);
-          return;
-        }
-        const body = await vres.json().catch(() => ({}));
-        if (vres.ok && body.data?.status === "paid") {
-          setStatus("paid");
-        } else {
-          setError(
-            verifyErrorMessage(
-              t,
-              { status: vres.status, code: body?.error?.code },
-              {
-                invoiceNumber: invoice?.invoice_number,
-                paymentId: resp.razorpay_payment_id,
-              }
-            )
-          );
-        }
+      // The money is captured by now. Confirm it like a redirect return, so
+      // the Pay button is gone and a failed confirmation offers Check again
+      // with the same signature rather than a second payment.
+      handler: (resp) => {
+        setError(null);
+        setStatus("verifying");
+        setGatewayReturn({
+          gateway: "razorpay",
+          paymentId: resp.razorpay_payment_id,
+          orderId: resp.razorpay_order_id,
+          signature: resp.razorpay_signature,
+        });
       },
     });
     rzp.on("payment.failed", (r) =>
@@ -413,9 +420,13 @@ export default function Checkout() {
           title={t.verifyErrorTitle}
           alert
           actions={
-            <Button onClick={handleCheckAgain} size="lg" className="w-full">
-              {t.checkAgain}
-            </Button>
+            // Re-checking only helps when the failure may be transient; a
+            // missing invoice or a mismatched payment answers the same again.
+            verifyErrorRetryable(verifyError) && (
+              <Button onClick={handleCheckAgain} size="lg" className="w-full">
+                {t.checkAgain}
+              </Button>
+            )
           }
         >
           {verifyErrorMessage(t, verifyError, {
@@ -609,7 +620,7 @@ function StatusScreen({ tone, title, children, actions, busy, alert }) {
   return (
     <div
       className="text-center"
-      role={alert ? "alert" : busy ? "status" : undefined}
+      role={busy ? "status" : undefined}
       aria-busy={busy || undefined}
     >
       <div className={`mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full ${ring}`}>
@@ -622,7 +633,11 @@ function StatusScreen({ tone, title, children, actions, busy, alert }) {
       >
         {title}
       </h1>
-      <p className="mt-2 text-sm text-muted-foreground">{children}</p>
+      {/* The alert covers the message only, so a screen reader doesn't
+          announce the action buttons as part of it. */}
+      <p role={alert ? "alert" : undefined} className="mt-2 text-sm text-muted-foreground">
+        {children}
+      </p>
       {actions && <div className="mt-6">{actions}</div>}
     </div>
   );

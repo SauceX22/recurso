@@ -1,4 +1,4 @@
-import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, cleanup, fireEvent, act } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router";
 import { describe, it, expect, vi, afterEach } from "vitest";
 
@@ -101,6 +101,96 @@ describe("Checkout (money-critical public flow)", () => {
         renderAt("inv_1");
         fireEvent.click(await screen.findByRole("button", { name: /pay \$42\.00/i }));
         expect(await screen.findByText(/payment successful/i)).toBeInTheDocument();
+    });
+
+    describe("Razorpay", () => {
+        const rzpOrder = {
+            gateway: "razorpay",
+            order_id: "order_1",
+            amount: 1200,
+            currency: "INR",
+            razorpay_key_id: "rzp_test",
+        };
+        const rzpInvoice = invoice({ currency: "INR", amount_due: 1200, invoice_number: "INV-7" });
+        const signed = {
+            razorpay_order_id: "order_1",
+            razorpay_payment_id: "pay_rzp_1",
+            razorpay_signature: "sig_1",
+        };
+
+        // Razorpay's checkout.js, reduced to what the page uses: the options it
+        // was opened with, so a test can fire `handler` as the modal would.
+        let opened;
+        const stubRazorpay = () => {
+            opened = null;
+            window.Razorpay = function Razorpay(opts) {
+                this.on = vi.fn();
+                this.open = () => (opened = opts);
+            };
+        };
+
+        afterEach(() => {
+            delete window.Razorpay;
+        });
+
+        const payThenCapture = async (verifyResponses) => {
+            const verify = vi.fn(() => verifyResponses.shift()());
+            vi.stubGlobal(
+                "fetch",
+                vi.fn((url, opts) => {
+                    if (String(url).endsWith("/razorpay/verify")) return verify(url, opts);
+                    if (opts?.method === "POST") return json(200, { data: rzpOrder });
+                    return json(200, { data: rzpInvoice });
+                })
+            );
+            stubRazorpay();
+            renderAt("inv_rzp");
+            // The order amount is the source of truth for the button once /pay returns.
+            fireEvent.click(await screen.findByRole("button", { name: /pay ₹12\.00/i }));
+            await waitFor(() => expect(opened).not.toBeNull());
+            return verify;
+        };
+
+        it("confirms the captured payment on a verifying screen with no Pay button", async () => {
+            let resolveVerify;
+            const verify = await payThenCapture([() => new Promise((r) => (resolveVerify = r))]);
+            act(() => {
+                opened.handler(signed);
+            });
+            expect(await screen.findByText(/confirming your payment/i)).toBeInTheDocument();
+            expect(screen.queryByRole("button", { name: /pay/i })).not.toBeInTheDocument();
+            expect(JSON.parse(verify.mock.calls[0][1].body)).toEqual(signed);
+            await act(async () => resolveVerify({ ok: true, status: 200, json: () => Promise.resolve({ data: { status: "paid" } }) }));
+            expect(await screen.findByText(/payment successful/i)).toBeInTheDocument();
+        });
+
+        it("offers Check again, not Pay, when verify fails, and re-posts the same signature", async () => {
+            const verify = await payThenCapture([
+                () => Promise.reject(new TypeError("Failed to fetch")),
+                () => json(200, { data: { status: "paid" } }),
+            ]);
+            act(() => {
+                opened.handler(signed);
+            });
+            expect(await screen.findByText(/couldn't reach the server/i)).toBeInTheDocument();
+            expect(screen.queryByRole("button", { name: /pay/i })).not.toBeInTheDocument();
+
+            fireEvent.click(screen.getByRole("button", { name: /check again/i }));
+            expect(await screen.findByText(/payment successful/i)).toBeInTheDocument();
+            expect(verify).toHaveBeenCalledTimes(2);
+            expect(JSON.parse(verify.mock.calls[1][1].body)).toEqual(signed);
+        });
+
+        it("says a settlement failure is on our side, not the buyer's", async () => {
+            await payThenCapture([
+                () => json(500, { error: { code: "internal_error", message: "failed to settle invoice" } }),
+            ]);
+            act(() => {
+                opened.handler(signed);
+            });
+            expect(await screen.findByText(/your payment went through/i)).toBeInTheDocument();
+            expect(screen.getByRole("button", { name: /check again/i })).toBeInTheDocument();
+        });
     });
 
     describe("returning from a Stripe bank redirect", () => {
