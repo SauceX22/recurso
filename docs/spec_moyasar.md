@@ -122,10 +122,12 @@ Every post-attempt write is conditional on the invoice still being open or
 past_due, so a payment that lands during the charge is never reverted.
 
 **Wallet auto-recharge.** The attempt number in the key advances only when the
-gateway answers (paid or declined), so a lost response replays the same charge
-whatever else changed on the wallet. Failed attempts back off 1h, 6h, then
-daily; a hard decline stops auto-recharge until the customer's saved method
-changes.
+gateway answers (paid or declined), so a lost response replays the same charge,
+for the amount frozen with the attempt (`recharge_amount`), whatever else
+changed on the wallet. Failed attempts back off 1h, 6h, then daily; a hard
+decline, or the 8th failure since the last success, stops auto-recharge until
+the customer's saved method changes. The decline email goes out on the first
+failure and when auto-recharge stops.
 
 ### Webhook (`POST /webhooks/moyasar`)
 

@@ -538,12 +538,17 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 	}
 	if !result.Success {
 		logChargeFailure(ctx, "wallet auto-recharge charge declined", result, nil, "wallet_id", w.ID, "provider", m.Provider)
+		failures := w.RechargeFailures + 1
 		blocked := ""
-		if result.Permanent {
+		if result.Permanent || failures >= maxRechargeFailures {
 			blocked = m.PaymentMethodRef
 		}
 		s.recordRechargeFailure(ctx, w, true, blocked)
-		s.notifyRechargeFailure(ctx, w, "payment failed")
+		// Tell the customer once when declines start, and once when
+		// auto-recharge stops; not on every backed-off retry in between.
+		if failures == 1 || blocked != "" {
+			s.notifyRechargeFailure(ctx, w, "payment failed")
+		}
 		return false
 	}
 
@@ -580,6 +585,11 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 	slog.InfoContext(ctx, "wallet auto-recharged", "wallet_id", w.ID, "amount", amount)
 	return true
 }
+
+// maxRechargeFailures caps failed recharges since the last success: the
+// decline that reaches it stops auto-recharge on that method until the
+// customer saves another (card networks limit reattempts on a declined card).
+const maxRechargeFailures = 8
 
 // rechargeBackoff is how long a wallet waits after its nth failed recharge in
 // a row: retrying a declined card every sweep breaks card-network retry rules

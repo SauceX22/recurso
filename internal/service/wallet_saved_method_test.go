@@ -136,7 +136,7 @@ func TestWalletRecharge_DeclineBacksOffAndAdvancesTheKey(t *testing.T) {
 	for _, tc := range []struct {
 		priorFailures int
 		wantWait      time.Duration
-	}{{0, time.Hour}, {1, 6 * time.Hour}, {2, 24 * time.Hour}, {7, 24 * time.Hour}} {
+	}{{0, time.Hour}, {1, 6 * time.Hour}, {2, 24 * time.Hour}, {maxRechargeFailures - 2, 24 * time.Hour}} {
 		svc, repo, _, _ := sarRechargeFixture()
 		repo.dueList[0].RechargeFailures = tc.priorFailures
 		charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: false, ErrorCode: "insufficient_funds"}}
@@ -300,5 +300,41 @@ func TestWalletRecharge_LostResponseReplaysTheChargedAmount(t *testing.T) {
 	}
 	if got := charger.reqs[2]; got.Amount != 60000 || got.IdempotencyKey == charger.reqs[0].IdempotencyKey {
 		t.Fatalf("next recharge = %+v, want 60000 under a new key", got)
+	}
+}
+
+// Soft declines are capped: card networks limit reattempts on a declined
+// card, so after maxRechargeFailures failed attempts since the last success
+// auto-recharge stops on that method until the customer saves another, as
+// for a hard decline. The customer hears about the first failure and about
+// the stop, not about every daily retry in between.
+func TestWalletRecharge_SoftDeclinesAreCapped(t *testing.T) {
+	for _, tc := range []struct {
+		priorFailures int
+		wantBlocked   bool
+		wantEmail     bool
+	}{
+		{0, false, true},
+		{1, false, false},
+		{maxRechargeFailures - 2, false, false},
+		{maxRechargeFailures - 1, true, true},
+	} {
+		svc, repo, _, _ := sarRechargeFixture()
+		repo.dueList[0].RechargeFailures = tc.priorFailures
+		notifier := &recordingNotifier{}
+		svc.SetNotifier(notifier)
+		charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: false, ErrorCode: "insufficient_funds"}}
+		svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
+
+		if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		o := repo.outcomes[0]
+		if blocked := o.BlockedMethodRef == "token_abc"; blocked != tc.wantBlocked || !o.Answered || o.Failures != tc.priorFailures+1 {
+			t.Fatalf("after %d prior failures: outcome = %+v, want blocked=%v", tc.priorFailures, o, tc.wantBlocked)
+		}
+		if emailed := len(notifier.to) == 1; emailed != tc.wantEmail || len(notifier.to) > 1 {
+			t.Fatalf("after %d prior failures: emails = %v, want emailed=%v", tc.priorFailures, notifier.to, tc.wantEmail)
+		}
 	}
 }
