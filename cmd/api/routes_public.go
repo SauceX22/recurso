@@ -162,17 +162,21 @@ func registerPublicRoutes(r *gin.Engine, h *publicHandlers) {
 	// Showing the page reads only the database. Paying checks the gateway for
 	// an earlier capture with the secret key (and creates an order), spending
 	// quota that renewals and retries share, so it is also bounded per invoice:
-	// rotating IPs past the per-IP limit cannot spend it without bound.
-	payPerInvoice := middleware.ParamRateLimitMiddleware(h.rdb, "checkout_pay", "id", 10, time.Minute)
+	// rotating IPs past the per-IP limit cannot spend it without bound. The
+	// per-invoice limiters key on the canonical invoice id (invoiceKey), so
+	// another spelling of the same id gets no fresh bucket.
+	payPerInvoice := middleware.ParamRateLimitMiddleware(h.rdb, "checkout_pay", invoiceKeyParam, 10, time.Minute)
 	r.GET("/checkout/:id", h.publicLimit, h.checkoutHandler.ShowCheckout)
-	r.POST("/checkout/:id/pay", h.publicLimit, payPerInvoice, h.checkoutHandler.InitiatePayment)
+	r.POST("/checkout/:id/pay", h.publicLimit, invoiceKey, payPerInvoice, h.checkoutHandler.InitiatePayment)
 	r.GET("/checkout/:id/success", h.publicLimit, h.checkoutHandler.CheckoutSuccess)
 	r.POST("/checkout/:id/razorpay/verify", h.publicLimit, h.checkoutHandler.RazorpayVerify)
 	// Each verify spends a secret-key read-back, so it is bounded per invoice
-	// and payment: re-posting one payment from rotating IPs gains nothing, and
-	// another caller's verifies (other payment ids) never use up the buyer's.
+	// and payment (re-posting one payment from rotating IPs gains nothing),
+	// and per invoice across all payment ids, since every fresh random
+	// payment id would otherwise get a fresh bucket.
 	verifyPerPayment := middleware.ParamRateLimitMiddleware(h.rdb, "checkout_verify", verifyKeyParam, 10, time.Minute)
-	r.POST("/checkout/:id/moyasar/verify", h.publicLimit, verifyKey, verifyPerPayment, h.checkoutHandler.MoyasarVerify)
+	verifyPerInvoice := middleware.ParamRateLimitMiddleware(h.rdb, "checkout_verify_invoice", invoiceKeyParam, verifyPerInvoiceLimit, time.Minute)
+	r.POST("/checkout/:id/moyasar/verify", h.publicLimit, invoiceKey, verifyKey, verifyPerPayment, verifyPerInvoice, h.checkoutHandler.MoyasarVerify)
 	r.POST("/payments/order", h.publicLimit, h.paymentHandler.CreateOrder)
 	// Recurso Cloud waitlist (ENG-12): public demand capture from the website.
 	r.POST("/waitlist", h.publicLimit, h.waitlistHandler.Join)
@@ -198,11 +202,32 @@ func registerPublicRoutes(r *gin.Engine, h *publicHandlers) {
 // verifyKeyParam is the path parameter verifyKey adds: "<invoice id>:<payment id>".
 const verifyKeyParam = "verify_key"
 
+// invoiceKeyParam is the path parameter invoiceKey adds: the canonical :id.
+const invoiceKeyParam = "invoice_key"
+
+// verifyPerInvoiceLimit caps verifies per invoice per minute across all
+// payment ids: above any real buyer's retries, but a bound on read-backs.
+const verifyPerInvoiceLimit = 30
+
+// invoiceKey adds the invoice_key parameter the per-invoice limiters key on:
+// :id in canonical form, since uuid.Parse accepts upper case, braces,
+// urn:uuid: and the undashed form for one invoice. An id that is not a UUID
+// is refused by the handler before any gateway call, so all of those share
+// one (empty) bucket.
+func invoiceKey(c *gin.Context) {
+	key := ""
+	if id, err := uuid.Parse(c.Param("id")); err == nil {
+		key = id.String()
+	}
+	c.Params = append(c.Params, gin.Param{Key: invoiceKeyParam, Value: key})
+}
+
 // maxVerifyBody bounds what verifyKey reads; a verify body is one payment id.
 const maxVerifyBody = 4 << 10
 
 // verifyKey adds the verify_key parameter the per-payment verify limiter keys
-// on, from :id and the body's payment_id, and restores the body for the
+// on, from invoice_key (set by invoiceKey, which runs first) and the body's
+// payment_id, and restores the body for the
 // handler. A payment id that is not a UUID is refused before any gateway
 // call, so all of those share one bucket.
 func verifyKey(c *gin.Context) {
@@ -221,5 +246,5 @@ func verifyKey(c *gin.Context) {
 			paymentID = id.String()
 		}
 	}
-	c.Params = append(c.Params, gin.Param{Key: verifyKeyParam, Value: c.Param("id") + ":" + paymentID})
+	c.Params = append(c.Params, gin.Param{Key: verifyKeyParam, Value: c.Param(invoiceKeyParam) + ":" + paymentID})
 }
