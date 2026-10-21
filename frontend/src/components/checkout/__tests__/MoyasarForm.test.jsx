@@ -95,6 +95,36 @@ describe("MoyasarForm", () => {
     expect(init).toHaveBeenCalledTimes(1);
   });
 
+  it("hides Moyasar's own save-card notice, and only it, when ours is shown", async () => {
+    // The markup Moyasar 2.3.0 renders with save_card: card inputs in a
+    // role="complementary" div, the notice in a role="complementary" <p>.
+    const renderVendorForm = ({ element }) => {
+      element.innerHTML =
+        '<div id="mysr"><div class="flex" role="complementary">card</div>' +
+        '<p class="flex items-center text-xs" role="complementary">You card data will be saved upon submit.</p></div>';
+    };
+    await mountWith(vi.fn(renderVendorForm), { order: { ...order, save_card: true } });
+    const notice = await screen.findByText(/saved upon submit/);
+
+    // jsdom's cascade ignores specificity, so check the rule itself: it must
+    // match the notice, not the inputs, and be !important to beat Moyasar's
+    // `div#mysr .flex{display:flex!important}`.
+    const rule = [...document.styleSheets]
+      .flatMap((s) => [...s.cssRules])
+      .find((r) => r.style?.display === "none" && r.selectorText?.includes("mysr"));
+    expect(rule).toBeDefined();
+    expect(rule.style.getPropertyPriority("display")).toBe("important");
+    expect(notice.matches(rule.selectorText)).toBe(true);
+    expect(screen.getByText("card").matches(rule.selectorText)).toBe(false);
+  });
+
+  it("leaves Moyasar's markup alone when the card isn't saved", async () => {
+    const init = vi.fn();
+    const { container } = await mountWith(init);
+    await waitFor(() => expect(init).toHaveBeenCalledTimes(1));
+    expect(container.querySelector(".mysr-form")).not.toHaveAttribute("data-own-consent");
+  });
+
   it("stores the payment id from on_completed and clears a stale error on the next attempt", async () => {
     const init = vi.fn();
     await mountWith(init);

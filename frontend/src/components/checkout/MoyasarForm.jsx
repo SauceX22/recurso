@@ -11,6 +11,7 @@ import {
   MOYASAR_JS_INTEGRITY,
   rememberMoyasarPayment,
 } from "./moyasarAssets";
+import "./MoyasarForm.css";
 
 const DEFAULT_METHODS = ["creditcard"];
 const DEFAULT_NETWORKS = ["mada", "visa", "mastercard"];
@@ -153,6 +154,7 @@ export default function MoyasarForm({ order, invoiceId, locale, t }) {
         ref={containerRef}
         className="mysr-form"
         aria-label={t.cardForm}
+        data-own-consent={saveCard || undefined}
         hidden={status !== "ready"}
       />
     </div>
