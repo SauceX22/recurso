@@ -16,7 +16,7 @@ export function detectCheckoutLocale(nav = typeof navigator !== "undefined" ? na
 // isolate wraps a left-to-right value (an amount, a Latin name) in Unicode
 // first-strong isolates so it keeps its own direction inside Arabic text:
 // "-SAR 20.00" must not render with the minus on the far side.
-export const isolate = (s) => `⁨${s}⁩`;
+export const isolate = (s) => `\u2068${s}\u2069`;
 
 const EN_UNITS = {
   day: ["day", "days"],

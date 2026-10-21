@@ -313,7 +313,7 @@ describe("Checkout — Moyasar embedded form", () => {
     // Money keeps its own direction inside the RTL layout.
     expect(screen.getByTestId("amount-due")).toHaveAttribute("dir", "ltr");
     expect(screen.getByText("المدفوع والرصيد المطبَّق").nextElementSibling).toHaveAttribute("dir", "ltr");
-    expect(pay.textContent).toMatch(/^ادفع ⁨.*80\.00⁩$/);
+    expect(pay.textContent).toMatch(/^ادفع \u2068.*80\.00\u2069$/);
     fireEvent.click(pay);
     const init = await loadMoyasar();
     await waitFor(() => expect(init).toHaveBeenCalledTimes(1));

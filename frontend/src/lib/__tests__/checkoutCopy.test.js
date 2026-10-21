@@ -68,8 +68,8 @@ describe("saveCardConsentText", () => {
 
   it("isolates the merchant and amount inside the Arabic sentence", () => {
     const text = saveCardConsentText(ar, terms);
-    expect(text).toContain("⁨Acme Gym⁩");
-    expect(text).toContain(`⁨${SAR99}⁩`);
+    expect(text).toContain("\u2068Acme Gym\u2069");
+    expect(text).toContain(`\u2068${SAR99}\u2069`);
     expect(text).toContain("تحل هذه البطاقة محل");
   });
 
