@@ -2,9 +2,7 @@ package handler
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/recurso-dev/recurso/internal/core/domain"
@@ -13,9 +11,9 @@ import (
 	"github.com/recurso-dev/recurso/internal/service"
 )
 
-// Shared fakes for the Moyasar checkout and webhook tests. Both handlers
-// settle through a real service.GatewaySettlementService and a real
-// MarkInvoicePaid; only the repositories and the gateway are faked.
+// Shared fakes for the Moyasar checkout and webhook tests. The handlers own
+// the HTTP mapping only; what settlement does to the invoice, the card and
+// dunning is tested in the service package, so here it is a recording fake.
 
 // fakePaymentReader returns its canned payment only for that payment's id,
 // so a test proves which id was fetched.
@@ -37,24 +35,15 @@ func (f *fakePaymentReader) FetchPayment(_ context.Context, id string) (*port.Ga
 	return &cp, nil
 }
 
-// fakeSettlementInvoices serves the unscoped lookup plus the reads and writes
-// settlement makes, recording the tenant each one ran under.
-type fakeSettlementInvoices struct {
+// fakeCheckoutInvoices serves the unscoped invoice lookup the public routes
+// make.
+type fakeCheckoutInvoices struct {
 	porttest.UnimplementedInvoiceRepository
-	inv *domain.Invoice
-	// settledElsewhere makes MarkPaid lose the race to another settler.
-	settledElsewhere bool
-	loadErr          error
-	markPaidErr      error
-
-	markPaidCalls  int
-	markPaidTenant uuid.UUID
-	getByIDTenant  any
-	claims         []string
-	claimTenant    uuid.UUID
+	inv     *domain.Invoice
+	loadErr error
 }
 
-func (r *fakeSettlementInvoices) GetByIDPublic(_ context.Context, id uuid.UUID) (*domain.Invoice, error) {
+func (r *fakeCheckoutInvoices) GetByIDPublic(_ context.Context, id uuid.UUID) (*domain.Invoice, error) {
 	if r.loadErr != nil {
 		return nil, r.loadErr
 	}
@@ -65,123 +54,84 @@ func (r *fakeSettlementInvoices) GetByIDPublic(_ context.Context, id uuid.UUID) 
 	return &cp, nil
 }
 
-func (r *fakeSettlementInvoices) GetByID(ctx context.Context, id uuid.UUID) (*domain.Invoice, error) {
-	r.getByIDTenant = ctx.Value(domain.TenantIDKey)
-	return r.GetByIDPublic(ctx, id)
+type settleCall struct {
+	invoiceID uuid.UUID
+	paymentID string
 }
 
-func (r *fakeSettlementInvoices) MarkPaid(_ context.Context, tenantID, _ uuid.UUID, paidAt time.Time) (bool, error) {
-	r.markPaidCalls++
-	r.markPaidTenant = tenantID
-	if r.markPaidErr != nil {
-		return false, r.markPaidErr
+// fakePaymentSettler records what the handlers ask of the settlement path and
+// answers with canned results.
+type fakePaymentSettler struct {
+	transitioned bool
+	err          error
+	savesCard    bool
+	terms        *service.CardOnFileTerms
+	settled      []settleCall
+
+	// The already-captured payment check; existing marks the invoice paid
+	// in the fixture's repository, as settling would.
+	existing      bool
+	existingErr   error
+	existingCalls int
+	invoices      *fakeCheckoutInvoices
+}
+
+func (f *fakePaymentSettler) SettleExistingPayment(_ context.Context, inv *domain.Invoice) (bool, error) {
+	f.existingCalls++
+	if f.existingErr != nil {
+		return false, f.existingErr
 	}
-	if r.settledElsewhere || r.inv.Status == domain.InvoiceStatusPaid {
-		return false, nil
+	if f.existing && f.invoices != nil && f.invoices.inv.ID == inv.ID {
+		f.invoices.inv.Status = domain.InvoiceStatusPaid
+		f.invoices.inv.AmountDue = 0
 	}
-	r.inv.Status = domain.InvoiceStatusPaid
-	r.inv.PaidAt = &paidAt
-	r.inv.AmountPaid = r.inv.Total
-	return true, nil
+	return f.existing, nil
 }
 
-func (r *fakeSettlementInvoices) ClaimGatewayPaymentID(_ context.Context, tenantID, _ uuid.UUID, paymentID string) (bool, error) {
-	r.claims = append(r.claims, paymentID)
-	r.claimTenant = tenantID
-	if r.inv.GatewayPaymentID != "" && r.inv.GatewayPaymentID != paymentID {
-		return false, nil
+func (f *fakePaymentSettler) Settle(_ context.Context, inv *domain.Invoice, p *port.GatewayPayment) (bool, error) {
+	f.settled = append(f.settled, settleCall{inv.ID, p.ID})
+	if f.err != nil {
+		return false, f.err
 	}
-	r.inv.GatewayPaymentID = paymentID
-	return true, nil
+	return f.transitioned, nil
 }
 
-type fakeSettlementSubs struct{ sub *domain.Subscription }
-
-func (f *fakeSettlementSubs) GetByID(_ context.Context, id uuid.UUID) (*domain.Subscription, error) {
-	if f.sub == nil || f.sub.ID != id {
-		return nil, errors.New("subscription not found")
-	}
-	return f.sub, nil
+func (f *fakePaymentSettler) CardOnFile(context.Context, *domain.Invoice) (bool, *service.CardOnFileTerms) {
+	return f.savesCard, f.terms
 }
 
-type savedGatewayCard struct {
-	ctxTenant            any
-	tenantID, customerID uuid.UUID
-	provider             domain.GatewayProvider
-	ref, brand, last4    string
-	expMonth, expYear    int
-}
-
-type fakeGatewayCards struct{ saved []savedGatewayCard }
-
-func (f *fakeGatewayCards) SetGatewayPaymentMethod(ctx context.Context, tenantID, customerID uuid.UUID, provider domain.GatewayProvider, ref, brand, last4 string, expMonth, expYear int) error {
-	f.saved = append(f.saved, savedGatewayCard{ctx.Value(domain.TenantIDKey), tenantID, customerID, provider, ref, brand, last4, expMonth, expYear})
-	return nil
-}
-
-type fakeCardTokens struct{}
-
-func (fakeCardTokens) FetchToken(context.Context, string) (int, int, error) { return 7, 2031, nil }
-
-type fakeDunningRecovery struct {
-	recovered []uuid.UUID
-	outcomes  []domain.DunningHistory
-}
-
-func (f *fakeDunningRecovery) MarkRecovered(_ context.Context, id uuid.UUID) error {
-	f.recovered = append(f.recovered, id)
-	return nil
-}
-
-func (f *fakeDunningRecovery) RecordOutcome(_ context.Context, h domain.DunningHistory) error {
-	f.outcomes = append(f.outcomes, h)
-	return nil
-}
-
-// moyasarSettlementFixture is an open SAR invoice of a renewing subscription
-// with 80.00 still due, and a paid tokenized payment of exactly that, wired
-// through the real settlement service.
-type moyasarSettlementFixture struct {
+// moyasarHandlerFixture is an open SAR invoice with 80.00 still due and a
+// paid payment of exactly that bound to it.
+type moyasarHandlerFixture struct {
 	inv      *domain.Invoice
-	sub      *domain.Subscription
 	payment  *port.GatewayPayment
 	reader   *fakePaymentReader
-	invoices *fakeSettlementInvoices
-	subs     *fakeSettlementSubs
-	cards    *fakeGatewayCards
-	dunning  *fakeDunningRecovery
-	settler  *service.GatewaySettlementService
+	invoices *fakeCheckoutInvoices
+	settler  *fakePaymentSettler
 }
 
-func newMoyasarSettlementFixture() *moyasarSettlementFixture {
-	sub := &domain.Subscription{ID: uuid.New(), Status: domain.SubscriptionStatusActive}
+func newMoyasarHandlerFixture() *moyasarHandlerFixture {
+	subID := uuid.New()
 	inv := &domain.Invoice{
-		ID: uuid.New(), TenantID: uuid.New(), CustomerID: uuid.New(), SubscriptionID: &sub.ID,
+		ID: uuid.New(), TenantID: uuid.New(), CustomerID: uuid.New(), SubscriptionID: &subID,
 		InvoiceNumber: "INV-42", Status: domain.InvoiceStatusOpen, Currency: "SAR",
 		Total: 10000, AmountPaid: 1500, CreditApplied: 500, AmountDue: 8000,
-		DunningActionID: "retry_24h", DunningContextKey: "ctx-key",
 	}
-	sub.TenantID = inv.TenantID
 	payment := &port.GatewayPayment{
 		ID: uuid.NewString(), Status: "paid", Amount: 8000, Currency: "SAR", InvoiceID: inv.ID.String(),
 		CardToken: "token_abc", CardBrand: "mada", CardLast4: "1010",
 	}
-	f := &moyasarSettlementFixture{
-		inv: inv, sub: sub, payment: payment,
+	invoices := &fakeCheckoutInvoices{inv: inv}
+	return &moyasarHandlerFixture{
+		inv: inv, payment: payment,
 		reader:   &fakePaymentReader{payment: payment},
-		invoices: &fakeSettlementInvoices{inv: inv},
-		subs:     &fakeSettlementSubs{sub: sub},
-		cards:    &fakeGatewayCards{},
-		dunning:  &fakeDunningRecovery{},
+		invoices: invoices,
+		settler:  &fakePaymentSettler{transitioned: true, savesCard: true, invoices: invoices},
 	}
-	subSvc := service.NewSubscriptionService(nil, f.invoices, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
-	f.settler = service.NewGatewaySettlementService(domain.GatewayMoyasar, subSvc, f.invoices, f.subs)
-	f.settler.SetCardSaving(f.cards, fakeCardTokens{})
-	f.settler.SetDunningRecovery(f.dunning, f.dunning)
-	return f
 }
 
-// wantSavedCard is the card the fixture's payment must store.
-func (f *moyasarSettlementFixture) wantSavedCard() savedGatewayCard {
-	return savedGatewayCard{f.inv.TenantID, f.inv.TenantID, f.inv.CustomerID, domain.GatewayMoyasar, "token_abc", "mada", "1010", 7, 2031}
+// settledOnce reports whether the fixture's payment was settled exactly once
+// against the fixture's invoice.
+func (f *moyasarHandlerFixture) settledOnce() bool {
+	return len(f.settler.settled) == 1 && f.settler.settled[0] == settleCall{f.inv.ID, f.payment.ID}
 }

@@ -91,6 +91,9 @@ type PortalAPIHandler struct {
 type cardUpdatePolicy interface {
 	Provider(ctx context.Context, customerID uuid.UUID, currency string) domain.GatewayProvider
 	SelfServe(provider domain.GatewayProvider) bool
+	// CardUpdateInvoice is the invoice whose payment saves a new card for a
+	// customer on provider, or uuid.Nil when none would.
+	CardUpdateInvoice(ctx context.Context, customerID uuid.UUID, provider domain.GatewayProvider) uuid.UUID
 }
 
 // SetCardUpdatePolicy wires the per-customer card-update routing. Nil-safe.
@@ -323,7 +326,13 @@ func (h *PortalAPIHandler) GetProfile(c *gin.Context) {
 	}
 
 	provider, supported := h.cardUpdateProvider(c.Request.Context(), customer.ID)
-	c.JSON(http.StatusOK, portalProfile{Customer: customer, PaymentMethodProvider: provider, CardUpdateSupported: supported})
+	profile := portalProfile{Customer: customer, PaymentMethodProvider: provider, CardUpdateSupported: supported}
+	if !supported {
+		if id := h.cardUpdate.CardUpdateInvoice(c.Request.Context(), customer.ID, provider); id != uuid.Nil {
+			profile.CardUpdateInvoiceID = &id
+		}
+	}
+	c.JSON(http.StatusOK, profile)
 }
 
 // portalProfile is the customer plus how the portal may update their card.
@@ -334,6 +343,9 @@ type portalProfile struct {
 	// CardUpdateSupported is false when the card must be replaced by paying
 	// an open invoice instead of the portal's update flow.
 	CardUpdateSupported bool `json:"card_update_supported"`
+	// CardUpdateInvoiceID is the invoice whose checkout saves the new card
+	// when CardUpdateSupported is false; null when no invoice would.
+	CardUpdateInvoiceID *uuid.UUID `json:"card_update_invoice_id"`
 }
 
 // portalUpdatePaymentMethodRequest carries the gateway-tokenized card metadata.

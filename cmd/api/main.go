@@ -1571,6 +1571,8 @@ func main() {
 		moyasarSettlement := service.NewGatewaySettlementService(domain.GatewayMoyasar, subscriptionService, invoiceRepo.(*db.InvoiceRepository), subscriptionRepo)
 		moyasarSettlement.SetCardSaving(customerRepo, moyasarGateway)
 		moyasarSettlement.SetDunningRecovery(dunningCampaignService, retryService)
+		moyasarSettlement.SetPaidPaymentLookup(moyasarGateway, paymentGateway.ProviderFor)
+		moyasarSettlement.SetCardOnFileTerms(planRepo, tenantRepo)
 		checkoutHandler.SetMoyasar(moyasarGateway, moyasarSettlement, os.Getenv("MOYASAR_PUBLISHABLE_KEY"))
 		webhookHandler.SetMoyasar(moyasarGateway, moyasarSettlement, os.Getenv("MOYASAR_WEBHOOK_SECRET"))
 	}

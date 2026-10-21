@@ -20,7 +20,7 @@ import (
 const moyasarTestSecret = "mysr_whsec_test"
 
 type moyasarWebhookFixture struct {
-	*moyasarSettlementFixture
+	*moyasarHandlerFixture
 	h     *WebhookHandler
 	dedup *mapDedup
 	logs  *bytes.Buffer
@@ -29,7 +29,7 @@ type moyasarWebhookFixture struct {
 func newMoyasarFixture(t *testing.T) *moyasarWebhookFixture {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	f := &moyasarWebhookFixture{moyasarSettlementFixture: newMoyasarSettlementFixture(), dedup: &mapDedup{}, logs: &bytes.Buffer{}}
+	f := &moyasarWebhookFixture{moyasarHandlerFixture: newMoyasarHandlerFixture(), dedup: &mapDedup{}, logs: &bytes.Buffer{}}
 	f.h = &WebhookHandler{
 		logger:       slog.New(slog.NewTextHandler(f.logs, nil)),
 		invoiceRepo:  f.invoices,
@@ -90,7 +90,7 @@ func TestMoyasarWebhook_UnconfiguredFailsClosed(t *testing.T) {
 			if w := f.deliver("ev1", "payment_paid"); w.Code != http.StatusServiceUnavailable {
 				t.Fatalf("got %d want 503", w.Code)
 			}
-			if len(f.reader.gotIDs) != 0 || f.invoices.markPaidCalls != 0 || f.dedup.marks != 0 {
+			if len(f.reader.gotIDs) != 0 || len(f.settler.settled) != 0 || f.dedup.marks != 0 {
 				t.Fatal("unconfigured webhook fetched, settled or was recorded")
 			}
 		})
@@ -104,7 +104,7 @@ func TestMoyasarWebhook_WrongSecretRejected(t *testing.T) {
 			if w := f.post(moyasarBody("ev1", "payment_paid", tc.secret, f.payment.ID)); w.Code != http.StatusUnauthorized {
 				t.Fatalf("got %d want 401", w.Code)
 			}
-			if len(f.reader.gotIDs) != 0 || f.dedup.marks != 0 || f.invoices.markPaidCalls != 0 {
+			if len(f.reader.gotIDs) != 0 || f.dedup.marks != 0 || len(f.settler.settled) != 0 {
 				t.Fatal("rejected webhook fetched, was recorded or settled")
 			}
 		})
@@ -139,20 +139,8 @@ func TestMoyasarWebhook_PaymentPaidSettles(t *testing.T) {
 	if len(f.reader.gotIDs) != 1 || f.reader.gotIDs[0] != f.payment.ID {
 		t.Fatalf("fetched %v, want [%s]", f.reader.gotIDs, f.payment.ID)
 	}
-	if f.invoices.markPaidCalls != 1 || f.invoices.markPaidTenant != f.inv.TenantID {
-		t.Fatalf("MarkPaid calls=%d tenant=%s, want 1 under %s", f.invoices.markPaidCalls, f.invoices.markPaidTenant, f.inv.TenantID)
-	}
-	if f.invoices.getByIDTenant != f.inv.TenantID {
-		t.Fatalf("MarkInvoicePaid ran under tenant %v, want %s", f.invoices.getByIDTenant, f.inv.TenantID)
-	}
-	if f.inv.Status != domain.InvoiceStatusPaid || f.inv.GatewayPaymentID != f.payment.ID || f.invoices.claimTenant != f.inv.TenantID {
-		t.Fatalf("invoice status=%s payment=%q claim tenant=%s", f.inv.Status, f.inv.GatewayPaymentID, f.invoices.claimTenant)
-	}
-	if len(f.cards.saved) != 1 || f.cards.saved[0] != f.wantSavedCard() {
-		t.Fatalf("saved cards = %+v, want [%+v]", f.cards.saved, f.wantSavedCard())
-	}
-	if len(f.dunning.recovered) != 1 || f.dunning.recovered[0] != f.inv.ID || len(f.dunning.outcomes) != 1 || f.dunning.outcomes[0].Outcome != "success" {
-		t.Fatalf("dunning recovery = %v / %+v, want one success for %s", f.dunning.recovered, f.dunning.outcomes, f.inv.ID)
+	if !f.settledOnce() {
+		t.Fatalf("settled %+v, want the payment once", f.settler.settled)
 	}
 	if f.dedup.marks != 1 {
 		t.Fatalf("dedup marks = %d, want 1", f.dedup.marks)
@@ -162,8 +150,8 @@ func TestMoyasarWebhook_PaymentPaidSettles(t *testing.T) {
 func TestMoyasarWebhook_LowerCaseCurrencySettles(t *testing.T) {
 	f := newMoyasarFixture(t)
 	f.payment.Currency = "sar"
-	if w := f.deliver("ev_lc", "payment_paid"); w.Code != http.StatusOK || f.inv.Status != domain.InvoiceStatusPaid {
-		t.Fatalf("got %d status %s, want settled", w.Code, f.inv.Status)
+	if w := f.deliver("ev_lc", "payment_paid"); w.Code != http.StatusOK || !f.settledOnce() {
+		t.Fatalf("got %d settled %+v, want settled", w.Code, f.settler.settled)
 	}
 }
 
@@ -174,52 +162,28 @@ func TestMoyasarWebhook_DuplicateDeliverySettlesOnce(t *testing.T) {
 			t.Fatalf("delivery %d: got %d want 200", i+1, w.Code)
 		}
 	}
-	if len(f.reader.gotIDs) != 1 || f.invoices.markPaidCalls != 1 || len(f.cards.saved) != 1 {
-		t.Fatalf("duplicate reprocessed: fetch=%d markPaid=%d cards=%d", len(f.reader.gotIDs), f.invoices.markPaidCalls, len(f.cards.saved))
+	if len(f.reader.gotIDs) != 1 || !f.settledOnce() {
+		t.Fatalf("duplicate reprocessed: fetch=%d settled=%d", len(f.reader.gotIDs), len(f.settler.settled))
 	}
 }
 
-// A redelivery under a new event id runs again but must not count the
-// recovery twice or move the recorded payment.
-func TestMoyasarWebhook_RedeliveryNewEventIDIsIdempotent(t *testing.T) {
+// A settlement that loses to another payment (or a redelivery under a new
+// event id) is still a handled delivery.
+func TestMoyasarWebhook_NoTransitionIsAcked(t *testing.T) {
 	f := newMoyasarFixture(t)
-	f.deliver("ev_a", "payment_paid")
-	if w := f.deliver("ev_b", "payment_paid"); w.Code != http.StatusOK {
-		t.Fatalf("second event: got %d want 200 (body %s)", w.Code, w.Body.String())
-	}
-	if f.inv.GatewayPaymentID != f.payment.ID {
-		t.Fatalf("recorded payment = %q, want %s", f.inv.GatewayPaymentID, f.payment.ID)
-	}
-	if len(f.dunning.recovered) != 1 || len(f.dunning.outcomes) != 1 {
-		t.Fatalf("dunning recovery counted %d/%d times, want once", len(f.dunning.recovered), len(f.dunning.outcomes))
+	f.settler.transitioned = false
+	if w := f.deliver("ev_b", "payment_paid"); w.Code != http.StatusOK || f.dedup.marks != 1 {
+		t.Fatalf("got %d marks %d, want 200 and recorded", w.Code, f.dedup.marks)
 	}
 }
 
-func TestMoyasarWebhook_SecondPaymentDoesNotOverwrite(t *testing.T) {
+// A paid invoice is still settled again, so a payment id lost between the
+// two writes gets recorded on redelivery.
+func TestMoyasarWebhook_PaidInvoiceStillSettles(t *testing.T) {
 	f := newMoyasarFixture(t)
 	f.inv.Status = domain.InvoiceStatusPaid
-	f.inv.GatewayPaymentID = "pay-A"
-	if w := f.deliver("ev_b", "payment_paid"); w.Code != http.StatusOK {
-		t.Fatalf("got %d want 200 (body %s)", w.Code, w.Body.String())
-	}
-	if f.inv.GatewayPaymentID != "pay-A" || len(f.cards.saved) != 0 || len(f.dunning.outcomes) != 0 {
-		t.Fatalf("second payment overwrote: payment=%q cards=%d outcomes=%d", f.inv.GatewayPaymentID, len(f.cards.saved), len(f.dunning.outcomes))
-	}
-}
-
-// An invoice settled before its payment id was recorded (a crash between the
-// two writes) still records it on redelivery.
-func TestMoyasarWebhook_PaidInvoiceWithoutRecordedPaymentRecordsIt(t *testing.T) {
-	f := newMoyasarFixture(t)
-	f.inv.Status = domain.InvoiceStatusPaid
-	if w := f.deliver("ev_r", "payment_paid"); w.Code != http.StatusOK {
-		t.Fatalf("got %d want 200", w.Code)
-	}
-	if f.inv.GatewayPaymentID != f.payment.ID || len(f.cards.saved) != 1 {
-		t.Fatalf("payment=%q cards=%d, want recorded and saved", f.inv.GatewayPaymentID, len(f.cards.saved))
-	}
-	if len(f.dunning.outcomes) != 0 {
-		t.Fatal("dunning recovery recorded without the paid transition")
+	if w := f.deliver("ev_r", "payment_paid"); w.Code != http.StatusOK || !f.settledOnce() {
+		t.Fatalf("got %d settled %+v, want one settle", w.Code, f.settler.settled)
 	}
 }
 
@@ -227,23 +191,12 @@ func TestMoyasarWebhook_InitiatedPaymentIsRedelivered(t *testing.T) {
 	f := newMoyasarFixture(t)
 	f.payment.Status = "initiated"
 	w := f.deliver("ev_i", "payment_paid")
-	if w.Code != http.StatusServiceUnavailable || f.dedup.marks != 0 || f.invoices.markPaidCalls != 0 {
-		t.Fatalf("got %d marks=%d markPaid=%d, want 503, unrecorded, unsettled", w.Code, f.dedup.marks, f.invoices.markPaidCalls)
+	if w.Code != http.StatusServiceUnavailable || f.dedup.marks != 0 || len(f.settler.settled) != 0 {
+		t.Fatalf("got %d marks=%d settled=%d, want 503, unrecorded, unsettled", w.Code, f.dedup.marks, len(f.settler.settled))
 	}
 	f.payment.Status = "paid"
-	if w := f.deliver("ev_i", "payment_paid"); w.Code != http.StatusOK || f.inv.Status != domain.InvoiceStatusPaid {
-		t.Fatalf("redelivery got %d status %s, want settled", w.Code, f.inv.Status)
-	}
-}
-
-func TestMoyasarWebhook_OneOffInvoiceSettlesWithoutSavingCard(t *testing.T) {
-	f := newMoyasarFixture(t)
-	f.inv.SubscriptionID = nil
-	if w := f.deliver("ev_o", "payment_paid"); w.Code != http.StatusOK || f.inv.Status != domain.InvoiceStatusPaid {
-		t.Fatalf("got %d status %s, want settled", w.Code, f.inv.Status)
-	}
-	if len(f.cards.saved) != 0 {
-		t.Fatalf("one-off invoice saved card %+v", f.cards.saved)
+	if w := f.deliver("ev_i", "payment_paid"); w.Code != http.StatusOK || !f.settledOnce() {
+		t.Fatalf("redelivery got %d settled %+v, want settled", w.Code, f.settler.settled)
 	}
 }
 
@@ -272,8 +225,8 @@ func TestMoyasarWebhook_UntrustedPaymentDoesNotSettle(t *testing.T) {
 			if got := ackReason(t, w); got != tc.reason {
 				t.Fatalf("reason = %q, want %q", got, tc.reason)
 			}
-			if f.invoices.markPaidCalls != 0 || len(f.invoices.claims) != 0 || len(f.cards.saved) != 0 {
-				t.Fatal("untrusted payment had effects")
+			if len(f.settler.settled) != 0 {
+				t.Fatal("untrusted payment settled")
 			}
 		})
 	}
@@ -286,7 +239,7 @@ func TestMoyasarWebhook_TransientFailuresAreRetried(t *testing.T) {
 	}{
 		"gateway fetch fails":    {func(f *moyasarWebhookFixture) { f.reader.err = errors.New("moyasar: 503") }, http.StatusBadGateway},
 		"invoice lookup fails":   {func(f *moyasarWebhookFixture) { f.invoices.loadErr = errors.New("db down") }, http.StatusInternalServerError},
-		"settlement write fails": {func(f *moyasarWebhookFixture) { f.invoices.markPaidErr = errors.New("db down") }, http.StatusInternalServerError},
+		"settlement write fails": {func(f *moyasarWebhookFixture) { f.settler.err = errors.New("db down") }, http.StatusInternalServerError},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -295,12 +248,13 @@ func TestMoyasarWebhook_TransientFailuresAreRetried(t *testing.T) {
 			if w := f.deliver("ev_retry", "payment_paid"); w.Code != tc.status {
 				t.Fatalf("got %d want %d", w.Code, tc.status)
 			}
-			if f.dedup.marks != 0 || len(f.cards.saved) != 0 {
-				t.Fatalf("failed delivery recorded (marks=%d) or saved a card", f.dedup.marks)
+			if f.dedup.marks != 0 {
+				t.Fatalf("failed delivery recorded (marks=%d)", f.dedup.marks)
 			}
-			f.reader.err, f.invoices.loadErr, f.invoices.markPaidErr = nil, nil, nil
-			if w := f.deliver("ev_retry", "payment_paid"); w.Code != http.StatusOK || f.inv.Status != domain.InvoiceStatusPaid || f.dedup.marks != 1 {
-				t.Fatalf("redelivery got %d status %s marks %d, want settled and recorded", w.Code, f.inv.Status, f.dedup.marks)
+			f.reader.err, f.invoices.loadErr, f.settler.err = nil, nil, nil
+			f.settler.settled = nil
+			if w := f.deliver("ev_retry", "payment_paid"); w.Code != http.StatusOK || !f.settledOnce() || f.dedup.marks != 1 {
+				t.Fatalf("redelivery got %d settled %+v marks %d, want settled and recorded", w.Code, f.settler.settled, f.dedup.marks)
 			}
 		})
 	}
@@ -320,7 +274,7 @@ func TestMoyasarWebhook_DedupStoreDownFailsClosed(t *testing.T) {
 	if w := f.deliver("ev_down", "payment_paid"); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("dedup down: got %d want 503", w.Code)
 	}
-	if len(f.reader.gotIDs) != 0 || f.invoices.markPaidCalls != 0 {
+	if len(f.reader.gotIDs) != 0 || len(f.settler.settled) != 0 {
 		t.Fatal("dedup outage processed the event")
 	}
 }
@@ -330,8 +284,8 @@ func TestMoyasarWebhook_PaymentFailedAcked(t *testing.T) {
 	if w := f.deliver("ev_fail", "payment_failed"); w.Code != http.StatusOK {
 		t.Fatalf("got %d want 200", w.Code)
 	}
-	if f.invoices.markPaidCalls != 0 || f.inv.Status != domain.InvoiceStatusOpen || f.dedup.marks != 1 {
-		t.Fatalf("payment_failed: markPaid=%d status=%s marks=%d", f.invoices.markPaidCalls, f.inv.Status, f.dedup.marks)
+	if len(f.settler.settled) != 0 || f.dedup.marks != 1 {
+		t.Fatalf("payment_failed: settled=%d marks=%d", len(f.settler.settled), f.dedup.marks)
 	}
 }
 
@@ -344,8 +298,8 @@ func TestMoyasarWebhook_ReversalOfSettledPaymentIsFlagged(t *testing.T) {
 			if w := f.deliver("ev_"+typ, typ); w.Code != http.StatusOK {
 				t.Fatalf("got %d want 200", w.Code)
 			}
-			if f.invoices.markPaidCalls != 0 || len(f.reader.gotIDs) != 1 {
-				t.Fatalf("markPaid=%d fetches=%d, want 0/1", f.invoices.markPaidCalls, len(f.reader.gotIDs))
+			if len(f.settler.settled) != 0 || len(f.reader.gotIDs) != 1 {
+				t.Fatalf("settled=%d fetches=%d, want 0/1", len(f.settler.settled), len(f.reader.gotIDs))
 			}
 			logs := f.logs.String()
 			if !strings.Contains(logs, "level=WARN") || !strings.Contains(logs, "refunded_amount=8000") || !strings.Contains(logs, f.inv.ID.String()) {
@@ -370,7 +324,7 @@ func TestMoyasarWebhook_UnhandledEventsIgnored(t *testing.T) {
 	if w := f.deliver("ev_cauth", "card_auth_failed"); w.Code != http.StatusOK {
 		t.Fatalf("got %d want 200", w.Code)
 	}
-	if f.invoices.markPaidCalls != 0 || len(f.reader.gotIDs) != 0 {
+	if len(f.settler.settled) != 0 || len(f.reader.gotIDs) != 0 {
 		t.Fatal("unhandled event fetched or settled")
 	}
 }

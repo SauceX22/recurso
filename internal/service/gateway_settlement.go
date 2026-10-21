@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/recurso-dev/recurso/internal/core/domain"
@@ -51,6 +50,12 @@ type settlementSubscriptionReader interface {
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.Subscription, error)
 }
 
+// settlementPlanReader reads a plan under the tenant in ctx. Satisfied by
+// *db.PlanRepository.
+type settlementPlanReader interface {
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.Plan, error)
+}
+
 // gatewayMethodSaver stores a reusable gateway card as the customer's
 // off-session method. Satisfied by *db.CustomerRepository.
 type gatewayMethodSaver interface {
@@ -61,6 +66,12 @@ type gatewayMethodSaver interface {
 // payment read-back does not carry.
 type cardTokenReader interface {
 	FetchToken(ctx context.Context, tokenID string) (expMonth, expYear int, err error)
+}
+
+// paidPaymentFinder finds a payment the gateway already captured for an
+// invoice in currency covering amount (net of refunds), or nil.
+type paidPaymentFinder interface {
+	FindPaidPayment(ctx context.Context, invoiceID, currency string, amount int64) (*port.GatewayPayment, error)
 }
 
 type dunningRecoveryMarker interface {
@@ -82,8 +93,11 @@ type GatewaySettlementService struct {
 	subs      settlementSubscriptionReader
 	cards     gatewayMethodSaver
 	tokens    cardTokenReader
-	campaigns dunningRecoveryMarker
-	outcomes  dunningOutcomeRecorder
+	recovery  *DunningSuccessRecorder
+	paid      paidPaymentFinder
+	routesTo  func(currency string) domain.GatewayProvider
+	plans     settlementPlanReader
+	merchants TenantLookup
 	logger    *slog.Logger
 }
 
@@ -109,22 +123,105 @@ func (s *GatewaySettlementService) SetCardSaving(cards gatewayMethodSaver, token
 // SetDunningRecovery wires the once-per-settlement dunning outcome: the
 // campaign is closed as recovered and the retry bandit is rewarded.
 func (s *GatewaySettlementService) SetDunningRecovery(campaigns dunningRecoveryMarker, outcomes dunningOutcomeRecorder) {
-	s.campaigns = campaigns
-	s.outcomes = outcomes
+	s.recovery = NewDunningSuccessRecorder(campaigns, outcomes)
+}
+
+// SetPaidPaymentLookup wires the check for a payment the gateway already
+// captured. routesTo names the gateway a currency is collected on; only
+// invoices routed to this service's gateway are looked up.
+func (s *GatewaySettlementService) SetPaidPaymentLookup(paid paidPaymentFinder, routesTo func(currency string) domain.GatewayProvider) {
+	s.paid = paid
+	s.routesTo = routesTo
+}
+
+// SettleExistingPayment settles inv from a payment the gateway already
+// captured for it, so a buyer whose earlier payment (a renewal whose answer
+// was lost, or a missed webhook) is not yet recorded is never asked to pay
+// again. It reports whether inv is now paid. A lookup error is returned: the
+// caller must not take a new payment it could not check against.
+func (s *GatewaySettlementService) SettleExistingPayment(ctx context.Context, inv *domain.Invoice) (bool, error) {
+	if s == nil || s.paid == nil || s.routesTo == nil ||
+		inv.Status == domain.InvoiceStatusPaid || inv.AmountDue <= 0 || s.routesTo(inv.Currency) != s.provider {
+		return false, nil
+	}
+	p, err := s.paid.FindPaidPayment(ctx, inv.ID.String(), inv.Currency, inv.AmountDue)
+	if err != nil || p == nil {
+		return false, err
+	}
+	s.logger.InfoContext(ctx, "invoice has a captured payment not yet recorded; settling it", "invoice_id", inv.ID, "payment_id", p.ID)
+	if _, err := s.Settle(ctx, inv, p); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // SavesCard reports whether paying inv may store the card for off-session
 // charges: only an invoice of a subscription that will renew again has
 // consented future charges. One-off invoices never save.
 func (s *GatewaySettlementService) SavesCard(ctx context.Context, inv *domain.Invoice) bool {
+	return s.renewingSubscription(ctx, inv) != nil
+}
+
+// renewingSubscription returns inv's subscription when paying inv may save
+// the card for its renewals, else nil.
+func (s *GatewaySettlementService) renewingSubscription(ctx context.Context, inv *domain.Invoice) *domain.Subscription {
 	if s == nil || s.cards == nil || s.subs == nil || inv.SubscriptionID == nil {
-		return false
+		return nil
 	}
 	sub, err := s.subs.GetByID(context.WithValue(ctx, domain.TenantIDKey, inv.TenantID), *inv.SubscriptionID)
-	if err != nil || sub == nil {
-		return false
+	if err != nil || sub == nil || sub.Status == domain.SubscriptionStatusCanceled || sub.CancelAtPeriodEnd {
+		return nil
 	}
-	return sub.Status != domain.SubscriptionStatusCanceled && !sub.CancelAtPeriodEnd
+	return sub
+}
+
+// CardOnFileTerms is the stored-credential agreement a checkout shows before
+// a payment that saves the card: who charges, how much, and how often, until
+// the customer cancels. Amount is this invoice's total in minor units, what
+// a renewal of the same plan charges; usage, discounts and plan changes can
+// move later renewals.
+type CardOnFileTerms struct {
+	Merchant      string `json:"merchant"`
+	Amount        int64  `json:"amount"`
+	Currency      string `json:"currency"`
+	Interval      string `json:"interval"`
+	IntervalCount int    `json:"interval_count"`
+}
+
+// SetCardOnFileTerms wires the plan and merchant reads the consent terms
+// need. Unset, checkouts save cards with the page's generic consent text.
+func (s *GatewaySettlementService) SetCardOnFileTerms(plans settlementPlanReader, merchants TenantLookup) {
+	s.plans = plans
+	s.merchants = merchants
+}
+
+// CardOnFile reports whether paying inv saves the card (as SavesCard) and,
+// when it does, the terms to disclose. terms is nil when any part of them
+// cannot be read: the page then shows its generic consent rather than a
+// half-filled agreement.
+func (s *GatewaySettlementService) CardOnFile(ctx context.Context, inv *domain.Invoice) (bool, *CardOnFileTerms) {
+	sub := s.renewingSubscription(ctx, inv)
+	if sub == nil {
+		return false, nil
+	}
+	if s.plans == nil || s.merchants == nil {
+		return true, nil
+	}
+	plan, err := s.plans.GetByID(context.WithValue(ctx, domain.TenantIDKey, inv.TenantID), sub.PlanID)
+	if err != nil || plan == nil || plan.IntervalUnit == "" {
+		return true, nil
+	}
+	tenant, err := s.merchants.GetByID(ctx, inv.TenantID)
+	if err != nil || tenant == nil || tenant.Name == "" {
+		return true, nil
+	}
+	return true, &CardOnFileTerms{
+		Merchant:      tenant.Name,
+		Amount:        inv.Total,
+		Currency:      strings.ToUpper(inv.Currency),
+		Interval:      string(plan.IntervalUnit),
+		IntervalCount: max(plan.IntervalCount, 1),
+	}
 }
 
 // Settle marks inv paid by p. The caller has already confirmed with the
@@ -166,7 +263,7 @@ func (s *GatewaySettlementService) Settle(ctx context.Context, inv *domain.Invoi
 	}
 
 	if transitioned {
-		s.recordDunningRecovery(tenantCtx, inv)
+		s.recovery.Record(tenantCtx, inv)
 	}
 	return transitioned, nil
 }
@@ -193,30 +290,5 @@ func (s *GatewaySettlementService) saveCard(ctx, tenantCtx context.Context, inv 
 	}
 	if err := s.cards.SetGatewayPaymentMethod(tenantCtx, inv.TenantID, inv.CustomerID, s.provider, p.CardToken, p.CardBrand, p.CardLast4, expMonth, expYear); err != nil {
 		log.ErrorContext(ctx, "failed to save card for off-session charges", "error", err)
-	}
-}
-
-func (s *GatewaySettlementService) recordDunningRecovery(ctx context.Context, inv *domain.Invoice) {
-	if s.campaigns != nil {
-		if err := s.campaigns.MarkRecovered(ctx, inv.ID); err != nil {
-			s.logger.ErrorContext(ctx, "failed to mark dunning campaign recovered", "invoice_id", inv.ID, "error", err)
-		}
-	}
-	if s.outcomes == nil || inv.DunningActionID == "" || inv.DunningContextKey == "" {
-		return
-	}
-	err := s.outcomes.RecordOutcome(ctx, domain.DunningHistory{
-		ID:            uuid.New(),
-		TenantID:      inv.TenantID,
-		InvoiceID:     inv.ID,
-		ContextKey:    inv.DunningContextKey,
-		ActionID:      inv.DunningActionID,
-		RetryInterval: int64(actionByID(inv.DunningActionID).Interval.Seconds()),
-		Outcome:       "success",
-		Reward:        1.0,
-		CreatedAt:     time.Now(),
-	})
-	if err != nil {
-		s.logger.ErrorContext(ctx, "failed to record dunning success outcome", "invoice_id", inv.ID, "error", err)
 	}
 }

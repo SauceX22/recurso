@@ -8,28 +8,36 @@ import (
 	"github.com/recurso-dev/recurso/internal/core/domain"
 )
 
-// customerInvoiceLister lists a customer's invoices, newest first. Satisfied
-// by *db.InvoiceRepository.
-type customerInvoiceLister interface {
-	GetByCustomerID(ctx context.Context, customerID uuid.UUID) ([]*domain.Invoice, error)
+// cardUpdateInvoiceReader is the bounded invoice reads the card-update policy
+// makes: the customer's latest invoice (its billing currency) and the
+// invoices whose payment would save the card. Satisfied by
+// *db.InvoiceRepository.
+type cardUpdateInvoiceReader interface {
+	GetByCustomerIDPaged(ctx context.Context, customerID uuid.UUID, limit, offset int) ([]*domain.Invoice, error)
+	ListCardSavingInvoices(ctx context.Context, customerID uuid.UUID, limit int) ([]*domain.Invoice, error)
 }
+
+// cardSavingCandidates bounds the card-saving scan; a customer rarely has more
+// than one open renewal invoice.
+const cardSavingCandidates = 10
 
 // PaymentMethodUpdatePolicy decides how a customer replaces the card their
 // renewals charge. The portal's self-serve flow saves a Stripe card; for a
 // gateway without a setup flow that would silently move the customer's
 // renewals off their gateway, so such customers replace the card by paying
-// an open invoice on the hosted checkout instead.
+// an open renewal invoice on the hosted checkout instead.
 type PaymentMethodUpdatePolicy struct {
 	methods     savedMethodLookup
-	invoices    customerInvoiceLister
+	invoices    cardUpdateInvoiceReader
 	providerFor func(currency string) domain.GatewayProvider
 	noSelfServe map[domain.GatewayProvider]bool
 }
 
 // NewPaymentMethodUpdatePolicy builds the policy. providerFor reports the
 // gateway a currency routes to (nil: unknown); noSelfServe lists the gateways
-// whose saved cards cannot be replaced from the portal.
-func NewPaymentMethodUpdatePolicy(methods savedMethodLookup, invoices customerInvoiceLister, providerFor func(currency string) domain.GatewayProvider, noSelfServe ...domain.GatewayProvider) *PaymentMethodUpdatePolicy {
+// whose saved cards cannot be replaced from the portal. With none listed
+// every customer is self-serve.
+func NewPaymentMethodUpdatePolicy(methods savedMethodLookup, invoices cardUpdateInvoiceReader, providerFor func(currency string) domain.GatewayProvider, noSelfServe ...domain.GatewayProvider) *PaymentMethodUpdatePolicy {
 	p := &PaymentMethodUpdatePolicy{methods: methods, invoices: invoices, providerFor: providerFor, noSelfServe: map[domain.GatewayProvider]bool{}}
 	for _, g := range noSelfServe {
 		p.noSelfServe[g] = true
@@ -55,13 +63,13 @@ func (p *PaymentMethodUpdatePolicy) Provider(ctx context.Context, customerID uui
 	if saved != "" && !p.SelfServe(saved) {
 		return saved
 	}
-	if currency == "" {
-		if inv := p.latestInvoice(ctx, customerID, false); inv != nil {
-			currency = inv.Currency
+	if currency == "" && p.invoices != nil {
+		if latest, err := p.invoices.GetByCustomerIDPaged(ctx, customerID, 1, 0); err == nil && len(latest) > 0 {
+			currency = latest[0].Currency
 		}
 	}
 	if currency != "" && p.providerFor != nil {
-		if routed := p.providerFor(currency); routed != "" && !p.SelfServe(routed) {
+		if routed := p.providerFor(currency); !p.SelfServe(routed) {
 			return routed
 		}
 	}
@@ -71,21 +79,40 @@ func (p *PaymentMethodUpdatePolicy) Provider(ctx context.Context, customerID uui
 	return domain.GatewayStripe
 }
 
+// CardUpdateInvoice returns the invoice whose payment replaces the card for a
+// customer governed by provider: the oldest open renewal invoice collected
+// on provider. uuid.Nil when provider is self-serve or no invoice would save
+// the card (the customer is asked for it at the next renewal).
+func (p *PaymentMethodUpdatePolicy) CardUpdateInvoice(ctx context.Context, customerID uuid.UUID, provider domain.GatewayProvider) uuid.UUID {
+	if p.SelfServe(provider) || p.invoices == nil {
+		return uuid.Nil
+	}
+	candidates, err := p.invoices.ListCardSavingInvoices(ctx, customerID, cardSavingCandidates)
+	if err != nil {
+		return uuid.Nil
+	}
+	for _, inv := range candidates {
+		if p.providerFor == nil || p.providerFor(inv.Currency) == provider {
+			return inv.ID
+		}
+	}
+	return uuid.Nil
+}
+
 // UpdatePaymentURL is the "update payment method" link for a recovery or
 // card-expiry email: the portal for self-serve customers, otherwise the
-// hosted checkout of invoiceID (or the customer's latest open invoice), whose
-// payment saves the new card. Falls back to the portal when there is no
-// invoice to pay.
+// hosted checkout of invoiceID (or the invoice CardUpdateInvoice picks),
+// whose payment saves the new card. Falls back to the portal, which explains
+// what happens, when there is no such invoice.
 func (p *PaymentMethodUpdatePolicy) UpdatePaymentURL(ctx context.Context, baseURL string, customerID uuid.UUID, currency string, invoiceID uuid.UUID) string {
 	base := strings.TrimRight(baseURL, "/")
 	portal := base + "/portal/login"
-	if p.SelfServe(p.Provider(ctx, customerID, currency)) {
+	provider := p.Provider(ctx, customerID, currency)
+	if p.SelfServe(provider) {
 		return portal
 	}
 	if invoiceID == uuid.Nil {
-		if inv := p.latestInvoice(ctx, customerID, true); inv != nil {
-			invoiceID = inv.ID
-		}
+		invoiceID = p.CardUpdateInvoice(ctx, customerID, provider)
 	}
 	if invoiceID == uuid.Nil {
 		return portal
@@ -101,28 +128,5 @@ func (p *PaymentMethodUpdatePolicy) savedProvider(ctx context.Context, customerI
 	if err != nil || m.PaymentMethodRef == "" {
 		return ""
 	}
-	if provider := m.Provider; provider != "" {
-		return provider
-	}
-	return domain.GatewayStripe
-}
-
-func (p *PaymentMethodUpdatePolicy) latestInvoice(ctx context.Context, customerID uuid.UUID, payableOnly bool) *domain.Invoice {
-	if p.invoices == nil {
-		return nil
-	}
-	invoices, err := p.invoices.GetByCustomerID(ctx, customerID)
-	if err != nil {
-		return nil
-	}
-	for _, inv := range invoices {
-		switch {
-		case inv.Status == domain.InvoiceStatusVoid || inv.Status == domain.InvoiceStatusDraft:
-		case !payableOnly:
-			return inv
-		case inv.Status == domain.InvoiceStatusOpen || inv.Status == domain.InvoiceStatusPastDue:
-			return inv
-		}
-	}
-	return nil
+	return m.Provider
 }
