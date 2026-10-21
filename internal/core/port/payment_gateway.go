@@ -92,7 +92,6 @@ type GatewayPayment struct {
 	CardToken      string // reusable token created with this payment ("" if none)
 	CardBrand      string // e.g. "mada", "visa"
 	CardLast4      string
-	Message        string // gateway result message (decline reason)
 }
 
 // RefundResult represents the outcome of a gateway refund call.

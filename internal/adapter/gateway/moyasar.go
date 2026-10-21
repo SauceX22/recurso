@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net/http"
@@ -33,8 +34,10 @@ type MoyasarGateway struct {
 	checkoutBaseURL string
 	baseURL         string
 	httpClient      *http.Client
-	// refundLocks serializes refunds per payment id (*sync.Mutex values).
-	refundLocks sync.Map
+	// refundLocks serializes refunds of one payment: a payment id hashes to
+	// one of a fixed set of mutexes, so memory stays bounded (two payments
+	// sharing a stripe merely wait for each other).
+	refundLocks [64]sync.Mutex
 }
 
 var _ port.PaymentGateway = (*MoyasarGateway)(nil)
@@ -188,7 +191,6 @@ func (p *moyasarPayment) toGatewayPayment() *port.GatewayPayment {
 		CardToken:      p.Source.Token,
 		CardBrand:      p.Source.Company,
 		CardLast4:      lastFourDigits(p.Source.Number),
-		Message:        p.Source.Message,
 	}
 }
 
@@ -487,9 +489,11 @@ func (g *MoyasarGateway) Refund(ctx context.Context, paymentID string, amount in
 	if amount <= 0 {
 		return nil, fmt.Errorf("moyasar refund: amount must be positive, got %d", amount)
 	}
-	lock, _ := g.refundLocks.LoadOrStore(paymentID, &sync.Mutex{})
-	lock.(*sync.Mutex).Lock()
-	defer lock.(*sync.Mutex).Unlock()
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(paymentID))
+	lock := &g.refundLocks[h.Sum32()%uint32(len(g.refundLocks))]
+	lock.Lock()
+	defer lock.Unlock()
 
 	before, err := g.fetch(ctx, paymentID)
 	if err != nil {

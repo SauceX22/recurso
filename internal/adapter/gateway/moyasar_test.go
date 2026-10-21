@@ -935,7 +935,7 @@ func TestMoyasarFetchPaymentMapping(t *testing.T) {
 	want := port.GatewayPayment{
 		ID: moyasarPaymentID, Status: "paid", Amount: 60000, RefundedAmount: 2000,
 		Currency: "SAR", InvoiceID: "inv-7", CardToken: "token_x6okRgkZ",
-		CardBrand: "visa", CardLast4: "1111", Message: "APPROVED",
+		CardBrand: "visa", CardLast4: "1111",
 	}
 	if *p != want {
 		t.Fatalf("payment = %+v, want %+v", *p, want)
