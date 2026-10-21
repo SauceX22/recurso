@@ -178,6 +178,21 @@ describe("Checkout — Moyasar embedded form", () => {
     expect(MOYASAR_JS_INTEGRITY).toMatch(/^sha384-[A-Za-z0-9+/]{64}$/);
   });
 
+  it("renders the server's card-on-file terms as the consent, tied to the form", async () => {
+    mockFetch(
+      payResponse({
+        card_on_file: { merchant: "Acme Gym", amount: 9900, currency: "SAR", interval: "month", interval_count: 1 },
+      })
+    );
+    renderAt();
+    await startPayment();
+    const consent = await screen.findByText(
+      /authorise Acme Gym to save this card and charge it SAR 99\.00 every month until you cancel/
+    );
+    expect(consent).toHaveTextContent(/replaces any card already saved/);
+    expect(document.querySelector(".mysr-form")).toHaveAttribute("aria-describedby", consent.id);
+  });
+
   it("does not save the card or show consent when the server says save_card is false", async () => {
     mockFetch(payResponse({ save_card: false }));
     renderAt();

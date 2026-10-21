@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import * as Sentry from "@sentry/react";
 
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/patterns/LoadingSkeleton";
+import { saveCardConsentText } from "@/lib/checkoutCopy";
 import { loadStylesheet, useExternalScript } from "@/lib/useExternalScript";
 import {
   MOYASAR_CSS,
@@ -29,6 +30,7 @@ const moyasarReady = () => !!window.Moyasar;
  */
 export default function MoyasarForm({ order, invoiceId, locale, t }) {
   const containerRef = useRef(null);
+  const consentId = useId();
   const initedRef = useRef(false);
   const [formError, setFormError] = useState(null);
   // initFailed: Moyasar.init refused the config. attempt re-runs the init
@@ -133,8 +135,11 @@ export default function MoyasarForm({ order, invoiceId, locale, t }) {
   return (
     <div className="space-y-3">
       {saveCard && (
-        <p className="rounded-lg bg-muted px-3 py-3 text-sm text-foreground ring-1 ring-inset ring-border">
-          {t.saveCardConsent}
+        <p
+          id={consentId}
+          className="rounded-lg bg-muted px-3 py-3 text-sm text-foreground ring-1 ring-inset ring-border"
+        >
+          {saveCardConsentText(t, order.card_on_file)}
         </p>
       )}
       {formError && (
@@ -154,6 +159,7 @@ export default function MoyasarForm({ order, invoiceId, locale, t }) {
         ref={containerRef}
         className="mysr-form"
         aria-label={t.cardForm}
+        aria-describedby={saveCard ? consentId : undefined}
         data-own-consent={saveCard || undefined}
         hidden={status !== "ready"}
       />

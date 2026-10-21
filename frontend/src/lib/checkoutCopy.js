@@ -2,6 +2,8 @@
 // source; Arabic covers buyers whose browser prefers it. Gateways that render
 // their own UI (Moyasar) receive the same locale.
 
+import { formatCurrency } from "@/lib/utils";
+
 export const RTL_LOCALES = new Set(["ar"]);
 
 // detectCheckoutLocale picks the checkout language from the browser's
@@ -10,6 +12,27 @@ export function detectCheckoutLocale(nav = typeof navigator !== "undefined" ? na
   const preferred = nav?.languages?.[0] || nav?.language || "";
   return preferred.toLowerCase().startsWith("ar") ? "ar" : "en";
 }
+
+// isolate wraps a left-to-right value (an amount, a Latin name) in Unicode
+// first-strong isolates so it keeps its own direction inside Arabic text:
+// "-SAR 20.00" must not render with the minus on the far side.
+export const isolate = (s) => `⁨${s}⁩`;
+
+const EN_UNITS = {
+  day: ["day", "days"],
+  week: ["week", "weeks"],
+  month: ["month", "months"],
+  year: ["year", "years"],
+};
+
+const AR_UNITS = {
+  day: ["يوم", "يومين", "أيام", "يومًا"],
+  week: ["أسبوع", "أسبوعين", "أسابيع", "أسبوعًا"],
+  month: ["شهر", "شهرين", "أشهر", "شهرًا"],
+  year: ["سنة", "سنتين", "سنوات", "سنة"],
+};
+
+const UNIT_ALIASES = { daily: "day", weekly: "week", monthly: "month", yearly: "year", annual: "year", annually: "year" };
 
 const en = {
   loading: "Loading checkout",
@@ -72,6 +95,12 @@ const en = {
 
   saveCardConsent:
     "By paying, you agree that your card will be saved and charged automatically for future renewals of this subscription.",
+  cardOnFileConsent: ({ merchant, amount, period }) =>
+    `By paying, you authorise ${merchant} to save this card and charge it ${amount} ${period} until you cancel. This card replaces any card already saved for this subscription. You can cancel at any time from your billing portal.`,
+  every: (unit, count) => {
+    const [one, many] = EN_UNITS[unit];
+    return count === 1 ? `every ${one}` : `every ${count} ${many}`;
+  },
   cardForm: "Card details",
   cardFormLoading: "Loading the card form",
   cardFormLoadError: "The card form didn't load. Check your connection and retry.",
@@ -136,6 +165,16 @@ const ar = {
 
   saveCardConsent:
     "بإتمام الدفع، توافق على حفظ بطاقتك وخصم مبالغ التجديدات القادمة لهذا الاشتراك منها تلقائيًا.",
+  cardOnFileConsent: ({ merchant, amount, period }) =>
+    `بإتمام الدفع، تفوّض ${isolate(merchant)} بحفظ هذه البطاقة وخصم ${isolate(amount)} منها ${period} حتى تلغي الاشتراك. تحل هذه البطاقة محل أي بطاقة محفوظة سابقًا لهذا الاشتراك. يمكنك الإلغاء في أي وقت من بوابة الفوترة.`,
+  // Arabic counts take the dual for 2, the plural for 3–10 and the
+  // accusative singular from 11.
+  every: (unit, count) => {
+    const [one, two, few, many] = AR_UNITS[unit];
+    if (count === 1) return `كل ${one}`;
+    if (count === 2) return `كل ${two}`;
+    return `كل ${count} ${count <= 10 ? few : many}`;
+  },
   cardForm: "بيانات البطاقة",
   cardFormLoading: "جارٍ تحميل نموذج البطاقة",
   cardFormLoadError: "لم يتم تحميل نموذج البطاقة. تحقق من اتصالك وحاول مرة أخرى.",
@@ -147,6 +186,34 @@ const COPY = { en, ar };
 
 export function checkoutCopy(locale) {
   return COPY[locale] || en;
+}
+
+// saveCardConsentText is the stored-credential consent shown before a payment
+// that saves the card. `terms` is the server's card_on_file object
+// ({ merchant, amount, currency, interval, interval_count }); it names who
+// charges, how much and how often. Anything missing or unrecognised falls
+// back to the generic sentence rather than guessing.
+export function saveCardConsentText(t, terms) {
+  const merchant = typeof terms?.merchant === "string" ? terms.merchant.trim() : "";
+  const raw = typeof terms?.interval === "string" ? terms.interval.toLowerCase() : "";
+  const unit = UNIT_ALIASES[raw] || raw;
+  const count = terms?.interval_count ?? 1;
+  if (
+    !merchant ||
+    !Number.isInteger(terms?.amount) ||
+    terms.amount <= 0 ||
+    !terms?.currency ||
+    !EN_UNITS[unit] ||
+    !Number.isInteger(count) ||
+    count < 1
+  ) {
+    return t.saveCardConsent;
+  }
+  return t.cardOnFileConsent({
+    merchant,
+    amount: formatCurrency(terms.amount, terms.currency),
+    period: t.every(unit, count),
+  });
 }
 
 // verifyErrorMessage maps a failed confirmation call to buyer copy with a next
