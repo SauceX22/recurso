@@ -58,6 +58,18 @@ func NewGatewayResolver(vault ConnectionVault, env *SmartRouter) *GatewayResolve
 	}
 }
 
+// ProviderFor names the gateway that collects currency for the tenant in ctx:
+// the tenant's own router when it has connections, else the env routing (also
+// when ctx carries no tenant).
+func (r *GatewayResolver) ProviderFor(ctx context.Context, currency string) domain.GatewayProvider {
+	if tenantID, ok := ctx.Value(domain.TenantIDKey).(uuid.UUID); ok {
+		if tr := r.For(ctx, tenantID); tr != nil {
+			return tr.ProviderFor(currency)
+		}
+	}
+	return r.env.ProviderFor(currency)
+}
+
 // For returns the tenant's gateway. When the tenant has no active connection
 // (or the vault is unavailable), it returns nil so the caller falls back to the
 // env gateway (D1). A non-nil router always covers both provider slots — the

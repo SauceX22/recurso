@@ -158,7 +158,9 @@ func (w *RetryWorker) savedMethodCharger(ctx context.Context, inv *domain.Invoic
 	if !m.Chargeable() {
 		return nil, domain.SavedPaymentMethod{}, nil
 	}
-	charger, err := w.chargerRouter.ChargerFor(ctx, m, inv.Currency)
+	// The worker's ctx carries no tenant; gateway routing is per tenant.
+	tenantCtx := context.WithValue(ctx, domain.TenantIDKey, inv.TenantID)
+	charger, err := w.chargerRouter.ChargerFor(tenantCtx, m, inv.Currency)
 	if errors.Is(err, service.ErrSavedMethodNotChargeable) {
 		slog.Warn("retry: saved payment method can't be charged; using interactive retry",
 			"invoice_id", inv.ID, "provider", m.Provider, "error", err)

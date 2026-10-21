@@ -105,8 +105,20 @@ func (h *PortalAPIHandler) cardUpdateProvider(ctx context.Context, customerID uu
 	if h.cardUpdate == nil {
 		return domain.GatewayStripe, true
 	}
-	provider := h.cardUpdate.Provider(ctx, customerID, "")
+	provider := h.cardUpdate.Provider(h.customerTenantCtx(ctx, customerID), customerID, "")
 	return provider, h.cardUpdate.SelfServe(provider)
+}
+
+// customerTenantCtx adds the customer's tenant to ctx: portal requests carry
+// none, and gateway routing is per tenant (BYO connections).
+func (h *PortalAPIHandler) customerTenantCtx(ctx context.Context, customerID uuid.UUID) context.Context {
+	if h.portalService == nil {
+		return ctx
+	}
+	if cust, err := h.portalService.GetCustomer(ctx, customerID); err == nil && cust != nil {
+		return context.WithValue(ctx, domain.TenantIDKey, cust.TenantID)
+	}
+	return ctx
 }
 
 // rejectUnsupportedCardUpdate answers 409 card_update_unsupported when saving a
@@ -328,7 +340,8 @@ func (h *PortalAPIHandler) GetProfile(c *gin.Context) {
 	provider, supported := h.cardUpdateProvider(c.Request.Context(), customer.ID)
 	profile := portalProfile{Customer: customer, PaymentMethodProvider: provider, CardUpdateSupported: supported}
 	if !supported {
-		if id := h.cardUpdate.CardUpdateInvoice(c.Request.Context(), customer.ID, provider); id != uuid.Nil {
+		tenantCtx := context.WithValue(c.Request.Context(), domain.TenantIDKey, customer.TenantID)
+		if id := h.cardUpdate.CardUpdateInvoice(tenantCtx, customer.ID, provider); id != uuid.Nil {
 			profile.CardUpdateInvoiceID = &id
 		}
 	}

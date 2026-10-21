@@ -314,3 +314,32 @@ func TestResolverBYOStripeTenantKeepsSAROffPlatformMoyasar(t *testing.T) {
 		t.Fatalf("env router SAR provider: got %q want moyasar (unchanged)", got)
 	}
 }
+
+// The tenant-aware ProviderFor is what the saved-card guard, the card-update
+// policy and the checkout paid-payment check route on: a BYO-Stripe tenant's
+// SAR stays on Stripe, a tenant without a connection (or no tenant in ctx)
+// follows the env routing.
+func TestResolverProviderForUsesTheTenantInContext(t *testing.T) {
+	byoStripe, plain := uuid.New(), uuid.New()
+	vault := &fakeVault{conns: map[uuid.UUID][]*domain.GatewayConnection{
+		byoStripe: {{ID: uuid.New(), Provider: domain.GatewayStripe, SecretKeyEnc: "sk", Active: true, UpdatedAt: time.Unix(1, 0)}},
+	}}
+	resolver := newTestResolver(vault)
+	resolver.env.RegisterGateway("moyasar", &stubGateway{name: "env-moyasar"})
+	if err := resolver.env.SetCurrencyOverrides("SAR=moyasar"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		want domain.GatewayProvider
+	}{
+		{"BYO Stripe tenant", context.WithValue(context.Background(), domain.TenantIDKey, byoStripe), domain.GatewayStripe},
+		{"tenant without a connection", context.WithValue(context.Background(), domain.TenantIDKey, plain), domain.GatewayMoyasar},
+		{"no tenant", context.Background(), domain.GatewayMoyasar},
+	} {
+		if got := resolver.ProviderFor(tc.ctx, "SAR"); got != tc.want {
+			t.Errorf("%s: ProviderFor(SAR) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

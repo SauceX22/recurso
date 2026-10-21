@@ -110,7 +110,7 @@ type GatewaySettlementService struct {
 	tokens    cardTokenReader
 	recovery  *DunningSuccessRecorder
 	paid      paidPaymentFinder
-	routesTo  func(currency string) domain.GatewayProvider
+	routesTo  func(ctx context.Context, currency string) domain.GatewayProvider
 	plans     settlementPlanReader
 	merchants TenantLookup
 	logger    *slog.Logger
@@ -144,7 +144,7 @@ func (s *GatewaySettlementService) SetDunningRecovery(campaigns dunningRecoveryM
 // SetPaidPaymentLookup wires the check for a payment the gateway already
 // captured. routesTo names the gateway a currency is collected on; only
 // invoices routed to this service's gateway are looked up.
-func (s *GatewaySettlementService) SetPaidPaymentLookup(paid paidPaymentFinder, routesTo func(currency string) domain.GatewayProvider) {
+func (s *GatewaySettlementService) SetPaidPaymentLookup(paid paidPaymentFinder, routesTo func(ctx context.Context, currency string) domain.GatewayProvider) {
 	s.paid = paid
 	s.routesTo = routesTo
 }
@@ -155,8 +155,11 @@ func (s *GatewaySettlementService) SetPaidPaymentLookup(paid paidPaymentFinder, 
 // again. It reports whether inv is now paid. A lookup error is returned: the
 // caller must not take a new payment it could not check against.
 func (s *GatewaySettlementService) SettleExistingPayment(ctx context.Context, inv *domain.Invoice) (bool, error) {
-	if s == nil || s.paid == nil || s.routesTo == nil ||
-		!InvoicePayable(inv) || inv.AmountDue <= 0 || s.routesTo(inv.Currency) != s.provider {
+	if s == nil || s.paid == nil || s.routesTo == nil || !InvoicePayable(inv) || inv.AmountDue <= 0 {
+		return false, nil
+	}
+	// Public checkout requests carry no tenant; route as the invoice's tenant.
+	if s.routesTo(context.WithValue(ctx, domain.TenantIDKey, inv.TenantID), inv.Currency) != s.provider {
 		return false, nil
 	}
 	p, err := s.paid.FindPaidPayment(ctx, inv.ID.String(), inv.Currency, inv.AmountDue)

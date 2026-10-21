@@ -37,10 +37,10 @@ type gatewayConnectionOpener interface {
 	OpenSecret(conn *domain.GatewayConnection) (string, error)
 }
 
-// currencyProviders names the gateway that collects a currency. Satisfied by
-// *gateway.SmartRouter.
+// currencyProviders names the gateway that collects a currency for the tenant
+// in ctx. Satisfied by *gateway.GatewayResolver.
 type currencyProviders interface {
-	ProviderFor(currency string) domain.GatewayProvider
+	ProviderFor(ctx context.Context, currency string) domain.GatewayProvider
 }
 
 // ErrSavedMethodNotChargeable means the saved method can never be charged
@@ -111,7 +111,7 @@ func (r *SavedCardGatewayRouter) ChargerFor(ctx context.Context, m domain.SavedP
 	if r.routes != nil {
 		// A Stripe card keeps reaching currencies whose gateway can't charge a
 		// saved method (INR on Razorpay, EUR on GoCardless), as it always has.
-		want := r.routes.ProviderFor(currency)
+		want := r.routes.ProviderFor(ctx, currency)
 		_, wantCharges := r.platform[want]
 		if want != m.Provider && (m.Provider != domain.GatewayStripe || wantCharges) {
 			return nil, fmt.Errorf("%w: %s method, %s routes to %s", ErrSavedMethodNotRoutable, m.Provider, currency, want)

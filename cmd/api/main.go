@@ -862,7 +862,7 @@ func main() {
 	// gateway the charge's currency routes to (never a Moyasar token on
 	// Stripe, or a Stripe card for a SAR invoice). Otherwise dunning and the
 	// pay link collect.
-	savedCardRouter.SetCurrencyRouting(paymentGateway)
+	savedCardRouter.SetCurrencyRouting(gatewayResolver)
 	retryWorker.SetSavedMethodCharging(customerRepo, savedCardRouter)
 	retryWorker.SetDunningCampaignService(dunningCampaignService)
 	// Successful retries settle through the same ledger-posting MarkInvoicePaid
@@ -1045,7 +1045,7 @@ func main() {
 	// Customers of a gateway without a portal card-setup flow update their card
 	// by paying an open invoice, so dunning, card-expiry and portal links go
 	// there instead of the Stripe portal.
-	cardUpdatePolicy := service.NewPaymentMethodUpdatePolicy(customerRepo, invoiceRepo.(*db.InvoiceRepository), paymentGateway.ProviderFor, noSelfServeCardUpdate...)
+	cardUpdatePolicy := service.NewPaymentMethodUpdatePolicy(customerRepo, invoiceRepo.(*db.InvoiceRepository), gatewayResolver.ProviderFor, noSelfServeCardUpdate...)
 
 	// Dunning Scheduler (P30 - payment retry and escalation)
 	dunningScheduler := scheduler.NewDunningScheduler(
@@ -1578,7 +1578,7 @@ func main() {
 		moyasarSettlement := service.NewGatewaySettlementService(domain.GatewayMoyasar, subscriptionService, invoiceRepo.(*db.InvoiceRepository), subscriptionRepo)
 		moyasarSettlement.SetCardSaving(customerRepo, moyasarGateway)
 		moyasarSettlement.SetDunningRecovery(dunningCampaignService, retryService)
-		moyasarSettlement.SetPaidPaymentLookup(moyasarGateway, paymentGateway.ProviderFor)
+		moyasarSettlement.SetPaidPaymentLookup(moyasarGateway, gatewayResolver.ProviderFor)
 		moyasarSettlement.SetCardOnFileTerms(planRepo, tenantRepo)
 		checkoutHandler.SetMoyasar(moyasarGateway, moyasarSettlement, moyasarCfg.publishableKey)
 		webhookHandler.SetMoyasar(moyasarGateway, moyasarSettlement, moyasarCfg.webhookSecret)

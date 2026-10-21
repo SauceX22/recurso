@@ -42,7 +42,7 @@ func (f *fakeCustomerInvoices) ListCardSavingInvoices(_ context.Context, _ uuid.
 
 // routeSAR mimics a deployment that routes SAR to the gateway without a
 // portal setup flow.
-func routeSAR(currency string) domain.GatewayProvider {
+func routeSAR(_ context.Context, currency string) domain.GatewayProvider {
 	if currency == "SAR" {
 		return domain.GatewayMoyasar
 	}

@@ -29,7 +29,7 @@ const cardSavingCandidates = 10
 type PaymentMethodUpdatePolicy struct {
 	methods     savedMethodLookup
 	invoices    cardUpdateInvoiceReader
-	providerFor func(currency string) domain.GatewayProvider
+	providerFor func(ctx context.Context, currency string) domain.GatewayProvider
 	noSelfServe map[domain.GatewayProvider]bool
 }
 
@@ -37,7 +37,7 @@ type PaymentMethodUpdatePolicy struct {
 // gateway a currency routes to (nil: unknown); noSelfServe lists the gateways
 // whose saved cards cannot be replaced from the portal. With none listed
 // every customer is self-serve.
-func NewPaymentMethodUpdatePolicy(methods savedMethodLookup, invoices cardUpdateInvoiceReader, providerFor func(currency string) domain.GatewayProvider, noSelfServe ...domain.GatewayProvider) *PaymentMethodUpdatePolicy {
+func NewPaymentMethodUpdatePolicy(methods savedMethodLookup, invoices cardUpdateInvoiceReader, providerFor func(ctx context.Context, currency string) domain.GatewayProvider, noSelfServe ...domain.GatewayProvider) *PaymentMethodUpdatePolicy {
 	p := &PaymentMethodUpdatePolicy{methods: methods, invoices: invoices, providerFor: providerFor, noSelfServe: map[domain.GatewayProvider]bool{}}
 	for _, g := range noSelfServe {
 		p.noSelfServe[g] = true
@@ -69,7 +69,7 @@ func (p *PaymentMethodUpdatePolicy) Provider(ctx context.Context, customerID uui
 		}
 	}
 	if currency != "" && p.providerFor != nil {
-		if routed := p.providerFor(currency); !p.SelfServe(routed) {
+		if routed := p.providerFor(ctx, currency); !p.SelfServe(routed) {
 			return routed
 		}
 	}
@@ -92,7 +92,7 @@ func (p *PaymentMethodUpdatePolicy) CardUpdateInvoice(ctx context.Context, custo
 		return uuid.Nil
 	}
 	for _, inv := range candidates {
-		if p.providerFor == nil || p.providerFor(inv.Currency) == provider {
+		if p.providerFor == nil || p.providerFor(ctx, inv.Currency) == provider {
 			return inv.ID
 		}
 	}

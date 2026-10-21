@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/recurso-dev/recurso/internal/core/domain"
 	"github.com/recurso-dev/recurso/internal/core/port"
 )
@@ -111,5 +113,24 @@ func TestGatewaySettlement_SettleExistingPaymentNilService(t *testing.T) {
 	var s *GatewaySettlementService
 	if settled, err := s.SettleExistingPayment(context.Background(), &domain.Invoice{}); settled || err != nil {
 		t.Fatalf("nil service = %v, %v", settled, err)
+	}
+}
+
+// Public checkout carries no tenant, so the routing check runs as the
+// invoice's tenant (a BYO-Stripe tenant's SAR never queries Moyasar).
+func TestGatewaySettlement_SettleExistingPaymentRoutesAsInvoiceTenant(t *testing.T) {
+	f := newSettlementFixture()
+	finder := &fakePaidPaymentFinder{found: f.payment}
+	var routedAs uuid.UUID
+	f.svc.SetPaidPaymentLookup(finder, func(ctx context.Context, currency string) domain.GatewayProvider {
+		routedAs, _ = ctx.Value(domain.TenantIDKey).(uuid.UUID)
+		return domain.GatewayStripe
+	})
+	settled, err := f.svc.SettleExistingPayment(context.Background(), f.inv)
+	if err != nil || settled || len(finder.calls) != 0 {
+		t.Fatalf("SettleExistingPayment = %v, %v, lookups %d; want no lookup for a Stripe-routed tenant", settled, err, len(finder.calls))
+	}
+	if routedAs != f.inv.TenantID {
+		t.Fatalf("routed as tenant %v, want the invoice's %v", routedAs, f.inv.TenantID)
 	}
 }

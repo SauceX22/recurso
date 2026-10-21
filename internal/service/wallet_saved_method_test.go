@@ -338,3 +338,29 @@ func TestWalletRecharge_SoftDeclinesAreCapped(t *testing.T) {
 		}
 	}
 }
+
+// tenantCapture records the tenant the routing guard was asked to route as.
+type tenantCapture struct{ got uuid.UUID }
+
+func (c *tenantCapture) ProviderFor(ctx context.Context, _ string) domain.GatewayProvider {
+	c.got, _ = ctx.Value(domain.TenantIDKey).(uuid.UUID)
+	return domain.GatewayMoyasar
+}
+
+// The recharge sweep runs on a background ctx; routing is per tenant (BYO
+// connections), so the guard must see the wallet's tenant.
+func TestWalletSavedMethod_RoutesAsTheWalletTenant(t *testing.T) {
+	svc, _, _, w := sarRechargeFixture()
+	moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: uuid.NewString()}}
+	router := moyasarRouter(moyasar)
+	routes := &tenantCapture{}
+	router.SetCurrencyRouting(routes)
+	svc.SetSavedMethodCharging(moyasarLookup(), router)
+
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if routes.got != w.TenantID {
+		t.Fatalf("routed as tenant %v, want the wallet's %v", routes.got, w.TenantID)
+	}
+}

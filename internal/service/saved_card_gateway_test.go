@@ -151,7 +151,7 @@ func TestSavedCardGatewayRouter_UnregisteredProviderRefused(t *testing.T) {
 // else to Stripe.
 type fixedRoutes map[string]domain.GatewayProvider
 
-func (f fixedRoutes) ProviderFor(currency string) domain.GatewayProvider {
+func (f fixedRoutes) ProviderFor(_ context.Context, currency string) domain.GatewayProvider {
 	if p, ok := f[currency]; ok {
 		return p
 	}
@@ -304,5 +304,35 @@ func TestSavedCardGatewayRouter_UnconfigurableBYOIsNotChargeable(t *testing.T) {
 		if _, err := tc.r.ChargerFor(context.Background(), tc.m, "USD"); !errors.Is(err, ErrSavedMethodNotChargeable) {
 			t.Errorf("%s: err = %v, want ErrSavedMethodNotChargeable", tc.name, err)
 		}
+	}
+}
+
+// tenantRoutes routes SAR to Stripe for one tenant (a BYO Stripe connection)
+// and to Moyasar for everyone else, keyed on the tenant in ctx.
+type tenantRoutes struct{ byoStripe uuid.UUID }
+
+func (r tenantRoutes) ProviderFor(ctx context.Context, currency string) domain.GatewayProvider {
+	if tid, _ := ctx.Value(domain.TenantIDKey).(uuid.UUID); currency == "SAR" && tid != r.byoStripe {
+		return domain.GatewayMoyasar
+	}
+	return domain.GatewayStripe
+}
+
+// The guard routes as the charge's tenant: a BYO-Stripe tenant's Stripe card
+// keeps charging SAR, while a platform tenant's Stripe card is refused for it.
+func TestSavedCardGatewayRouter_CurrencyGuardRoutesPerTenant(t *testing.T) {
+	stripe := &namedCharger{name: "stripe"}
+	r := NewSavedCardGatewayRouter(nil, nil, stripe)
+	r.RegisterProvider(domain.GatewayMoyasar, &namedCharger{name: "moyasar"})
+	byo := uuid.New()
+	r.SetCurrencyRouting(tenantRoutes{byoStripe: byo})
+
+	byoCtx := context.WithValue(context.Background(), domain.TenantIDKey, byo)
+	if got, err := r.ChargerFor(byoCtx, stripeMethod(nil), "SAR"); err != nil || got != stripe {
+		t.Fatalf("BYO-Stripe tenant, SAR: got %v, %v; want the stripe charger", got, err)
+	}
+	platformCtx := context.WithValue(context.Background(), domain.TenantIDKey, uuid.New())
+	if _, err := r.ChargerFor(platformCtx, stripeMethod(nil), "SAR"); !errors.Is(err, ErrSavedMethodNotRoutable) {
+		t.Fatalf("platform tenant, SAR: err = %v, want ErrSavedMethodNotRoutable", err)
 	}
 }

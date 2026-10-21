@@ -282,12 +282,14 @@ func (f *fakeCustomerLookup) GetSavedPaymentMethod(_ context.Context, _ uuid.UUI
 type fakeCardRouter struct {
 	charger   service.SavedCardCharger
 	gotConnID *uuid.UUID
+	gotTenant uuid.UUID
 	saw       bool
 	err       error
 }
 
-func (f *fakeCardRouter) ChargerFor(_ context.Context, m domain.SavedPaymentMethod, _ string) (service.SavedCardCharger, error) {
+func (f *fakeCardRouter) ChargerFor(ctx context.Context, m domain.SavedPaymentMethod, _ string) (service.SavedCardCharger, error) {
 	f.saw = true
+	f.gotTenant, _ = ctx.Value(domain.TenantIDKey).(uuid.UUID)
 	f.gotConnID = m.GatewayConnectionID
 	if f.err != nil {
 		return nil, f.err
@@ -320,6 +322,10 @@ func TestRetryWorker_ChargesOnRecordedGateway(t *testing.T) {
 
 	if !router.saw || router.gotConnID == nil || *router.gotConnID != connID {
 		t.Fatalf("router should be consulted with the saved connection %v, got %v", connID, router.gotConnID)
+	}
+	// Routing is per tenant (BYO connections); the sweep's ctx has none.
+	if router.gotTenant != inv.TenantID {
+		t.Fatalf("router routed as tenant %v, want the invoice's %v", router.gotTenant, inv.TenantID)
 	}
 	if byo.charges != 1 {
 		t.Fatalf("BYO gateway should be charged once, got %d", byo.charges)

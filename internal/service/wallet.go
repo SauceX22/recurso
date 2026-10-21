@@ -484,6 +484,8 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 	if s.lookup == nil || w.AutoRechargeAmount == nil || s.chargerRouter == nil {
 		return false
 	}
+	// The sweep runs on a background ctx; gateway routing is per tenant.
+	ctx = context.WithValue(ctx, domain.TenantIDKey, w.TenantID)
 	m, err := s.lookup.GetSavedPaymentMethod(ctx, w.CustomerID)
 	if err != nil {
 		slog.WarnContext(ctx, "wallet auto-recharge: saved payment method lookup failed", "wallet_id", w.ID, "error", err)
