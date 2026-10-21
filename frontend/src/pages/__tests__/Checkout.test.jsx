@@ -10,6 +10,7 @@ vi.mock("@stripe/stripe-js", () => ({ loadStripe: vi.fn(() => Promise.resolve(nu
 vi.mock("@stripe/react-stripe-js", () => ({
     Elements: ({ children }) => <div>{children}</div>,
     PaymentElement: () => <div data-testid="payment-element" />,
+    AddressElement: () => null,
     useStripe: () => null,
     useElements: () => null,
 }));
@@ -72,6 +73,26 @@ describe("Checkout (money-critical public flow)", () => {
         expect(await screen.findByRole("button", { name: /pay \$12\.00/i })).toBeInTheDocument();
         expect(screen.getByTestId("amount-due")).toHaveTextContent("$12.00");
         expect(screen.getByText("Paid or credited")).toBeInTheDocument();
+    });
+
+    it("labels the Stripe form with the amount the order will charge", async () => {
+        // The /pay order is the source of truth for what the card is charged;
+        // for a partly paid invoice that is the amount due, not the total.
+        vi.stubGlobal(
+            "fetch",
+            vi.fn((url, opts) =>
+                opts?.method === "POST"
+                    ? json(200, {
+                          data: { gateway: "stripe", client_secret: "cs_1", publishable_key: "pk_test", amount: 1200, currency: "USD" },
+                      })
+                    : json(200, { data: invoice({ amount_due: 1200 }) })
+            )
+        );
+        renderAt("inv_partial");
+        fireEvent.click(await screen.findByRole("button", { name: /pay \$12\.00/i }));
+        expect(await screen.findByTestId("payment-element")).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: /pay \$12\.00/i })).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: /\$42\.00/ })).not.toBeInTheDocument();
     });
 
     it("maps a /pay failure to buyer copy instead of the server string", async () => {
