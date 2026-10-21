@@ -43,10 +43,17 @@ type currencyProviders interface {
 	ProviderFor(currency string) domain.GatewayProvider
 }
 
+// ErrSavedMethodNotChargeable means the saved method can never be charged
+// off-session as things stand (its gateway isn't configured, its BYO
+// connection is gone or belongs to another gateway), so the caller falls back
+// to dunning and the pay link. Any other ChargerFor error is transient (the
+// connection store or vault failed) and worth retrying.
+var ErrSavedMethodNotChargeable = errors.New("saved payment method can't be charged off-session")
+
 // ErrSavedMethodNotRoutable means the saved method lives on a different
-// gateway than the one the charge's currency routes to. The charge is skipped
-// and the invoice is left to dunning and the pay link.
-var ErrSavedMethodNotRoutable = errors.New("saved payment method is not on the gateway for this currency")
+// gateway than the one the charge's currency routes to. It is a kind of
+// ErrSavedMethodNotChargeable.
+var ErrSavedMethodNotRoutable = fmt.Errorf("%w: not on the gateway for this currency", ErrSavedMethodNotChargeable)
 
 // SavedCardGatewayRouter returns the off-session charger a saved method must
 // be charged on. A method's reference is only valid on the gateway account
@@ -113,27 +120,27 @@ func (r *SavedCardGatewayRouter) ChargerFor(ctx context.Context, m domain.SavedP
 	if m.GatewayConnectionID == nil {
 		c := r.platform[m.Provider]
 		if c == nil {
-			return nil, fmt.Errorf("no platform charger configured for %s saved methods", m.Provider)
+			return nil, fmt.Errorf("%w: no platform charger configured for %s saved methods", ErrSavedMethodNotChargeable, m.Provider)
 		}
 		return c, nil
 	}
 	connID := *m.GatewayConnectionID
 	if r.conns == nil {
-		return nil, fmt.Errorf("saved-card gateway connection %s: no connection store configured", connID)
+		return nil, fmt.Errorf("%w: saved-card gateway connection %s: no connection store configured", ErrSavedMethodNotChargeable, connID)
 	}
 	conn, err := r.conns.GetByID(ctx, connID)
 	if err != nil {
 		return nil, fmt.Errorf("load saved-card gateway connection %s: %w", connID, err)
 	}
 	if conn == nil {
-		return nil, fmt.Errorf("saved-card gateway connection %s not found", connID)
+		return nil, fmt.Errorf("%w: saved-card gateway connection %s not found", ErrSavedMethodNotChargeable, connID)
 	}
 	if conn.Provider != m.Provider {
-		return nil, fmt.Errorf("saved-card gateway connection %s is %s, not %s", connID, conn.Provider, m.Provider)
+		return nil, fmt.Errorf("%w: saved-card gateway connection %s is %s, not %s", ErrSavedMethodNotChargeable, connID, conn.Provider, m.Provider)
 	}
 	build := r.build[conn.Provider]
 	if build == nil {
-		return nil, fmt.Errorf("saved-card gateway connection %s: %s connections can't charge saved methods", connID, conn.Provider)
+		return nil, fmt.Errorf("%w: saved-card gateway connection %s: %s connections can't charge saved methods", ErrSavedMethodNotChargeable, connID, conn.Provider)
 	}
 	secret, err := r.conns.OpenSecret(conn)
 	if err != nil || secret == "" {
@@ -156,10 +163,4 @@ func logChargeFailure(ctx context.Context, msg string, result *port.PaymentResul
 			"permanent", result.Permanent, "message", result.ErrorMsg)
 	}
 	slog.WarnContext(ctx, msg, attrs...)
-}
-
-// platformRouter is the router used when none is wired: platform Stripe
-// methods charge on c, everything else is refused.
-func platformRouter(c SavedCardCharger) savedChargerRouter {
-	return NewSavedCardGatewayRouter(nil, nil, c)
 }

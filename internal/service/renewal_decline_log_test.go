@@ -28,8 +28,7 @@ func TestRenewalDeclineLogsCodeAndPaymentID(t *testing.T) {
 	charger := &fakeRenewalCharger{result: &port.PaymentResult{
 		Success: false, PaymentID: "pay_declined_1", ErrorCode: "expired_card", Permanent: true, ErrorMsg: "EXPIRED CARD (response code 54)",
 	}}
-	svc.SetSavedMethodCharging(nil, moyasarLookup(), &fakeRenewalSettler{})
-	svc.SetChargerRouter(moyasarRouter(charger))
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger), &fakeRenewalSettler{})
 
 	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 		t.Fatal(err)

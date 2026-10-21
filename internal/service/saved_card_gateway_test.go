@@ -226,3 +226,44 @@ func TestSavedCardGatewayRouter_BYOConnectionWithoutStoreRefused(t *testing.T) {
 		t.Fatalf("BYO method without a connection store resolved to %#v; it must never charge the platform account", got)
 	}
 }
+
+// Callers retry a transient failure but give up on a method that can never be
+// charged as configured, so ChargerFor must say which one it is. A Moyasar
+// token pointing at a Stripe connection is never charged, and no charger is
+// built for it.
+func TestSavedCardGatewayRouter_ErrorKinds(t *testing.T) {
+	connID := uuid.New()
+	stripeConn := &domain.GatewayConnection{ID: connID, Provider: domain.GatewayStripe}
+	moyasarOnStripeConn := moyasarMethod()
+	moyasarOnStripeConn.GatewayConnectionID = &connID
+	for _, tc := range []struct {
+		name          string
+		opener        *fakeConnOpener
+		m             domain.SavedPaymentMethod
+		notChargeable bool
+	}{
+		{"connection store down", &fakeConnOpener{getErr: errors.New("timeout")}, stripeMethod(&connID), false},
+		{"secret can't be opened", &fakeConnOpener{conn: stripeConn, secErr: errors.New("vault sealed")}, stripeMethod(&connID), false},
+		{"connection gone", &fakeConnOpener{}, stripeMethod(&connID), true},
+		{"connection of another provider", &fakeConnOpener{conn: stripeConn, secret: "sk_x"}, moyasarOnStripeConn, true},
+		{"provider without a platform charger", &fakeConnOpener{}, moyasarMethod(), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			built := false
+			r := NewSavedCardGatewayRouter(tc.opener, func(string) SavedCardCharger { built = true; return &namedCharger{} }, &namedCharger{name: "stripe"})
+			got, err := r.ChargerFor(context.Background(), tc.m, "USD")
+			if err == nil || got != nil {
+				t.Fatalf("got (%#v, %v), want an error", got, err)
+			}
+			if errors.Is(err, ErrSavedMethodNotChargeable) != tc.notChargeable {
+				t.Fatalf("errors.Is(%v, ErrSavedMethodNotChargeable) = %v, want %v", err, !tc.notChargeable, tc.notChargeable)
+			}
+			if built {
+				t.Fatal("a charger was built although ChargerFor failed")
+			}
+		})
+	}
+	if !errors.Is(ErrSavedMethodNotRoutable, ErrSavedMethodNotChargeable) {
+		t.Fatal("a method on another gateway than the currency's must count as not chargeable")
+	}
+}

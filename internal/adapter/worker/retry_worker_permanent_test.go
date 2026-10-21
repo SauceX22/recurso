@@ -171,8 +171,7 @@ func TestRetryWorker_ProviderSavedMethodCharged(t *testing.T) {
 	router.RegisterProvider(domain.GatewayMoyasar, moyasar)
 
 	w := NewRetryWorker(repo, newTestRetryService(), gw, &mockNotifier{})
-	w.SetSavedMethodCharging(stripe, &fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_r"})
-	w.SetChargerRouter(router)
+	w.SetSavedMethodCharging(&fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_r"}, router)
 	w.processRetries(context.Background())
 
 	if moyasar.charges != 1 || gw.calls != 0 || stripe.charges != 0 {
@@ -200,7 +199,7 @@ func TestRetryWorker_UnchargeableMethodUsesInteractiveRetry(t *testing.T) {
 	stripe := &fakeSavedCharger{name: "stripe"}
 
 	w := NewRetryWorker(repo, newTestRetryService(), gw, &mockNotifier{})
-	w.SetSavedMethodCharging(stripe, &fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_r"})
+	w.SetSavedMethodCharging(&fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_r"}, service.NewSavedCardGatewayRouter(nil, nil, stripe))
 	w.processRetries(context.Background())
 
 	if stripe.charges != 0 || gw.calls != 1 || gw.lastAmount != 10000 {
@@ -261,8 +260,7 @@ func TestRetryWorker_RecordsSettlingPaymentID(t *testing.T) {
 			router.RegisterProvider(domain.GatewayMoyasar, moyasar)
 
 			w := NewRetryWorker(repo, newTestRetryService(), &mockGateway{}, &mockNotifier{})
-			w.SetSavedMethodCharging(nil, &fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_r"})
-			w.SetChargerRouter(router)
+			w.SetSavedMethodCharging(&fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_r"}, router)
 			w.SetSettler(fakeSettler{transitioned: tc.transitioned})
 			w.processRetries(context.Background())
 

@@ -338,7 +338,7 @@ func TestWalletAutoRecharge(t *testing.T) {
 	repo.dueList = []domain.Wallet{*w}
 
 	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: "pay_w1"}}
-	svc.SetSavedMethodCharging(charger, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"})
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, NewSavedCardGatewayRouter(nil, nil, charger))
 
 	recharged, err := svc.ProcessAutoRecharges(context.Background())
 	if err != nil {
@@ -367,7 +367,7 @@ func TestWalletAutoRecharge_ConcurrentSweepCreditsOnce(t *testing.T) {
 	repo.dueList = []domain.Wallet{*w}
 
 	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: "pay_w1"}}
-	svc.SetSavedMethodCharging(charger, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"})
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, NewSavedCardGatewayRouter(nil, nil, charger))
 
 	// Two sweeps fire back-to-back before either recharge drops the balance.
 	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
@@ -399,9 +399,8 @@ func TestWalletAutoRecharge_ChargesOnRecordedGateway(t *testing.T) {
 	platform := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
 	byo := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: "pay_byo"}}
 	connID := uuid.New()
-	svc.SetSavedMethodCharging(platform, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1", connID: &connID})
 	router := &fakeChargerRouter{charger: byo}
-	svc.SetChargerRouter(router)
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1", connID: &connID}, router)
 
 	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -421,7 +420,7 @@ func TestWalletAutoRechargeNoSavedMethodOnlyNotifies(t *testing.T) {
 	repo.dueList = []domain.Wallet{*w}
 
 	charger := &fakeRenewalCharger{}
-	svc.SetSavedMethodCharging(charger, &fakeRenewalLookup{}) // nothing saved
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{}, NewSavedCardGatewayRouter(nil, nil, charger)) // nothing saved
 
 	recharged, err := svc.ProcessAutoRecharges(context.Background())
 	if err != nil {

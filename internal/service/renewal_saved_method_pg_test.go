@@ -110,11 +110,10 @@ func TestRenewalSavedMethod_SettlesLedger_Postgres(t *testing.T) {
 	invoicer := &pgRenewalInvoicer{h: h, amount: 11500, currency: "SAR"}
 	svc := NewRenewalService(subRepo, db.NewPlanRepository(conn), invoicer)
 	// Stripe mocked in this deployment: no Stripe charger, settler wired.
-	svc.SetSavedMethodCharging(nil, custRepo, h.subSvc)
 	moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: uuid.NewString()}}
 	router := NewSavedCardGatewayRouter(nil, nil, nil)
 	router.RegisterProvider(domain.GatewayMoyasar, moyasar)
-	svc.SetChargerRouter(router)
+	svc.SetSavedMethodCharging(custRepo, router, h.subSvc)
 
 	// The unattended sweep's context carries no tenant; renewal must supply
 	// the subscription's own for the plan lookup and the settlement.

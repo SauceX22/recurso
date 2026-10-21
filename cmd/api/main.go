@@ -831,11 +831,9 @@ func main() {
 
 	// 6. Initialize Workers
 	retryWorker := worker.NewRetryWorker(invoiceRepo, retryService, tenantGateway, notifier)
-	// ENG-5 Phase 2: charge the customer's saved method off-session on retries.
-	// The mock gateway doesn't implement it, so platform Stripe cards stay on the
-	// interactive fallback until real Stripe keys are set.
+	// The mock gateway can't charge saved methods, so platform Stripe cards stay
+	// on the interactive retry until real Stripe keys are set.
 	stripeCharger, _ := stripeGateway.(service.SavedCardCharger)
-	retryWorker.SetSavedMethodCharging(stripeCharger, customerRepo)
 	// One router for every off-session charge (dunning retry, renewal, wallet
 	// auto-recharge): each saved method charges on the gateway that issued it —
 	// a BYO connection, or the platform account of its provider. Built in full
@@ -853,7 +851,7 @@ func main() {
 	// Stripe, or a Stripe card for a SAR invoice). Otherwise dunning and the
 	// pay link collect.
 	savedCardRouter.SetCurrencyRouting(paymentGateway)
-	retryWorker.SetChargerRouter(savedCardRouter)
+	retryWorker.SetSavedMethodCharging(customerRepo, savedCardRouter)
 	retryWorker.SetDunningCampaignService(dunningCampaignService)
 	retryWorker.SetRecoveryRecorder(dunningRecoveryService)
 	// Successful retries settle through the same ledger-posting MarkInvoicePaid
@@ -1112,11 +1110,9 @@ func main() {
 	// preserving period advance, best-effort saved-method payment.
 	// BILLING_CYCLE_INTERVAL=0 disables; default 5m.
 	renewalService := service.NewRenewalService(subscriptionRepo.(*db.SubscriptionRepository), planRepo, invoiceService)
-	renewalService.SetSavedMethodCharging(stripeCharger, customerRepo, subscriptionService)
+	renewalService.SetSavedMethodCharging(customerRepo, savedCardRouter, subscriptionService)
 	renewalService.SetPaymentRecorder(invoiceRepo)
-	walletService.SetSavedMethodCharging(stripeCharger, customerRepo)
-	renewalService.SetChargerRouter(savedCardRouter)
-	walletService.SetChargerRouter(savedCardRouter)
+	walletService.SetSavedMethodCharging(customerRepo, savedCardRouter)
 	var billingCycleScheduler *scheduler.BillingCycleScheduler
 	billingCycleInterval := 5 * time.Minute
 	if raw := os.Getenv("BILLING_CYCLE_INTERVAL"); raw != "" {

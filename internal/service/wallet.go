@@ -59,10 +59,9 @@ type WalletService struct {
 	entities  walletEntityReader // nil-safe: entity resolution for new wallets
 	notifier  port.Notifier      // auto-recharge failure notices; nil-safe
 
-	charger SavedCardCharger  // nil-safe: without it auto-recharge only notifies
-	lookup  savedMethodLookup // saved-method resolution (shared slice)
-	// chargerRouter routes the recharge to the gateway the method was saved
-	// on. nil-safe: without it, only platform Stripe methods charge, on `charger`.
+	// Saved-method charging; nil-safe: without it auto-recharge does nothing.
+	// chargerRouter routes the recharge to the gateway the method was saved on.
+	lookup        savedMethodLookup
 	chargerRouter savedChargerRouter
 
 	now func() time.Time
@@ -83,16 +82,10 @@ func (s *WalletService) SetEntityReader(r walletEntityReader) { s.entities = r }
 // SetNotifier wires auto-recharge failure notifications (nil-safe).
 func (s *WalletService) SetNotifier(n port.Notifier) { s.notifier = n }
 
-// SetSavedMethodCharging wires gateway charging for auto-recharge (nil-safe).
-func (s *WalletService) SetSavedMethodCharging(charger SavedCardCharger, lookup savedMethodLookup) {
-	s.charger = charger
+// SetSavedMethodCharging wires gateway charging for auto-recharge (nil-safe):
+// the recharge charges on the gateway router picks for the saved method.
+func (s *WalletService) SetSavedMethodCharging(lookup savedMethodLookup, router savedChargerRouter) {
 	s.lookup = lookup
-}
-
-// SetChargerRouter wires per-gateway routing: the recharge charges on the
-// gateway the method was saved with. nil-safe — without it, only platform
-// Stripe methods charge, on `charger`.
-func (s *WalletService) SetChargerRouter(router savedChargerRouter) {
 	s.chargerRouter = router
 }
 
@@ -488,7 +481,7 @@ func (s *WalletService) ProcessAutoRecharges(ctx context.Context) (int, error) {
 }
 
 func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bool {
-	if s.lookup == nil || w.AutoRechargeAmount == nil || (s.charger == nil && s.chargerRouter == nil) {
+	if s.lookup == nil || w.AutoRechargeAmount == nil || s.chargerRouter == nil {
 		return false
 	}
 	m, err := s.lookup.GetSavedPaymentMethod(ctx, w.CustomerID)
@@ -496,11 +489,7 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 		s.notifyRechargeFailure(ctx, w, "no saved payment method")
 		return false
 	}
-	router := s.chargerRouter
-	if router == nil {
-		router = platformRouter(s.charger)
-	}
-	charger, err := router.ChargerFor(ctx, m, w.Currency)
+	charger, err := s.chargerRouter.ChargerFor(ctx, m, w.Currency)
 	if err != nil {
 		slog.WarnContext(ctx, "wallet auto-recharge: saved payment method can't be charged", "wallet_id", w.ID, "provider", m.Provider, "error", err)
 		s.notifyRechargeFailure(ctx, w, "payment gateway unavailable")

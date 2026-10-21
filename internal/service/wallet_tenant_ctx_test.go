@@ -55,7 +55,7 @@ func TestWalletAutoRecharge_FailureNoticeInjectsWalletTenant(t *testing.T) {
 	}}}
 	notifier := &recordingNotifier{}
 	svc := NewWalletService(wallets, &strictTenantCustomerRepo{tenantID: tenantID, customer: cust}, nil)
-	svc.SetSavedMethodCharging(unusedWalletCharger{}, noSavedMethodLookup{})
+	svc.SetSavedMethodCharging(noSavedMethodLookup{}, NewSavedCardGatewayRouter(nil, nil, unusedWalletCharger{}))
 	svc.SetNotifier(notifier)
 
 	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {

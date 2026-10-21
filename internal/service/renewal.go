@@ -52,14 +52,12 @@ type RenewalService struct {
 	plans    port.PlanRepository
 	invoicer renewalInvoicer
 
-	// Saved-method charging trio; all nil-safe — without them renewal
-	// invoices are generated open and dunning/notifications take over.
-	charger SavedCardCharger
-	lookup  savedMethodLookup
-	settler renewalSettler
-	// chargerRouter routes each charge to the gateway the method was saved on.
-	// nil-safe: when unset, only platform Stripe methods charge, on `charger`.
+	// Saved-method charging; all nil-safe — without them renewal invoices are
+	// generated open and dunning/notifications take over. chargerRouter
+	// routes each charge to the gateway the method was saved on.
+	lookup        savedMethodLookup
 	chargerRouter savedChargerRouter
+	settler       renewalSettler
 	// payments records the settling payment id as the invoice's refund
 	// target. nil-safe.
 	payments gatewayPaymentRecorder
@@ -76,18 +74,12 @@ func NewRenewalService(subs renewalSubscriptionRepo, plans port.PlanRepository, 
 	}
 }
 
-// SetSavedMethodCharging wires off-session payment collection (nil-safe).
-func (s *RenewalService) SetSavedMethodCharging(charger SavedCardCharger, lookup savedMethodLookup, settler renewalSettler) {
-	s.charger = charger
+// SetSavedMethodCharging wires off-session payment collection (nil-safe):
+// each saved method is charged on the gateway router picks for it.
+func (s *RenewalService) SetSavedMethodCharging(lookup savedMethodLookup, router savedChargerRouter, settler renewalSettler) {
 	s.lookup = lookup
-	s.settler = settler
-}
-
-// SetChargerRouter wires per-gateway routing: each saved method is charged on
-// the gateway it was saved with. nil-safe — without it, only platform Stripe
-// methods charge, on the `charger` from SetSavedMethodCharging.
-func (s *RenewalService) SetChargerRouter(router savedChargerRouter) {
 	s.chargerRouter = router
+	s.settler = settler
 }
 
 // SetPaymentRecorder wires recording of the gateway payment that settles a
@@ -194,7 +186,7 @@ func (s *RenewalService) RenewSubscription(ctx context.Context, sub *domain.Subs
 // method on another gateway, or a decline all leave the invoice open — dunning
 // owns recovery.
 func (s *RenewalService) attemptPayment(ctx context.Context, inv *domain.Invoice) {
-	if s.lookup == nil || s.settler == nil || (s.charger == nil && s.chargerRouter == nil) {
+	if s.lookup == nil || s.settler == nil || s.chargerRouter == nil {
 		return
 	}
 	if inv == nil || inv.Status != domain.InvoiceStatusOpen || inv.Total <= 0 {
@@ -217,11 +209,7 @@ func (s *RenewalService) attemptPayment(ctx context.Context, inv *domain.Invoice
 			"invoice_id", inv.ID, "customer_id", inv.CustomerID)
 		return
 	}
-	router := s.chargerRouter
-	if router == nil {
-		router = platformRouter(s.charger)
-	}
-	charger, err := router.ChargerFor(ctx, m, inv.Currency)
+	charger, err := s.chargerRouter.ChargerFor(ctx, m, inv.Currency)
 	if err != nil {
 		slog.WarnContext(ctx, "renewal: saved payment method can't be charged; invoice left open for dunning",
 			"invoice_id", inv.ID, "provider", m.Provider, "error", err)

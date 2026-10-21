@@ -39,10 +39,9 @@ func TestRenewalSavedMethod_ChargesOnItsProviderAndSettlesWithTenant(t *testing.
 	moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: uuid.NewString()}}
 	stripe := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
 	settler := &fakeRenewalSettler{}
-	svc.SetSavedMethodCharging(stripe, moyasarLookup(), settler)
 	router := NewSavedCardGatewayRouter(nil, nil, stripe)
 	router.RegisterProvider(domain.GatewayMoyasar, moyasar)
-	svc.SetChargerRouter(router)
+	svc.SetSavedMethodCharging(moyasarLookup(), router, settler)
 
 	// The sweep ctx carries no tenant.
 	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
@@ -76,8 +75,7 @@ func TestRenewalSavedMethod_StripeMockedStillCharges(t *testing.T) {
 	settler := &fakeRenewalSettler{}
 	// main.go with Stripe mocked: no Stripe charger; lookup, settler and the
 	// router are still wired.
-	svc.SetSavedMethodCharging(nil, moyasarLookup(), settler)
-	svc.SetChargerRouter(moyasarRouter(moyasar))
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(moyasar), settler)
 
 	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 		t.Fatal(err)
@@ -88,28 +86,18 @@ func TestRenewalSavedMethod_StripeMockedStillCharges(t *testing.T) {
 }
 
 // A Moyasar token must never reach Stripe, even when the customer still has a
-// stripe_customer_id from an earlier card and no Moyasar charger is wired
-// (key removed, or no router at all).
+// stripe_customer_id from an earlier card and no Moyasar charger is
+// registered (key removed).
 func TestRenewalSavedMethod_UnregisteredProviderNeverChargesStripe(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		router bool
-	}{{"platform charger only", false}, {"router without moyasar", true}} {
-		t.Run(tc.name, func(t *testing.T) {
-			svc, _, sub := sarRenewalFixture()
-			stripe := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
-			settler := &fakeRenewalSettler{}
-			svc.SetSavedMethodCharging(stripe, moyasarLookup(), settler)
-			if tc.router {
-				svc.SetChargerRouter(NewSavedCardGatewayRouter(nil, nil, stripe))
-			}
-			if err := svc.RenewSubscription(context.Background(), sub); err != nil {
-				t.Fatal(err)
-			}
-			if stripe.charges != 0 || len(settler.settled) != 0 {
-				t.Fatalf("stripe charged %d times / settled %v with a moyasar token", stripe.charges, settler.settled)
-			}
-		})
+	svc, _, sub := sarRenewalFixture()
+	stripe := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
+	settler := &fakeRenewalSettler{}
+	svc.SetSavedMethodCharging(moyasarLookup(), NewSavedCardGatewayRouter(nil, nil, stripe), settler)
+	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
+		t.Fatal(err)
+	}
+	if stripe.charges != 0 || len(settler.settled) != 0 {
+		t.Fatalf("stripe charged %d times / settled %v with a moyasar token", stripe.charges, settler.settled)
 	}
 }
 
@@ -119,13 +107,12 @@ func TestRenewalSavedMethod_MethodOnAnotherGatewayIsSkipped(t *testing.T) {
 	svc, _, sub := sarRenewalFixture()
 	stripe := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
 	settler := &fakeRenewalSettler{}
-	svc.SetSavedMethodCharging(stripe, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, settler)
 	router := NewSavedCardGatewayRouter(nil, nil, stripe)
 	// Production always registers the gateway an override names (boot fails
 	// otherwise), and the guard keys off that registration.
 	router.RegisterProvider(domain.GatewayMoyasar, &fakeRenewalCharger{})
 	router.SetCurrencyRouting(fixedRoutes{"SAR": domain.GatewayMoyasar})
-	svc.SetChargerRouter(router)
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, router, settler)
 
 	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 		t.Fatal(err)
@@ -147,8 +134,7 @@ func TestRenewalSavedMethod_ChargeFailureLeavesInvoiceUnsettled(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, _, sub := sarRenewalFixture()
 			settler := &fakeRenewalSettler{}
-			svc.SetSavedMethodCharging(nil, moyasarLookup(), settler)
-			svc.SetChargerRouter(moyasarRouter(tc.charger))
+			svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(tc.charger), settler)
 
 			if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 				t.Fatalf("a failed charge must not fail renewal: %v", err)
@@ -180,8 +166,7 @@ func TestRenewalSavedMethod_NothingToCollectSkipsLookup(t *testing.T) {
 			lookup := moyasarLookup()
 			moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
 			settler := &fakeRenewalSettler{}
-			svc.SetSavedMethodCharging(nil, lookup, settler)
-			svc.SetChargerRouter(moyasarRouter(moyasar))
+			svc.SetSavedMethodCharging(lookup, moyasarRouter(moyasar), settler)
 
 			if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 				t.Fatal(err)
@@ -199,8 +184,7 @@ func TestRenewalSavedMethod_LookupErrorLeavesInvoiceOpen(t *testing.T) {
 	lookup.err = errors.New("db down")
 	moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
 	settler := &fakeRenewalSettler{}
-	svc.SetSavedMethodCharging(nil, lookup, settler)
-	svc.SetChargerRouter(moyasarRouter(moyasar))
+	svc.SetSavedMethodCharging(lookup, moyasarRouter(moyasar), settler)
 
 	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 		t.Fatal(err)
@@ -230,8 +214,7 @@ func (f *fakePaymentRecorder) SetGatewayPaymentID(_ context.Context, tenantID, i
 func TestRenewalSavedMethod_RecordsSettlingPaymentID(t *testing.T) {
 	svc, invoicer, sub := sarRenewalFixture()
 	moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: "pay_renewal_1"}}
-	svc.SetSavedMethodCharging(nil, moyasarLookup(), &fakeRenewalSettler{})
-	svc.SetChargerRouter(moyasarRouter(moyasar))
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(moyasar), &fakeRenewalSettler{})
 	rec := &fakePaymentRecorder{}
 	svc.SetPaymentRecorder(rec)
 
@@ -251,8 +234,7 @@ func TestRenewalSavedMethod_DoesNotRecordPaymentThatDidNotSettle(t *testing.T) {
 	svc, _, sub := sarRenewalFixture()
 	moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: "pay_late"}}
 	already := false
-	svc.SetSavedMethodCharging(nil, moyasarLookup(), &fakeRenewalSettler{transitioned: &already})
-	svc.SetChargerRouter(moyasarRouter(moyasar))
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(moyasar), &fakeRenewalSettler{transitioned: &already})
 	rec := &fakePaymentRecorder{}
 	svc.SetPaymentRecorder(rec)
 

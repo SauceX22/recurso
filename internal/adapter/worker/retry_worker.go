@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -52,7 +53,6 @@ type RetryWorker struct {
 	notifier               port.Notifier
 	dunningCampaignService *service.DunningCampaignService
 	recoveryRecorder       RecoveryRecorder
-	savedCharger           service.SavedCardCharger
 	customerLookup         customerPaymentLookup
 	chargerRouter          savedCardChargerRouter
 	settler                invoiceSettler
@@ -88,18 +88,10 @@ func (w *RetryWorker) SetSettler(s invoiceSettler) {
 }
 
 // SetSavedMethodCharging wires off-session collection with the customer's saved
-// card (ENG-5 Phase 2). When either dependency is nil, retries fall back to the
-// interactive gateway path — behavior is unchanged for customers without a
-// saved payment method.
-func (w *RetryWorker) SetSavedMethodCharging(charger service.SavedCardCharger, lookup customerPaymentLookup) {
-	w.savedCharger = charger
+// method, charged on the gateway router picks for it. When either dependency is
+// nil, retries use the interactive gateway path.
+func (w *RetryWorker) SetSavedMethodCharging(lookup customerPaymentLookup, router savedCardChargerRouter) {
 	w.customerLookup = lookup
-}
-
-// SetChargerRouter wires per-gateway routing: the retry charges on the gateway
-// the method was saved with. nil-safe — without it, only platform Stripe
-// methods charge, on `savedCharger`.
-func (w *RetryWorker) SetChargerRouter(router savedCardChargerRouter) {
 	w.chargerRouter = router
 }
 
@@ -118,7 +110,11 @@ func (w *RetryWorker) chargeInvoice(ctx context.Context, inv *domain.Invoice) (*
 		return &port.PaymentResult{Success: true, PaymentID: noChargeDue}, nil
 	}
 
-	if charger, m, ok := w.savedMethodCharger(ctx, inv); ok {
+	charger, m, err := w.savedMethodCharger(ctx, inv)
+	if err != nil {
+		return nil, err
+	}
+	if charger != nil {
 		// Idempotent per attempt: a worker re-run for the same attempt won't
 		// double-charge.
 		return charger.ChargeSavedPaymentMethod(ctx, port.SavedMethodCharge{
@@ -134,28 +130,32 @@ func (w *RetryWorker) chargeInvoice(ctx context.Context, inv *domain.Invoice) (*
 }
 
 // savedMethodCharger resolves the customer's saved method and the charger for
-// it. ok is false when there is nothing to charge off-session: no method, a
-// lookup error, or a method that can't be charged for this invoice (another
-// gateway, an unreachable BYO connection) — never the wrong account.
-func (w *RetryWorker) savedMethodCharger(ctx context.Context, inv *domain.Invoice) (service.SavedCardCharger, domain.SavedPaymentMethod, bool) {
-	if w.customerLookup == nil || (w.savedCharger == nil && w.chargerRouter == nil) {
-		return nil, domain.SavedPaymentMethod{}, false
+// it. A nil charger with a nil error means there is nothing to charge
+// off-session: no method, or one that can't be charged for this invoice
+// (another gateway, a connection that is gone) — never the wrong account. An
+// error means the method couldn't be resolved right now (lookup or connection
+// store failure); the caller retries rather than concluding there is no card.
+func (w *RetryWorker) savedMethodCharger(ctx context.Context, inv *domain.Invoice) (service.SavedCardCharger, domain.SavedPaymentMethod, error) {
+	if w.customerLookup == nil || w.chargerRouter == nil {
+		return nil, domain.SavedPaymentMethod{}, nil
 	}
 	m, err := w.customerLookup.GetSavedPaymentMethod(ctx, inv.CustomerID)
-	if err != nil || !m.Chargeable() {
-		return nil, domain.SavedPaymentMethod{}, false
-	}
-	router := w.chargerRouter
-	if router == nil {
-		router = service.NewSavedCardGatewayRouter(nil, nil, w.savedCharger)
-	}
-	charger, err := router.ChargerFor(ctx, m, inv.Currency)
 	if err != nil {
+		return nil, domain.SavedPaymentMethod{}, fmt.Errorf("look up saved payment method: %w", err)
+	}
+	if !m.Chargeable() {
+		return nil, domain.SavedPaymentMethod{}, nil
+	}
+	charger, err := w.chargerRouter.ChargerFor(ctx, m, inv.Currency)
+	if errors.Is(err, service.ErrSavedMethodNotChargeable) {
 		slog.Warn("retry: saved payment method can't be charged; using interactive retry",
 			"invoice_id", inv.ID, "provider", m.Provider, "error", err)
-		return nil, domain.SavedPaymentMethod{}, false
+		return nil, domain.SavedPaymentMethod{}, nil
 	}
-	return charger, m, true
+	if err != nil {
+		return nil, domain.SavedPaymentMethod{}, fmt.Errorf("resolve saved payment method gateway: %w", err)
+	}
+	return charger, m, nil
 }
 
 // Start runs the worker loop.

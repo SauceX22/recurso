@@ -244,9 +244,13 @@ type fakeCustomerLookup struct {
 	provider domain.GatewayProvider
 	ref      string
 	none     bool
+	err      error
 }
 
 func (f *fakeCustomerLookup) GetSavedPaymentMethod(_ context.Context, _ uuid.UUID) (domain.SavedPaymentMethod, error) {
+	if f.err != nil {
+		return domain.SavedPaymentMethod{}, f.err
+	}
 	if f.none {
 		return domain.SavedPaymentMethod{Provider: domain.GatewayStripe}, nil
 	}
@@ -260,11 +264,15 @@ type fakeCardRouter struct {
 	charger   service.SavedCardCharger
 	gotConnID *uuid.UUID
 	saw       bool
+	err       error
 }
 
 func (f *fakeCardRouter) ChargerFor(_ context.Context, m domain.SavedPaymentMethod, _ string) (service.SavedCardCharger, error) {
 	f.saw = true
 	f.gotConnID = m.GatewayConnectionID
+	if f.err != nil {
+		return nil, f.err
+	}
 	return f.charger, nil
 }
 
@@ -286,9 +294,8 @@ func TestRetryWorker_ChargesOnRecordedGateway(t *testing.T) {
 	platform := &fakeSavedCharger{name: "platform"}
 	byo := &fakeSavedCharger{name: "byo"}
 	connID := uuid.New()
-	w.SetSavedMethodCharging(platform, &fakeCustomerLookup{connID: &connID})
 	router := &fakeCardRouter{charger: byo}
-	w.SetChargerRouter(router)
+	w.SetSavedMethodCharging(&fakeCustomerLookup{connID: &connID}, router)
 
 	w.processRetries(context.Background())
 

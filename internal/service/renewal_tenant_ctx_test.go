@@ -39,8 +39,8 @@ func TestRenewSubscription_SettlesWithInvoiceTenant(t *testing.T) {
 	svc, _, invoicer, sub := renewalFixture()
 	invoicer.invoice.TenantID = sub.TenantID
 	settler := &tenantCheckingSettler{}
-	svc.SetSavedMethodCharging(&fakeRenewalCharger{result: &port.PaymentResult{Success: true}},
-		&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, settler)
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"},
+		NewSavedCardGatewayRouter(nil, nil, &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}), settler)
 
 	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 		t.Fatalf("unexpected error: %v", err)

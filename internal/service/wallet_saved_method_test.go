@@ -25,8 +25,7 @@ func TestWalletSavedMethod_AutoRechargeChargesProviderMethod(t *testing.T) {
 	svc, repo, ledger, w := sarRechargeFixture()
 	moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: uuid.NewString()}}
 	// Stripe mocked: no Stripe charger at all, only the router.
-	svc.SetSavedMethodCharging(nil, moyasarLookup())
-	svc.SetChargerRouter(moyasarRouter(moyasar))
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(moyasar))
 
 	recharged, err := svc.ProcessAutoRecharges(context.Background())
 	if err != nil {
@@ -57,8 +56,7 @@ func TestWalletSavedMethod_DeclineOrErrorCreditsNothing(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, repo, ledger, _ := sarRechargeFixture()
-			svc.SetSavedMethodCharging(nil, moyasarLookup())
-			svc.SetChargerRouter(moyasarRouter(tc.charger))
+			svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(tc.charger))
 
 			recharged, err := svc.ProcessAutoRecharges(context.Background())
 			if err != nil {
@@ -78,8 +76,7 @@ func TestWalletSavedMethod_NoAutoRechargeAmountNoLookup(t *testing.T) {
 	repo.dueList = []domain.Wallet{*w}
 	lookup := moyasarLookup()
 	moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
-	svc.SetSavedMethodCharging(nil, lookup)
-	svc.SetChargerRouter(moyasarRouter(moyasar))
+	svc.SetSavedMethodCharging(lookup, moyasarRouter(moyasar))
 
 	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
 		t.Fatal(err)
@@ -94,8 +91,7 @@ func TestWalletSavedMethod_NoAutoRechargeAmountNoLookup(t *testing.T) {
 func TestWalletRecharge_ChargesForTheWalletNotAnInvoice(t *testing.T) {
 	svc, _, _, w := sarRechargeFixture()
 	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
-	svc.SetSavedMethodCharging(nil, moyasarLookup())
-	svc.SetChargerRouter(moyasarRouter(charger))
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
 
 	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
 		t.Fatal(err)
@@ -112,8 +108,7 @@ func TestWalletRecharge_ChargesForTheWalletNotAnInvoice(t *testing.T) {
 func TestWalletRecharge_SameBalanceAgainIsANewCharge(t *testing.T) {
 	svc, repo, ledger, w := sarRechargeFixture()
 	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
-	svc.SetSavedMethodCharging(nil, moyasarLookup())
-	svc.SetChargerRouter(moyasarRouter(charger))
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
 
 	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
 		t.Fatal(err)
@@ -139,8 +134,7 @@ func TestWalletRecharge_SameBalanceAgainIsANewCharge(t *testing.T) {
 func TestWalletRecharge_DeclineAdvancesTheKey(t *testing.T) {
 	svc, repo, _, w := sarRechargeFixture()
 	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: false, ErrorCode: "insufficient_funds"}}
-	svc.SetSavedMethodCharging(nil, moyasarLookup())
-	svc.SetChargerRouter(moyasarRouter(charger))
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
 
 	for i := 0; i < 2; i++ {
 		if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
@@ -160,8 +154,7 @@ func TestWalletRecharge_DeclineAdvancesTheKey(t *testing.T) {
 func TestWalletRecharge_ErrorKeepsTheKey(t *testing.T) {
 	svc, repo, _, _ := sarRechargeFixture()
 	charger := &fakeRenewalCharger{err: errors.New("timeout")}
-	svc.SetSavedMethodCharging(nil, moyasarLookup())
-	svc.SetChargerRouter(moyasarRouter(charger))
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
 
 	for i := 0; i < 2; i++ {
 		if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
@@ -184,10 +177,9 @@ func TestWalletSavedMethod_StripeCustomerUnchanged(t *testing.T) {
 
 	stripe := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
 	moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
-	svc.SetSavedMethodCharging(stripe, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"})
 	router := NewSavedCardGatewayRouter(nil, nil, stripe)
 	router.RegisterProvider(domain.GatewayMoyasar, moyasar)
-	svc.SetChargerRouter(router)
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, router)
 
 	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
 		t.Fatal(err)
