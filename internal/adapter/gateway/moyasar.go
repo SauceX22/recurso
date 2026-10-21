@@ -351,6 +351,17 @@ func (g *MoyasarGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.
 	return mapMoyasarCharge(&out), nil
 }
 
+// FindPaidPayment returns a paid payment bound to invoiceID that covers
+// amount in currency (net of refunds), or nil when there is none. Checkout
+// asks before taking a payment, so a buyer never pays an invoice twice.
+func (g *MoyasarGateway) FindPaidPayment(ctx context.Context, invoiceID, currency string, amount int64) (*port.GatewayPayment, error) {
+	p, err := g.paidPaymentFor(ctx, port.SavedMethodCharge{InvoiceID: invoiceID, Currency: currency, Amount: amount})
+	if err != nil || p == nil {
+		return nil, err
+	}
+	return p.toGatewayPayment(), nil
+}
+
 // paidPaymentFor returns a paid payment already bound to req's invoice that
 // covers the charge, or nil. Each attempt uses its own given_id, so a payment
 // whose response was lost under an earlier key (renewal, then a dunning retry)

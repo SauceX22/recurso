@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -522,6 +523,46 @@ func TestMoyasarChargeIgnoresPaidPaymentsThatDontCover(t *testing.T) {
 				t.Fatalf("POST count = %d, want 1", n)
 			}
 		})
+	}
+}
+
+// FindPaidPayment exposes the same paid-payment lookup to checkout, so a
+// buyer is never shown a form for an invoice Moyasar already took money for.
+func TestMoyasarFindPaidPayment(t *testing.T) {
+	const paid = "11111111-2222-4333-8444-555555555555"
+	for _, tc := range []struct {
+		name, payments string
+		amount         int64
+		wantID         string
+	}{
+		{"paid payment covers the invoice", moyasarPaymentJSON(paid, "paid", "00", "APPROVED"), 10000, paid},
+		{"paid payment too small", moyasarPaymentJSON(paid, "paid", "00", "APPROVED"), 12000, ""},
+		{"none", "", 10000, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, rec := moyasarTestServer(t, map[string]moyasarReply{
+				"GET /payments": {http.StatusOK, `{"payments":[` + tc.payments + `]}`},
+			})
+			got, err := testMoyasar(srv.URL).FindPaidPayment(context.Background(), "inv-1", "SAR", tc.amount)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantID == "" {
+				if got != nil {
+					t.Fatalf("got %+v, want none", got)
+				}
+			} else if got == nil || got.ID != tc.wantID || got.InvoiceID != "inv-1" || got.Status != "paid" || got.Currency != "SAR" {
+				t.Fatalf("got %+v, want payment %s bound to inv-1", got, tc.wantID)
+			}
+			q := rec.to(http.MethodGet, "/payments")[0].query
+			if q.Get("metadata[invoice_id]") != "inv-1" || q.Get("status") != "paid" {
+				t.Fatalf("lookup query = %v", q)
+			}
+		})
+	}
+	srv, _ := moyasarTestServer(t, map[string]moyasarReply{"GET /payments": {http.StatusBadGateway, ``}})
+	if _, err := testMoyasar(srv.URL).FindPaidPayment(context.Background(), "inv-1", "SAR", 10000); err == nil {
+		t.Fatal("a failed lookup must be an error, not \"not paid\"")
 	}
 }
 
@@ -1080,7 +1121,8 @@ func TestMoyasarRefundsOfOnePaymentDoNotOverlap(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	if !(statuses[0] == "refunded" && statuses[1] == "pending") && !(statuses[0] == "pending" && statuses[1] == "refunded") {
+	sort.Strings(statuses)
+	if statuses[0] != "pending" || statuses[1] != "refunded" {
 		t.Fatalf("statuses = %v, want one refunded and the lost one pending", statuses)
 	}
 }
