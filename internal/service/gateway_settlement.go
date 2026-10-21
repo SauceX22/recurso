@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/recurso-dev/recurso/internal/core/domain"
@@ -88,8 +87,7 @@ type GatewaySettlementService struct {
 	subs      settlementSubscriptionReader
 	cards     gatewayMethodSaver
 	tokens    cardTokenReader
-	campaigns dunningRecoveryMarker
-	outcomes  dunningOutcomeRecorder
+	recovery  *DunningSuccessRecorder
 	paid      paidPaymentFinder
 	routesTo  func(currency string) domain.GatewayProvider
 	logger    *slog.Logger
@@ -117,8 +115,7 @@ func (s *GatewaySettlementService) SetCardSaving(cards gatewayMethodSaver, token
 // SetDunningRecovery wires the once-per-settlement dunning outcome: the
 // campaign is closed as recovered and the retry bandit is rewarded.
 func (s *GatewaySettlementService) SetDunningRecovery(campaigns dunningRecoveryMarker, outcomes dunningOutcomeRecorder) {
-	s.campaigns = campaigns
-	s.outcomes = outcomes
+	s.recovery = NewDunningSuccessRecorder(campaigns, outcomes)
 }
 
 // SetPaidPaymentLookup wires the check for a payment the gateway already
@@ -203,7 +200,7 @@ func (s *GatewaySettlementService) Settle(ctx context.Context, inv *domain.Invoi
 	}
 
 	if transitioned {
-		s.recordDunningRecovery(tenantCtx, inv)
+		s.recovery.Record(tenantCtx, inv)
 	}
 	return transitioned, nil
 }
@@ -230,30 +227,5 @@ func (s *GatewaySettlementService) saveCard(ctx, tenantCtx context.Context, inv 
 	}
 	if err := s.cards.SetGatewayPaymentMethod(tenantCtx, inv.TenantID, inv.CustomerID, s.provider, p.CardToken, p.CardBrand, p.CardLast4, expMonth, expYear); err != nil {
 		log.ErrorContext(ctx, "failed to save card for off-session charges", "error", err)
-	}
-}
-
-func (s *GatewaySettlementService) recordDunningRecovery(ctx context.Context, inv *domain.Invoice) {
-	if s.campaigns != nil {
-		if err := s.campaigns.MarkRecovered(ctx, inv.ID); err != nil {
-			s.logger.ErrorContext(ctx, "failed to mark dunning campaign recovered", "invoice_id", inv.ID, "error", err)
-		}
-	}
-	if s.outcomes == nil || inv.DunningActionID == "" || inv.DunningContextKey == "" {
-		return
-	}
-	err := s.outcomes.RecordOutcome(ctx, domain.DunningHistory{
-		ID:            uuid.New(),
-		TenantID:      inv.TenantID,
-		InvoiceID:     inv.ID,
-		ContextKey:    inv.DunningContextKey,
-		ActionID:      inv.DunningActionID,
-		RetryInterval: int64(actionByID(inv.DunningActionID).Interval.Seconds()),
-		Outcome:       "success",
-		Reward:        1.0,
-		CreatedAt:     time.Now(),
-	})
-	if err != nil {
-		s.logger.ErrorContext(ctx, "failed to record dunning success outcome", "invoice_id", inv.ID, "error", err)
 	}
 }
