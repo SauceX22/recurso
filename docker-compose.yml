@@ -35,6 +35,9 @@ services:
       - MOYASAR_WEBHOOK_SECRET=${MOYASAR_WEBHOOK_SECRET:-e2e_moyasar_webhook_secret}
       - MOYASAR_API_URL=${MOYASAR_API_URL-http://host.docker.internal:8091/v1}
       - GATEWAY_CURRENCY_OVERRIDES=${GATEWAY_CURRENCY_OVERRIDES:-SAR=moyasar}
+      # Renewal sweep every few seconds (default 5m) so the E2E suite's
+      # backdated SAR subscriptions renew within the run (step 6e).
+      - BILLING_CYCLE_INTERVAL=${BILLING_CYCLE_INTERVAL:-5s}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
