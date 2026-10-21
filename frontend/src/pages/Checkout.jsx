@@ -375,6 +375,18 @@ export default function Checkout() {
 
   const invoiceNumber = invoice?.invoice_number;
 
+  // A voided or unfinalized invoice is not owed; the server refuses to take
+  // payment for it, so don't offer a Pay button.
+  if (status !== "paid" && (invoice?.status === "void" || invoice?.status === "draft")) {
+    return (
+      <CheckoutShell locale={locale}>
+        <StatusScreen tone="destructive" title={t.notPayableTitle}>
+          {t.notPayableBody}
+        </StatusScreen>
+      </CheckoutShell>
+    );
+  }
+
   if (status === "paid") {
     return (
       <CheckoutShell locale={locale}>

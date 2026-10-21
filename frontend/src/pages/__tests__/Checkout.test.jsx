@@ -73,6 +73,14 @@ describe("Checkout (money-critical public flow)", () => {
         await waitFor(() => expect(screen.getAllByText(/not found/i).length).toBeGreaterThan(0));
     });
 
+    it.each(["void", "draft"])("offers no payment for a %s invoice", async (status) => {
+        const fetchMock = vi.fn(() => json(200, { data: invoice({ status }) }));
+        vi.stubGlobal("fetch", fetchMock);
+        renderAt(`inv_${status}`);
+        expect(await screen.findByText(/no longer payable/i)).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: /pay/i })).not.toBeInTheDocument();
+    });
+
     it("reflects an already-paid invoice", async () => {
         vi.stubGlobal("fetch", vi.fn(() => json(200, { data: invoice({ status: "paid" }) })));
         renderAt("inv_paid");
