@@ -16,7 +16,8 @@ import (
 // currency-override gateways (GoCardless, Adyen, Moyasar) set it only on a
 // server without them, so a sandbox override key (the way a new gateway is
 // verified) can't flip a live server to "test" and lock out every live API
-// key. Any live/test mix is returned as a warning naming the gateways.
+// key. Any live/test mix is returned as a warning naming the gateways;
+// validateMoyasarConfig refuses to boot when Moyasar's is the odd mode out.
 // overrideGateways is false when the override gateways are not registered,
 // as in demo mode.
 func gatewayModeFromEnv(getenv func(string) string, overrideGateways bool) (mode string, warnings []string) {
@@ -109,10 +110,13 @@ func moyasarConfigFromEnv(getenv func(string) string, baseURL string) moyasarCon
 // would create payments in one mode while the server reads them back in the
 // other, so customers pay and invoices never settle. So is a callback origin
 // Moyasar can't use (live needs absolute https on a real host), since it
-// would refuse every token charge, and an API override on a live key. A
+// would refuse every token charge, and an API override on a live key or a
+// live server. So is a key whose mode isn't serverMode (gatewayModeFromEnv):
+// a test key on a live server lets Moyasar's public test cards settle real
+// invoices, and a live key on a test server charges real cards. A
 // missing publishable key (SAR checkout unavailable) or webhook secret (no
 // settlement backstop when the checkout return is lost) is a warning.
-func validateMoyasarConfig(c moyasarConfig) (warnings []string, err error) {
+func validateMoyasarConfig(c moyasarConfig, serverMode string) (warnings []string, err error) {
 	var live bool
 	switch {
 	case strings.HasPrefix(c.secretKey, moyasarLivePrefix):
@@ -142,12 +146,15 @@ func validateMoyasarConfig(c moyasarConfig) (warnings []string, err error) {
 	if c.apiURL != "" {
 		u, perr := url.Parse(c.apiURL)
 		switch {
-		case live:
-			return nil, errors.New("MOYASAR_API_URL is a test-only override and is refused with a live Moyasar key")
+		case live || serverMode == "live":
+			return nil, errors.New("MOYASAR_API_URL is a test-only override and is refused on a live server or with a live Moyasar key")
 		case perr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
 			return nil, fmt.Errorf("MOYASAR_API_URL %q must be an absolute URL", c.apiURL)
 		}
 		warnings = append(warnings, "MOYASAR_API_URL overrides the Moyasar API (test only): "+c.apiURL)
+	}
+	if keyMode := map[bool]string{true: "live", false: "test"}[live]; keyMode != serverMode {
+		return nil, fmt.Errorf("MOYASAR_SECRET_KEY is a %s key but the server runs in %s mode (set by the other payment gateways): use a %s Moyasar key", keyMode, serverMode, serverMode)
 	}
 	return warnings, nil
 }

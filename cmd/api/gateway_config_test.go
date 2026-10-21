@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func envOf(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
@@ -11,7 +14,8 @@ func envOf(m map[string]string) func(string) string {
 // and refuses every live API key. When Stripe or Razorpay is configured, they
 // alone set the mode: an override gateway in the other mode (a sandbox
 // Moyasar key on a live Stripe server) must not flip the server to "test" and
-// lock out every live API key; it is reported as a warning instead.
+// lock out every live API key; it is reported as a warning here (and refused
+// at boot by validateMoyasarConfig).
 func TestGatewayModeFromEnv(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -85,7 +89,12 @@ func TestValidateMoyasarConfig(t *testing.T) {
 		{"api override not a URL", with(complete("sk_test_a", "pk_test_b"), func(c *moyasarConfig) { c.apiURL = "moyasar-stub" }), true, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			warnings, err := validateMoyasarConfig(tc.cfg)
+			// The key's own mode, as on a Moyasar-only server.
+			mode := "test"
+			if strings.HasPrefix(tc.cfg.secretKey, moyasarLivePrefix) {
+				mode = "live"
+			}
+			warnings, err := validateMoyasarConfig(tc.cfg, mode)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
 			}
@@ -93,6 +102,60 @@ func TestValidateMoyasarConfig(t *testing.T) {
 				t.Fatalf("warnings = %q, want %d", warnings, tc.wantWarnings)
 			}
 		})
+	}
+}
+
+// The server's mode (set by Stripe or Razorpay when configured, else by the
+// override gateways) must be Moyasar's: a test key on a live server lets
+// Moyasar's public test cards settle real invoices, and a live key on a test
+// server charges real cards for test tenants. Both refuse to boot, as does the
+// test-only API override on a live server, whatever the Moyasar key.
+func TestValidateMoyasarConfigAgainstServerMode(t *testing.T) {
+	cfg := func(secret, publishable, apiURL string) moyasarConfig {
+		return moyasarConfig{secretKey: secret, publishableKey: publishable, webhookSecret: "s", callbackBaseURL: "https://app.example.com", apiURL: apiURL}
+	}
+	for _, tc := range []struct {
+		name       string
+		cfg        moyasarConfig
+		serverMode string
+		wantErr    string
+	}{
+		{"live server, live key", cfg("sk_live_a", "pk_live_b", ""), "live", ""},
+		{"test server, test key", cfg("sk_test_a", "pk_test_b", ""), "test", ""},
+		{"api override on a test server", cfg("sk_test_a", "pk_test_b", "http://stub/v1"), "test", ""},
+		{"live server, test key", cfg("sk_test_a", "pk_test_b", ""), "live", "server runs in live mode"},
+		{"test server, live key", cfg("sk_live_a", "pk_live_b", ""), "test", "server runs in test mode"},
+		{"api override on a live server", cfg("sk_test_a", "pk_test_b", "http://stub/v1"), "live", "MOYASAR_API_URL"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validateMoyasarConfig(tc.cfg, tc.serverMode)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("err = %v, want boot to proceed", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want a fatal error mentioning %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// Every deployment shape that should boot does: the server mode
+// gatewayModeFromEnv derives always agrees with a Moyasar key of the same mode.
+func TestValidDeploymentsBootWithMoyasar(t *testing.T) {
+	for _, env := range []map[string]string{
+		{"MOYASAR_SECRET_KEY": "sk_test_a", "MOYASAR_PUBLISHABLE_KEY": "pk_test_b"},
+		{"MOYASAR_SECRET_KEY": "sk_live_a", "MOYASAR_PUBLISHABLE_KEY": "pk_live_b"},
+		{"STRIPE_SECRET_KEY": "sk_live_s", "MOYASAR_SECRET_KEY": "sk_live_a", "MOYASAR_PUBLISHABLE_KEY": "pk_live_b"},
+		{"STRIPE_SECRET_KEY": "sk_test_s", "MOYASAR_SECRET_KEY": "sk_test_a", "MOYASAR_PUBLISHABLE_KEY": "pk_test_b"},
+	} {
+		env["MOYASAR_WEBHOOK_SECRET"] = "s"
+		mode, _ := gatewayModeFromEnv(envOf(env), true)
+		if _, err := validateMoyasarConfig(moyasarConfigFromEnv(envOf(env), "https://app.example.com"), mode); err != nil {
+			t.Errorf("env %v (server mode %s): %v, want boot to proceed", env, mode, err)
+		}
 	}
 }
 

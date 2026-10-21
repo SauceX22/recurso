@@ -281,18 +281,25 @@ func main() {
 	// naming an unregistered gateway), the saved-card router (before the
 	// retry worker and billing scheduler start), and the checkout/webhook
 	// handlers. Its saved cards can't be replaced from the portal.
+	//
+	// The server's payment mode is decided first: a Moyasar key in the other
+	// mode (or the test-only API override on a live server) refuses to boot.
+	gatewayMode, modeWarnings := gatewayModeFromEnv(os.Getenv, !demo.Enabled())
+	for _, w := range modeWarnings {
+		slog.Warn("PAYMENT GATEWAY MODE MISMATCH", "problem", w)
+	}
 	var moyasarGateway *gateway.MoyasarGateway
 	var noSelfServeCardUpdate []domain.GatewayProvider
-	if key := os.Getenv("MOYASAR_SECRET_KEY"); key != "" && !demo.Enabled() {
-		cfg := moyasarConfigFromEnv(os.Getenv, baseURL)
-		warnings, err := validateMoyasarConfig(cfg)
+	moyasarCfg := moyasarConfigFromEnv(os.Getenv, baseURL)
+	if moyasarCfg.secretKey != "" && !demo.Enabled() {
+		warnings, err := validateMoyasarConfig(moyasarCfg, gatewayMode)
 		if err != nil {
 			log.Fatalf("Invalid Moyasar configuration: %v", err)
 		}
 		for _, w := range warnings {
 			slog.Warn("Moyasar configuration incomplete", "problem", w)
 		}
-		moyasarGateway = gateway.NewMoyasarGateway(key, cfg.callbackBaseURL, cfg.apiURL)
+		moyasarGateway = gateway.NewMoyasarGateway(moyasarCfg.secretKey, moyasarCfg.callbackBaseURL, moyasarCfg.apiURL)
 		paymentGateway.RegisterGateway("moyasar", moyasarGateway)
 		noSelfServeCardUpdate = append(noSelfServeCardUpdate, domain.GatewayMoyasar)
 		log.Println("Moyasar gateway configured (EXPERIMENTAL — sandbox verification pending)")
@@ -1573,8 +1580,8 @@ func main() {
 		moyasarSettlement.SetDunningRecovery(dunningCampaignService, retryService)
 		moyasarSettlement.SetPaidPaymentLookup(moyasarGateway, paymentGateway.ProviderFor)
 		moyasarSettlement.SetCardOnFileTerms(planRepo, tenantRepo)
-		checkoutHandler.SetMoyasar(moyasarGateway, moyasarSettlement, os.Getenv("MOYASAR_PUBLISHABLE_KEY"))
-		webhookHandler.SetMoyasar(moyasarGateway, moyasarSettlement, os.Getenv("MOYASAR_WEBHOOK_SECRET"))
+		checkoutHandler.SetMoyasar(moyasarGateway, moyasarSettlement, moyasarCfg.publishableKey)
+		webhookHandler.SetMoyasar(moyasarGateway, moyasarSettlement, moyasarCfg.webhookSecret)
 	}
 
 	// Revenue Recognition Handler
@@ -1695,11 +1702,6 @@ func main() {
 	founderToken := os.Getenv("FOUNDER_TOKEN")
 	platformRepo := db.NewPlatformRepository(database)
 	platformChargeRepo := db.NewCloudChargeRepository(database)
-
-	gatewayMode, modeWarnings := gatewayModeFromEnv(os.Getenv, !demo.Enabled())
-	for _, w := range modeWarnings {
-		slog.Warn("PAYMENT GATEWAY MODE MISMATCH", "problem", w)
-	}
 
 	// Public Routes — stricter rate limit (20 req/min per IP) for endpoints
 	// worth brute-forcing (credentials, tokens, payment initiation).

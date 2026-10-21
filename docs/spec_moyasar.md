@@ -173,17 +173,19 @@ dunned invoice's checkout, card-expiry emails to that invoice.
 | `MOYASAR_PUBLISHABLE_KEY` | browser key; `pk_test_`/`pk_live_`, same mode |
 | `MOYASAR_WEBHOOK_SECRET` | shared secret on the Moyasar webhook |
 | `GATEWAY_CURRENCY_OVERRIDES` | includes `SAR=moyasar` |
-| `MOYASAR_API_URL` | test only: replaces the API base (the e2e stub); refused with `sk_live_` |
+| `MOYASAR_API_URL` | test only: replaces the API base (the e2e stub); refused with `sk_live_` or on a live server |
 
 `validateMoyasarConfig` (`cmd/api/gateway_config.go`): fatal on a bad key
 prefix, mixed test/live keys, a `DASHBOARD_URL` (else `BASE_URL`) that isn't an
 absolute URL (public https with a live key; it is token charges'
-`callback_url`), or `MOYASAR_API_URL` with a live key; warns on a missing
-publishable key (SAR checkout 503) or webhook secret. An override naming an
-unregistered gateway is fatal; `DEMO_MODE` skips Moyasar. In
-`gatewayModeFromEnv` Stripe/Razorpay set the server's live/test mode when
-configured; Moyasar (`sk_live_`), GoCardless and Adyen set it only without
-them, and a live/test mix is a boot warning.
+`callback_url`), `MOYASAR_API_URL` with a live key or on a live server, or a
+Moyasar key whose mode isn't the server's; warns on a missing publishable key
+(SAR checkout 503) or webhook secret. An override naming an unregistered
+gateway is fatal; `DEMO_MODE` skips Moyasar. In `gatewayModeFromEnv`
+Stripe/Razorpay set the server's live/test mode when configured; Moyasar
+(`sk_live_`), GoCardless and Adyen set it only without them. A Moyasar key in
+the other mode refuses to boot (a test key on a live server would let public
+test cards settle real invoices); any other live/test mix is a boot warning.
 
 ## Self-hosting runbook
 
