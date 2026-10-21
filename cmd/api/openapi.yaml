@@ -3903,12 +3903,16 @@ paths:
       summary: Initiate payment for an invoice
       description: >
         Creates a payment order on the currency-routed gateway for an unpaid
-        invoice. The response tells the frontend which flow to drive: `stripe`
+        invoice, for the amount due (total less payments and applied credit)
+        on every gateway. The response tells the frontend which flow to drive: `stripe`
         returns a PaymentIntent `client_secret` + `publishable_key` for the
         Payment Element; `razorpay` returns the order id + `razorpay_key_id`
         for the Checkout.js modal; `moyasar` returns the embedded-form config
-        (`moyasar_publishable_key`, `amount` = the amount due, `description`,
-        `metadata`, `save_card`). Settlement is always verified server-side —
+        (`moyasar_publishable_key`, `description`, `metadata`, `save_card`,
+        `card_on_file`). Before handing out the Moyasar form the server checks
+        the gateway for a payment already captured for the invoice and
+        settles it instead (400 `invoice_already_paid`); if it cannot check,
+        it answers 502 rather than risk a second capture. Settlement is always verified server-side —
         see `/checkout/{id}/success`, `/checkout/{id}/razorpay/verify` and
         `/checkout/{id}/moyasar/verify`.
       security: []
@@ -3931,7 +3935,7 @@ paths:
                       amount:
                         type: integer
                         format: int64
-                        description: Amount in the lowest currency unit.
+                        description: Amount the order charges, in the lowest currency unit — the invoice's amount due.
                       currency:
                         type: string
                       invoice_id:
@@ -3972,10 +3976,49 @@ paths:
                           that renews, so paying stores the card for future renewals. The
                           page must show that disclosure before payment and pass this
                           value to the form; false (one-off invoices) never saves.
+                      card_on_file:
+                        type: object
+                        description: >
+                          Present only when `save_card` is true and the terms are
+                          complete: the stored-credential agreement to show before
+                          payment ("<merchant> will charge <amount> every
+                          <interval_count> <interval> until you cancel"). Gateway-neutral.
+                        required: [merchant, amount, currency, interval, interval_count]
+                        properties:
+                          merchant:
+                            type: string
+                            description: The business that bills the customer.
+                          amount:
+                            type: integer
+                            format: int64
+                            description: >
+                              This invoice's total in minor units, what a renewal of the
+                              same plan charges; usage, discounts and plan changes can move
+                              later renewals.
+                          currency:
+                            type: string
+                          interval:
+                            type: string
+                            enum: [day, week, month, year]
+                          interval_count:
+                            type: integer
+                            minimum: 1
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: >
+            Invalid invoice id, or `invoice_already_paid` when the invoice is paid,
+            has nothing left due, or a payment already captured for it was just settled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
+        '502':
+          description: '`gateway_unavailable`: the gateway could not be asked whether the invoice was already paid (Moyasar); retry shortly.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           description: Checkout is not fully configured (e.g. the gateway's browser-side key is missing). `checkout_unavailable` for Moyasar.
           content:
@@ -4104,8 +4147,12 @@ paths:
         an amount net of refunds covering the balance due), through the same
         settlement path as the `payment_paid` webhook: the payment id is
         recorded unless another payment already settled the invoice, and the
-        card is saved only for an invoice of a renewing subscription. The
-        browser alone can never mark an invoice paid.
+        card is saved only for an invoice of a renewing subscription. When
+        the given payment is not paid but an earlier payment for the invoice
+        was captured, that one is settled and `paid` reported. Void and draft
+        invoices are refused (409); uncollectible ones stay payable. Limited
+        per invoice as well as per IP. The browser alone can never mark an
+        invoice paid.
       security: []
       parameters:
         - $ref: '#/components/parameters/PathID'
@@ -4119,6 +4166,7 @@ paths:
               properties:
                 payment_id:
                   type: string
+                  format: uuid
                   description: Moyasar payment id from the form's return URL.
       responses:
         '200':
@@ -4148,15 +4196,27 @@ paths:
                         type: string
         '400':
           description: >
-            `validation_failed` for a malformed invoice id or a missing `payment_id`;
-            `payment_mismatch` when the payment is not for this invoice (another
-            invoice, currency, or less than the amount due).
+            `validation_failed` for a malformed invoice id or a missing or
+            non-UUID `payment_id`; `payment_mismatch` when the payment is not for
+            this invoice (another invoice, currency, or less than the amount due).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: The invoice is void or draft and cannot be paid (`conflict`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Too many verifications for this invoice or from this client (`rate_limited`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: The payment was confirmed but settlement failed (`internal_error`); the webhook retries it.
           content:
@@ -4772,7 +4832,16 @@ paths:
                         description: >
                           False when the portal's card-update flow would move the
                           customer's renewals off their gateway; the card is then
-                          replaced by paying an open invoice on the hosted checkout.
+                          replaced by paying `card_update_invoice_id` on the hosted checkout.
+                      card_update_invoice_id:
+                        type: string
+                        format: uuid
+                        nullable: true
+                        description: >
+                          When `card_update_supported` is false: the open or past-due
+                          invoice of a renewing subscription whose payment saves the new
+                          card (`/checkout/{id}`). Null when no invoice would save it;
+                          the card is then requested at the next renewal.
         '401':
           $ref: '#/components/responses/Unauthorized'
 
