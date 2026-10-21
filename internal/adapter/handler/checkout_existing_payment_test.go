@@ -7,39 +7,45 @@ import (
 )
 
 // A payment the gateway already captured for the invoice (a renewal whose
-// answer was lost, a missed webhook) is settled before the buyer is shown a
+// answer was lost, a missed webhook) is settled before the buyer is given a
 // way to pay again.
 
-func TestShowCheckout_SettlesAnAlreadyCapturedPayment(t *testing.T) {
+// Showing the page is a public GET: it never spends a secret-key gateway
+// read-back (an unauthenticated caller could drain the quota renewals share)
+// and never settles. Paying is where an earlier capture is checked.
+func TestShowCheckout_NeverChecksTheGateway(t *testing.T) {
 	f := newMoyCheckoutFixture("moyasar")
 	f.settler.existing = true
-	code, out := f.show(t)
-	if code != http.StatusOK {
-		t.Fatalf("status = %d, body %v", code, out)
-	}
-	if d := moyData(t, out); d["status"] != "paid" || d["amount_due"] != float64(0) {
-		t.Fatalf("data = %v, want the invoice reported paid with nothing due", d)
-	}
-	if f.settler.existingCalls != 1 {
-		t.Fatalf("existing-payment checks = %d, want 1", f.settler.existingCalls)
-	}
-}
-
-// Showing the page is harmless; paying is what the failed check must block.
-func TestShowCheckout_ExistingPaymentCheckErrorStillShows(t *testing.T) {
-	f := newMoyCheckoutFixture("moyasar")
-	f.settler.existingErr = errors.New("moyasar: 503")
 	code, out := f.show(t)
 	if code != http.StatusOK || moyData(t, out)["status"] != "open" {
 		t.Fatalf("status = %d body %v, want the open invoice", code, out)
 	}
+	if f.settler.existingCalls != 0 || len(f.settler.settled) != 0 {
+		t.Fatalf("existing-payment checks = %d settled = %v, want none", f.settler.existingCalls, f.settler.settled)
+	}
 }
 
-func TestShowCheckout_PaidInvoiceIsNotChecked(t *testing.T) {
+// A buyer who already paid (the answer was lost) reopens the link and clicks
+// Pay: /pay finds the capture, settles it and says "paid" instead of handing
+// out a form that would take a second payment.
+func TestCheckout_PaidBuyerReopeningTheLinkIsToldPaidNotChargedAgain(t *testing.T) {
 	f := newMoyCheckoutFixture("moyasar")
-	f.inv.Status = "paid"
-	if code, _ := f.show(t); code != http.StatusOK || f.settler.existingCalls != 0 {
-		t.Fatalf("status = %d checks = %d, want no check", code, f.settler.existingCalls)
+	f.settler.existing = true
+	if code, out := f.show(t); code != http.StatusOK || moyData(t, out)["status"] != "open" {
+		t.Fatalf("show: status = %d body %v", code, out)
+	}
+	code, out := f.pay(t)
+	if code != http.StatusBadRequest || moyErrorCode(out) != codeInvoiceAlreadyPaid {
+		t.Fatalf("pay: status = %d code = %q, want 400 %s", code, moyErrorCode(out), codeInvoiceAlreadyPaid)
+	}
+	if _, ok := out["data"]; ok {
+		t.Fatal("pay handed out a payment form for an invoice already captured")
+	}
+	if f.settler.existingCalls != 1 || f.invoices.inv.Status != "paid" {
+		t.Fatalf("checks = %d status = %s, want one check that settled the invoice", f.settler.existingCalls, f.invoices.inv.Status)
+	}
+	if code, out := f.show(t); code != http.StatusOK || moyData(t, out)["status"] != "paid" {
+		t.Fatalf("reload: status = %d body %v, want paid", code, out)
 	}
 }
 

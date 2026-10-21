@@ -180,6 +180,9 @@ func NewCheckoutHandler(repo port.InvoiceRepository, gw port.PaymentGateway, ins
 }
 
 // ShowCheckout returns invoice data as JSON for the frontend checkout page.
+// It reads only the database: a public GET must not spend a secret-key
+// gateway call. An earlier capture that is not yet recorded is caught by
+// InitiatePayment, before any new payment can be taken.
 func (h *CheckoutHandler) ShowCheckout(c *gin.Context) {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -196,7 +199,6 @@ func (h *CheckoutHandler) ShowCheckout(c *gin.Context) {
 		respondError(c, http.StatusNotFound, codeNotFound, "invoice not found")
 		return
 	}
-	invoice = h.settleExistingPayment(c.Request.Context(), invoice)
 
 	c.JSON(http.StatusOK, gin.H{
 		"data": gin.H{
@@ -217,28 +219,6 @@ func (h *CheckoutHandler) ShowCheckout(c *gin.Context) {
 			"customer_id":        invoice.CustomerID,
 		},
 	})
-}
-
-// settleExistingPayment settles an unpaid invoice from a payment its gateway
-// already captured and returns the reloaded invoice, so the page shows it
-// paid. Showing is harmless, so a failed check only logs; InitiatePayment is
-// where it blocks.
-func (h *CheckoutHandler) settleExistingPayment(ctx context.Context, invoice *domain.Invoice) *domain.Invoice {
-	if h.moyasarSettler == nil || invoice.Status == domain.InvoiceStatusPaid {
-		return invoice
-	}
-	settled, err := h.moyasarSettler.SettleExistingPayment(ctx, invoice)
-	if err != nil {
-		h.logger.Warn("checkout: could not check for an already captured payment", "invoice_id", invoice.ID, "error", err)
-		return invoice
-	}
-	if !settled {
-		return invoice
-	}
-	if reloaded, err := h.invoiceRepo.GetByIDPublic(ctx, invoice.ID); err == nil && reloaded != nil {
-		return reloaded
-	}
-	return invoice
 }
 
 // InitiatePayment creates a payment order via the gateway and returns the order details.
