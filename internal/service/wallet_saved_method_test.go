@@ -237,3 +237,68 @@ func TestWalletSavedMethod_StripeCustomerUnchanged(t *testing.T) {
 		t.Fatalf("stripe charge refs = %q/%q, want cus_1/pm_1", got.CustomerRef, got.MethodRef)
 	}
 }
+
+// keyedCharger is a gateway that keeps every payment under its idempotency
+// key, as Moyasar's given_id does: a replay with the same amount returns the
+// stored payment, one with another amount is refused as a processing error
+// with no error (moyasar.go's mismatch read-back). dropFirst loses the first
+// response after the payment was captured.
+type keyedCharger struct {
+	payments  map[string]int64
+	dropFirst bool
+	reqs      []port.SavedMethodCharge
+}
+
+func (c *keyedCharger) ChargeSavedPaymentMethod(_ context.Context, req port.SavedMethodCharge) (*port.PaymentResult, error) {
+	c.reqs = append(c.reqs, req)
+	if amount, ok := c.payments[req.IdempotencyKey]; ok {
+		if amount != req.Amount {
+			return &port.PaymentResult{Success: false, ErrorCode: "processing_error"}, nil
+		}
+		return &port.PaymentResult{Success: true, PaymentID: req.IdempotencyKey}, nil
+	}
+	c.payments[req.IdempotencyKey] = req.Amount
+	if c.dropFirst {
+		c.dropFirst = false
+		return nil, errors.New("connection reset")
+	}
+	return &port.PaymentResult{Success: true, PaymentID: req.IdempotencyKey}, nil
+}
+
+// A recharge whose response was lost replays the amount it charged, even when
+// the auto-recharge amount changed in between: the replay finds the captured
+// payment and credits it, instead of being refused as a decline (which
+// advanced the key, so the captured payment was never credited and the
+// customer was charged again).
+func TestWalletRecharge_LostResponseReplaysTheChargedAmount(t *testing.T) {
+	svc, repo, ledger, _ := sarRechargeFixture()
+	charger := &keyedCharger{payments: map[string]int64{}, dropFirst: true}
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
+
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	more := int64(60000)
+	repo.dueList[0].AutoRechargeAmount = &more
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(charger.reqs) != 2 || charger.reqs[1].Amount != 50000 || charger.reqs[1].IdempotencyKey != charger.reqs[0].IdempotencyKey {
+		t.Fatalf("charges = %+v, want the lost 50000 charge replayed under its key", charger.reqs)
+	}
+	if len(repo.topUps) != 1 || repo.topUps[0].Amount != 50000 || len(ledger.topUps) != 1 {
+		t.Fatalf("top-ups = %+v, want the captured 50000 credited once", repo.topUps)
+	}
+	if o := repo.outcomes[len(repo.outcomes)-1]; !o.Answered || o.Failures != 0 {
+		t.Fatalf("last outcome = %+v, want a success", o)
+	}
+
+	// The next recharge is a new charge at the new amount.
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := charger.reqs[2]; got.Amount != 60000 || got.IdempotencyKey == charger.reqs[0].IdempotencyKey {
+		t.Fatalf("next recharge = %+v, want 60000 under a new key", got)
+	}
+}

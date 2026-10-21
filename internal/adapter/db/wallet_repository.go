@@ -468,6 +468,25 @@ func (r *WalletRepository) ListDueForRecharge(ctx context.Context, limit int) ([
 	return wallets, rows.Err()
 }
 
+// ReserveRechargeAmount freezes the amount of auto-recharge attempt `attempt`
+// (the first reservation wins) and returns it; ok is false once the attempt
+// is no longer current.
+func (r *WalletRepository) ReserveRechargeAmount(ctx context.Context, tenantID, walletID uuid.UUID, attempt int, amount int64) (int64, bool, error) {
+	var frozen int64
+	err := r.db.QueryRowContext(ctx, `
+		UPDATE wallets SET recharge_amount = COALESCE(recharge_amount, $4)
+		WHERE tenant_id = $1 AND id = $2 AND recharge_attempt = $3
+		RETURNING recharge_amount`,
+		tenantID, walletID, attempt, amount).Scan(&frozen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to reserve wallet recharge amount: %w", err)
+	}
+	return frozen, true, nil
+}
+
 // RecordRechargeOutcome stores the outcome of auto-recharge attempt `attempt`.
 // The attempt guard makes concurrent sweeps that charged under the same key
 // record it once. updated_at moves strictly forward (like every wallet write,
@@ -477,6 +496,7 @@ func (r *WalletRepository) RecordRechargeOutcome(ctx context.Context, tenantID, 
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE wallets
 		SET recharge_attempt = recharge_attempt + CASE WHEN $4 THEN 1 ELSE 0 END,
+		    recharge_amount = CASE WHEN $4 THEN NULL ELSE recharge_amount END,
 		    recharge_failures = $5, recharge_retry_at = $6, recharge_blocked_ref = $7,
 		    updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond')
 		WHERE tenant_id = $1 AND id = $2 AND recharge_attempt = $3`,

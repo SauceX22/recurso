@@ -503,13 +503,24 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 		return false
 	}
 
-	amount := *w.AutoRechargeAmount
 	// The key advances only once an attempt's outcome is known (paid or
 	// declined), so a sweep after a lost response replays the same charge,
 	// whatever else changed on the wallet meanwhile, and each legitimate
 	// recharge gets a fresh key. Gateway keys can live forever (Moyasar's
 	// given_id does), so a key that repeated across recharges would replay
-	// an old payment instead of charging.
+	// an old payment instead of charging. The amount is frozen with the
+	// attempt: a replay at another amount is refused by the gateway, and the
+	// payment the lost response captured would never be credited.
+	amount, current, err := s.wallets.ReserveRechargeAmount(ctx, w.TenantID, w.ID, w.RechargeAttempt, *w.AutoRechargeAmount)
+	if err != nil {
+		slog.WarnContext(ctx, "wallet auto-recharge: could not reserve the attempt", "wallet_id", w.ID, "error", err)
+		s.recordRechargeFailure(ctx, w, false, "")
+		return false
+	}
+	if !current {
+		// Another sweep already recorded this attempt's outcome.
+		return false
+	}
 	idemKey := fmt.Sprintf("wallet-recharge-%s-%d", w.ID, w.RechargeAttempt)
 	result, err := charger.ChargeSavedPaymentMethod(ctx, port.SavedMethodCharge{
 		CustomerRef:    m.CustomerRef,
