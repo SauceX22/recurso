@@ -126,7 +126,7 @@ describe("PortalPaymentMethod", () => {
       jsonResponse(409, { error: { code: "card_update_unsupported", message: "not supported" } })
     );
     renderDialog();
-    expect(await screen.findByText(/pay your next open invoice/i)).toBeInTheDocument();
+    expect(await screen.findByText(/pay your open renewal invoice/i)).toBeInTheDocument();
     expect(screen.queryByText("not supported")).toBeNull();
     expect(screen.queryByRole("button", { name: /us bank \(ach\)/i })).toBeNull();
     expect(screen.queryByTestId("payment-element")).toBeNull();
