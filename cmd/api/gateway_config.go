@@ -27,7 +27,9 @@ func gatewayModeFromEnv(getenv func(string) string, overrideGateways bool) (mode
 	}
 	var primary, extra []gatewayMode
 	if k := getenv("STRIPE_SECRET_KEY"); k != "" {
-		primary = append(primary, gatewayMode{"Stripe", !strings.HasPrefix(k, "sk_test")})
+		// Secret (sk_) and restricted (rk_) keys both carry the mode.
+		test := strings.HasPrefix(k, "sk_test") || strings.HasPrefix(k, "rk_test")
+		primary = append(primary, gatewayMode{"Stripe", !test})
 	}
 	if k := getenv("RAZORPAY_KEY_ID"); k != "" {
 		primary = append(primary, gatewayMode{"Razorpay", !strings.HasPrefix(k, "rzp_test")})
