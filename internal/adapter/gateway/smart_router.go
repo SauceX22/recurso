@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/recurso-dev/recurso/internal/core/domain"
 	"github.com/recurso-dev/recurso/internal/core/port"
 )
@@ -197,7 +199,11 @@ func (r *SmartRouter) CancelSubscription(ctx context.Context, subscriptionID str
 
 // Refund routes by the gateway payment id prefix (mirrors VerifyPayment's
 // prefix routing): Stripe issues pi_/ch_ ids, Razorpay issues pay_ ids.
-// Unknown prefixes (e.g. mock-era ids) fall back to currency routing.
+// Moyasar issues canonical UUIDs, which no other gateway does (GoCardless
+// PM..., Adyen 16-char pspReference), so a UUID goes to the registered
+// Moyasar gateway whatever the currency now routes to: a tenant that later
+// connected its own Stripe still refunds its older Moyasar payments there.
+// Other unknown ids (e.g. mock-era ids) fall back to currency routing.
 func (r *SmartRouter) Refund(ctx context.Context, paymentID string, amount int64, currency string) (*port.RefundResult, error) {
 	switch {
 	case strings.HasPrefix(paymentID, "pi_") || strings.HasPrefix(paymentID, "ch_"):
@@ -210,6 +216,8 @@ func (r *SmartRouter) Refund(ctx context.Context, paymentID string, amount int64
 			return nil, fmt.Errorf("razorpay gateway not configured for refund of %s", paymentID)
 		}
 		return r.Razorpay.Refund(ctx, paymentID, amount, currency)
+	case isMoyasarPaymentID(paymentID) && r.Extra[string(domain.GatewayMoyasar)] != nil:
+		return r.Extra[string(domain.GatewayMoyasar)].Refund(ctx, paymentID, amount, currency)
 	}
 
 	gw, err := r.gatewayFor(currency)
@@ -222,4 +230,14 @@ func (r *SmartRouter) Refund(ctx context.Context, paymentID string, amount int64
 // Virtual account operations route to Razorpay
 func (r *SmartRouter) CreateVirtualAccount(ctx context.Context, customerID, invoiceID string, amount int64, description string) (*port.VirtualAccountResult, error) {
 	return r.Razorpay.CreateVirtualAccount(ctx, customerID, invoiceID, amount, description)
+}
+
+// isMoyasarPaymentID reports a canonical 36-char UUID, the only id shape
+// Moyasar issues.
+func isMoyasarPaymentID(id string) bool {
+	if len(id) != 36 {
+		return false
+	}
+	_, err := uuid.Parse(id)
+	return err == nil
 }

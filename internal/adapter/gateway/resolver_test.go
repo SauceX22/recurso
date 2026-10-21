@@ -343,3 +343,30 @@ func TestResolverProviderForUsesTheTenantInContext(t *testing.T) {
 		}
 	}
 }
+
+// A tenant that connects its own Stripe after taking Moyasar payments must
+// still refund those payments on Moyasar: the payment id (a UUID, which no
+// other gateway issues) names the gateway, not the currency's current route.
+func TestResolverBYOStripeTenantRefundsMoyasarPaymentOnMoyasar(t *testing.T) {
+	byoStripe := uuid.New()
+	vault := &fakeVault{conns: map[uuid.UUID][]*domain.GatewayConnection{
+		byoStripe: {{ID: uuid.New(), Provider: domain.GatewayStripe, SecretKeyEnc: "sk", Active: true, UpdatedAt: time.Unix(1, 0)}},
+	}}
+	resolver := newTestResolver(vault)
+	resolver.env.RegisterGateway("moyasar", &stubGateway{name: "env-moyasar"})
+	if err := resolver.env.SetCurrencyOverrides("SAR=moyasar"); err != nil {
+		t.Fatal(err)
+	}
+	tg := NewTenantGateway(resolver, resolver.env)
+	ctx := context.WithValue(context.Background(), domain.TenantIDKey, byoStripe)
+
+	res, err := tg.Refund(ctx, uuid.NewString(), 100, "SAR")
+	if err != nil || res.RefundID != "env-moyasar" {
+		t.Fatalf("UUID payment refund = %+v, %v; want env-moyasar", res, err)
+	}
+	// Stripe ids still go to the tenant's own Stripe, whatever the currency.
+	res, err = tg.Refund(ctx, "pi_123", 100, "SAR")
+	if err != nil || res.RefundID != "byo-stripe:sk" {
+		t.Fatalf("pi_ refund = %+v, %v; want byo-stripe:sk", res, err)
+	}
+}
