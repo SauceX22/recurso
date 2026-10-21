@@ -114,13 +114,19 @@ to confirm a credit note exists. `payment_failed` and others are acked.
 
 ### Hosted checkout
 
-`GET /checkout/:id` shows `amount_due`; `POST /checkout/:id/pay` for SAR returns
-`gateway:"moyasar"`, `amount` = `AmountDue`, `save_card`, the publishable key,
-`description` and `metadata:{invoice_id}`. `MoyasarForm.jsx` loads the pinned,
+`GET /checkout/:id` shows `amount_due`; `POST /checkout/:id/pay` creates every
+gateway's order for `AmountDue`, and for SAR returns `gateway:"moyasar"`,
+`save_card`, `card_on_file` (`{merchant, amount, currency, interval,
+interval_count}`, the consent terms, when the card is saved), the publishable
+key, `description` and `metadata:{invoice_id}`. Before showing or handing out
+the form, `SettleExistingPayment` asks Moyasar for a paid payment bound to the
+invoice and settles it, so a renewal whose answer was lost is never paid twice
+(`/pay` fails closed with 502 if it can't check). `MoyasarForm.jsx` loads the pinned,
 SRI-checked assets (`moyasarAssets.js`) and mounts `Moyasar.init` (mada, visa,
 mastercard; `callback_url` `/checkout/<id>?gateway=moyasar`). The return calls
 `POST /checkout/:id/moyasar/verify {payment_id}`, which reads back, binds and
-settles only `paid`. The browser never marks an invoice paid.
+settles only `paid`; void and draft invoices answer 409, and the route is
+limited per invoice as well as per IP. The browser never marks an invoice paid.
 
 **Arabic/RTL.** `lib/checkoutCopy.js` has English and Arabic copy, picked from
 the browser language; Arabic sets `dir="rtl"` and the form's `language: "ar"`.
@@ -129,8 +135,10 @@ the browser language; Arabic sets `dir="rtl"` and the form's `language: "ar"`.
 
 No Moyasar card-setup flow exists (a Stripe setup would move renewals to
 Stripe), so `PaymentMethodUpdatePolicy` marks Moyasar not self-serve: the
-portal returns 409 `card_update_unsupported`, `cardUpdate.js` says to pay the
-next open invoice with the new card, and dunning/card-expiry emails link there.
+portal returns 409 `card_update_unsupported`, and the profile's
+`card_update_invoice_id` names the open invoice of a renewing subscription whose
+payment saves the new card (null when none would). Dunning emails link to the
+dunned invoice's checkout, card-expiry emails to that invoice.
 
 ## Env vars and boot validation
 
@@ -176,8 +184,6 @@ names only cards and Apple Pay). A refusal or 3DS demand returns `failed` or
 - Moyasar charges are not written to the tenant payments log.
 - `CreatePlan.jsx` offers only USD/INR/EUR/GBP; SAR plans need the API.
 - Pre-existing: the retry worker writes back the whole (possibly stale) row.
-- Pre-existing: Stripe/Razorpay checkout orders charge `Total`, not `AmountDue`.
-
 ## Founder-gated: sandbox verification before dropping EXPERIMENTAL
 
 1. Test account with **Tokenization enabled**; env vars set; webhook registered.
