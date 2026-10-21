@@ -203,7 +203,9 @@ export default function Checkout() {
 
   // Load the invoice for display + paid check.
   useEffect(() => {
-    fetch(`${API_BASE}/checkout/${id}`)
+    // The page and this API share /checkout/:id; without no-store a reload can
+    // answer the fetch from the cached page HTML.
+    fetch(`${API_BASE}/checkout/${id}`, { cache: "no-store", headers: { Accept: "application/json" } })
       .then((res) => {
         if (!res.ok) throw new Error("Invoice not found");
         return res.json();

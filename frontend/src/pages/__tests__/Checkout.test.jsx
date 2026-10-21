@@ -55,6 +55,18 @@ describe("Checkout (money-critical public flow)", () => {
         await waitFor(() => expect(screen.getAllByText(/\$42\.00/).length).toBeGreaterThan(0));
     });
 
+    it("asks for JSON and bypasses the HTTP cache when loading the invoice", async () => {
+        // The page and the invoice API share the URL /checkout/:id; on reload the
+        // browser would otherwise answer the fetch with the cached page HTML.
+        const fetchMock = vi.fn(() => json(200, { data: invoice() }));
+        vi.stubGlobal("fetch", fetchMock);
+        renderAt("inv_cache");
+        await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(url).toMatch(/\/checkout\/inv_cache$/);
+        expect(init).toMatchObject({ cache: "no-store", headers: { Accept: "application/json" } });
+    });
+
     it("shows a not-found error when the invoice can't be loaded", async () => {
         vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({ ok: false })));
         renderAt("missing");
