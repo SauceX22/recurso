@@ -18,10 +18,26 @@ func (f fakeSavedMethods) GetSavedPaymentMethod(context.Context, uuid.UUID) (dom
 	return f.m, f.err
 }
 
-type fakeCustomerInvoices struct{ list []*domain.Invoice }
+// fakeCustomerInvoices serves the two targeted reads the policy may make and
+// records their bounds; it has no unbounded history read to call.
+type fakeCustomerInvoices struct {
+	list       []*domain.Invoice // newest first
+	cardSaving []*domain.Invoice // as ListCardSavingInvoices orders them
+	pagedLimit []int
+	savingCall int
+}
 
-func (f fakeCustomerInvoices) GetByCustomerID(context.Context, uuid.UUID) ([]*domain.Invoice, error) {
-	return f.list, nil
+func (f *fakeCustomerInvoices) GetByCustomerIDPaged(_ context.Context, _ uuid.UUID, limit, offset int) ([]*domain.Invoice, error) {
+	f.pagedLimit = append(f.pagedLimit, limit)
+	if offset >= len(f.list) {
+		return nil, nil
+	}
+	return f.list[offset:min(len(f.list), offset+limit)], nil
+}
+
+func (f *fakeCustomerInvoices) ListCardSavingInvoices(_ context.Context, _ uuid.UUID, limit int) ([]*domain.Invoice, error) {
+	f.savingCall++
+	return f.cardSaving[:min(len(f.cardSaving), limit)], nil
 }
 
 // routeSAR mimics a deployment that routes SAR to the gateway without a
@@ -34,12 +50,15 @@ func routeSAR(currency string) domain.GatewayProvider {
 }
 
 func newUpdatePolicy(saved domain.SavedPaymentMethod, invoices ...*domain.Invoice) *PaymentMethodUpdatePolicy {
-	return NewPaymentMethodUpdatePolicy(fakeSavedMethods{m: saved}, fakeCustomerInvoices{list: invoices}, routeSAR, domain.GatewayMoyasar)
+	return NewPaymentMethodUpdatePolicy(fakeSavedMethods{m: saved}, &fakeCustomerInvoices{list: invoices}, routeSAR, domain.GatewayMoyasar)
 }
 
+var (
+	stripeCard  = domain.SavedPaymentMethod{Provider: domain.GatewayStripe, CustomerRef: "cus_1", PaymentMethodRef: "pm_1"}
+	gatewayCard = domain.SavedPaymentMethod{Provider: domain.GatewayMoyasar, PaymentMethodRef: "token_1"}
+)
+
 func TestPaymentMethodUpdatePolicy_Provider(t *testing.T) {
-	stripeCard := domain.SavedPaymentMethod{CustomerRef: "cus_1", PaymentMethodRef: "pm_1"}
-	gatewayCard := domain.SavedPaymentMethod{Provider: "moyasar", PaymentMethodRef: "token_1"}
 	sarInvoice := &domain.Invoice{ID: uuid.New(), Currency: "SAR", Status: domain.InvoiceStatusPaid}
 	usdInvoice := &domain.Invoice{ID: uuid.New(), Currency: "USD", Status: domain.InvoiceStatusPaid}
 	cases := []struct {
@@ -70,23 +89,65 @@ func TestPaymentMethodUpdatePolicy_Provider(t *testing.T) {
 	}
 }
 
+// The portal calls this on every profile load: it reads at most the latest
+// invoice, never the customer's whole history.
+func TestPaymentMethodUpdatePolicy_ProviderReadsOnlyTheLatestInvoice(t *testing.T) {
+	invoices := &fakeCustomerInvoices{list: []*domain.Invoice{{Currency: "USD"}, {Currency: "SAR"}, {Currency: "SAR"}}}
+	p := NewPaymentMethodUpdatePolicy(fakeSavedMethods{m: stripeCard}, invoices, routeSAR, domain.GatewayMoyasar)
+	if got := p.Provider(context.Background(), uuid.New(), ""); got != domain.GatewayStripe {
+		t.Fatalf("Provider = %q, want stripe from the latest (USD) invoice", got)
+	}
+	if len(invoices.pagedLimit) != 1 || invoices.pagedLimit[0] != 1 {
+		t.Fatalf("paged reads = %v, want one read of limit 1", invoices.pagedLimit)
+	}
+}
+
+func TestPaymentMethodUpdatePolicy_CardUpdateInvoice(t *testing.T) {
+	sarOpen := &domain.Invoice{ID: uuid.New(), Currency: "SAR", Status: domain.InvoiceStatusOpen}
+	usdOpen := &domain.Invoice{ID: uuid.New(), Currency: "USD", Status: domain.InvoiceStatusOpen}
+	cases := []struct {
+		name       string
+		cardSaving []*domain.Invoice
+		provider   domain.GatewayProvider
+		want       uuid.UUID
+	}{
+		{"first card-saving invoice on the gateway", []*domain.Invoice{sarOpen}, domain.GatewayMoyasar, sarOpen.ID},
+		{"skips one collected on another gateway", []*domain.Invoice{usdOpen, sarOpen}, domain.GatewayMoyasar, sarOpen.ID},
+		{"none on the gateway", []*domain.Invoice{usdOpen}, domain.GatewayMoyasar, uuid.Nil},
+		{"none at all", nil, domain.GatewayMoyasar, uuid.Nil},
+		{"self-serve needs none", []*domain.Invoice{usdOpen}, domain.GatewayStripe, uuid.Nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewPaymentMethodUpdatePolicy(fakeSavedMethods{}, &fakeCustomerInvoices{cardSaving: tc.cardSaving}, routeSAR, domain.GatewayMoyasar)
+			if got := p.CardUpdateInvoice(context.Background(), uuid.New(), tc.provider); got != tc.want {
+				t.Fatalf("CardUpdateInvoice = %s, want %s", got, tc.want)
+			}
+		})
+	}
+	var nilPolicy *PaymentMethodUpdatePolicy
+	if got := nilPolicy.CardUpdateInvoice(context.Background(), uuid.New(), domain.GatewayMoyasar); got != uuid.Nil {
+		t.Fatalf("nil policy = %s", got)
+	}
+}
+
 func TestPaymentMethodUpdatePolicy_UpdatePaymentURL(t *testing.T) {
-	gatewayCard := domain.SavedPaymentMethod{Provider: "moyasar", PaymentMethodRef: "token_1"}
-	stripeCard := domain.SavedPaymentMethod{CustomerRef: "cus_1", PaymentMethodRef: "pm_1"}
 	open := &domain.Invoice{ID: uuid.New(), Currency: "SAR", Status: domain.InvoiceStatusOpen}
-	paid := &domain.Invoice{ID: uuid.New(), Currency: "SAR", Status: domain.InvoiceStatusPaid}
 	given := uuid.New()
 	const base = "https://app.example.com/"
+	withSaving := func(saved domain.SavedPaymentMethod, saving ...*domain.Invoice) *PaymentMethodUpdatePolicy {
+		return NewPaymentMethodUpdatePolicy(fakeSavedMethods{m: saved}, &fakeCustomerInvoices{cardSaving: saving}, routeSAR, domain.GatewayMoyasar)
+	}
 	cases := []struct {
 		name      string
 		policy    *PaymentMethodUpdatePolicy
 		invoiceID uuid.UUID
 		want      string
 	}{
-		{"self-serve customer goes to the portal", newUpdatePolicy(stripeCard), given, "https://app.example.com/portal/login"},
-		{"given invoice's checkout", newUpdatePolicy(gatewayCard, open), given, "https://app.example.com/checkout/" + given.String()},
-		{"latest open invoice's checkout", newUpdatePolicy(gatewayCard, paid, open), uuid.Nil, "https://app.example.com/checkout/" + open.ID.String()},
-		{"nothing to pay falls back to the portal", newUpdatePolicy(gatewayCard, paid), uuid.Nil, "https://app.example.com/portal/login"},
+		{"self-serve customer goes to the portal", withSaving(stripeCard), given, "https://app.example.com/portal/login"},
+		{"given invoice's checkout", withSaving(gatewayCard, open), given, "https://app.example.com/checkout/" + given.String()},
+		{"card-saving invoice's checkout", withSaving(gatewayCard, open), uuid.Nil, "https://app.example.com/checkout/" + open.ID.String()},
+		{"nothing that saves the card falls back to the portal", withSaving(gatewayCard), uuid.Nil, "https://app.example.com/portal/login"},
 		{"nil policy keeps the portal", nil, given, "https://app.example.com/portal/login"},
 	}
 	for _, tc := range cases {

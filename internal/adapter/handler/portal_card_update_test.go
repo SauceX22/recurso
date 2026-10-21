@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/recurso-dev/recurso/internal/core/domain"
 	"github.com/recurso-dev/recurso/internal/core/port"
+	"github.com/recurso-dev/recurso/internal/core/port/porttest"
 	"github.com/recurso-dev/recurso/internal/service"
 )
 
@@ -19,7 +20,15 @@ import (
 type fixedCardUpdatePolicy struct {
 	provider  domain.GatewayProvider
 	selfServe bool
+	invoiceID uuid.UUID
 	asked     []uuid.UUID
+}
+
+func (p *fixedCardUpdatePolicy) CardUpdateInvoice(_ context.Context, _ uuid.UUID, provider domain.GatewayProvider) uuid.UUID {
+	if provider != p.provider {
+		return uuid.Nil
+	}
+	return p.invoiceID
 }
 
 func (p *fixedCardUpdatePolicy) Provider(_ context.Context, customerID uuid.UUID, _ string) domain.GatewayProvider {
@@ -146,7 +155,7 @@ func TestPortalCardUpdate_SelfServeCustomerProceeds(t *testing.T) {
 }
 
 type profileCustomerRepo struct {
-	port.CustomerRepository
+	porttest.UnimplementedCustomerRepository
 	cust *domain.Customer
 }
 
@@ -155,14 +164,17 @@ func (r *profileCustomerRepo) GetByIDPublic(context.Context, uuid.UUID) (*domain
 }
 
 func TestPortalProfile_ExposesCardUpdateProvider(t *testing.T) {
+	payable := uuid.New()
 	cases := map[string]struct {
 		policy        cardUpdatePolicy
 		wantProvider  string
 		wantSupported bool
+		wantInvoice   any // the JSON value of card_update_invoice_id
 	}{
-		"gateway without setup": {&fixedCardUpdatePolicy{provider: domain.GatewayMoyasar}, "moyasar", false},
-		"stripe":                {&fixedCardUpdatePolicy{provider: domain.GatewayStripe, selfServe: true}, "stripe", true},
-		"no policy":             {nil, "stripe", true},
+		"gateway without setup, invoice to pay": {&fixedCardUpdatePolicy{provider: domain.GatewayMoyasar, invoiceID: payable}, "moyasar", false, payable.String()},
+		"gateway without setup, nothing to pay": {&fixedCardUpdatePolicy{provider: domain.GatewayMoyasar}, "moyasar", false, nil},
+		"stripe":                                {&fixedCardUpdatePolicy{provider: domain.GatewayStripe, selfServe: true, invoiceID: payable}, "stripe", true, nil},
+		"no policy":                             {nil, "stripe", true, nil},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -190,6 +202,9 @@ func TestPortalProfile_ExposesCardUpdateProvider(t *testing.T) {
 			}
 			if out["payment_method_provider"] != tc.wantProvider || out["card_update_supported"] != tc.wantSupported {
 				t.Fatalf("provider=%v supported=%v, want %s/%v", out["payment_method_provider"], out["card_update_supported"], tc.wantProvider, tc.wantSupported)
+			}
+			if got, present := out["card_update_invoice_id"]; !present || got != tc.wantInvoice {
+				t.Fatalf("card_update_invoice_id = %v (present %v), want %v", got, present, tc.wantInvoice)
 			}
 			if p, ok := tc.policy.(*fixedCardUpdatePolicy); ok && (len(p.asked) != 1 || p.asked[0] != cid) {
 				t.Fatalf("policy asked about %v, want the session customer %s", p.asked, cid)

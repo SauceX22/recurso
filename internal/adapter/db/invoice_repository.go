@@ -1528,3 +1528,27 @@ func (r *InvoiceRepository) MarkAsUncollectible(ctx context.Context, invoiceID u
 	}
 	return nil
 }
+
+// ListCardSavingInvoices returns up to limit of the customer's open or
+// past-due invoices on a subscription that will renew (not canceled, not
+// cancelling at period end), oldest due first: paying one saves the card for
+// the renewals. Cross-tenant by customer id: the portal session and the
+// card-expiry sweep carry no tenant, and customer ids are unique UUIDs.
+func (r *InvoiceRepository) ListCardSavingInvoices(ctx context.Context, customerID uuid.UUID, limit int) ([]*domain.Invoice, error) {
+	query := `SELECT ` + invoiceListColumns + `
+		FROM invoices i
+		WHERE i.customer_id = $1
+		  AND i.status IN ('open', 'past_due')
+		  AND EXISTS (
+			SELECT 1 FROM subscriptions s
+			WHERE s.id = i.subscription_id AND s.tenant_id = i.tenant_id
+			  AND s.status <> 'canceled' AND NOT s.cancel_at_period_end)
+		ORDER BY i.due_date ASC, i.created_at ASC
+		LIMIT $2`
+	rows, err := r.db.QueryContext(ctx, query, customerID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list card-saving invoices: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return scanInvoiceList(rows)
+}
