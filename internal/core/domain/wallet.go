@@ -59,10 +59,16 @@ type Wallet struct {
 	Balance int64 `json:"balance"`
 	// Auto-recharge: when Balance falls below Threshold, charge the saved
 	// payment method Amount. Both nil = disabled.
-	AutoRechargeThreshold *int64    `json:"auto_recharge_threshold,omitempty"`
-	AutoRechargeAmount    *int64    `json:"auto_recharge_amount,omitempty"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	AutoRechargeThreshold *int64 `json:"auto_recharge_threshold,omitempty"`
+	AutoRechargeAmount    *int64 `json:"auto_recharge_amount,omitempty"`
+	// RechargeAttempt numbers auto-recharge attempts; it is part of the
+	// charge's idempotency key and advances only once an attempt's outcome is
+	// known. RechargeFailures is the current run of failed attempts, for
+	// backoff. Internal only.
+	RechargeAttempt  int       `json:"-"`
+	RechargeFailures int       `json:"-"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 	// ClosedAt is set when the wallet is closed/cashed out; a closed wallet has a
 	// zero balance and accepts no further top-ups or drains. nil = open.
 	ClosedAt *time.Time `json:"closed_at,omitempty"`

@@ -24,12 +24,13 @@ func NewWalletRepository(db *sql.DB) port.WalletRepository {
 	return &WalletRepository{db: db}
 }
 
-const walletColumns = `id, tenant_id, entity_id, customer_id, currency, balance, auto_recharge_threshold, auto_recharge_amount, created_at, updated_at, closed_at`
+const walletColumns = `id, tenant_id, entity_id, customer_id, currency, balance, auto_recharge_threshold, auto_recharge_amount, created_at, updated_at, closed_at, recharge_attempt, recharge_failures`
 
 func scanWallet(row interface{ Scan(...any) error }) (*domain.Wallet, error) {
 	var w domain.Wallet
 	if err := row.Scan(&w.ID, &w.TenantID, &w.EntityID, &w.CustomerID, &w.Currency, &w.Balance,
-		&w.AutoRechargeThreshold, &w.AutoRechargeAmount, &w.CreatedAt, &w.UpdatedAt, &w.ClosedAt); err != nil {
+		&w.AutoRechargeThreshold, &w.AutoRechargeAmount, &w.CreatedAt, &w.UpdatedAt, &w.ClosedAt,
+		&w.RechargeAttempt, &w.RechargeFailures); err != nil {
 		return nil, err
 	}
 	return &w, nil
@@ -447,6 +448,9 @@ func (r *WalletRepository) ListDueForRecharge(ctx context.Context, limit int) ([
 		AND auto_recharge_amount > 0
 		AND balance < auto_recharge_threshold
 		AND closed_at IS NULL
+		AND (recharge_retry_at IS NULL OR recharge_retry_at <= NOW())
+		AND (recharge_blocked_ref IS NULL OR recharge_blocked_ref IS DISTINCT FROM
+		     (SELECT c.default_payment_method FROM customers c WHERE c.id = wallets.customer_id))
 		ORDER BY updated_at
 		LIMIT $1`, limit)
 	if err != nil {
@@ -464,16 +468,21 @@ func (r *WalletRepository) ListDueForRecharge(ctx context.Context, limit int) ([
 	return wallets, rows.Err()
 }
 
-// MarkRechargeAttempted moves updated_at forward after a declined recharge.
-// Every wallet write advances updated_at strictly (never back to an earlier
-// NOW()), because the auto-recharge idempotency key is derived from it and
-// must never repeat.
-func (r *WalletRepository) MarkRechargeAttempted(ctx context.Context, tenantID, walletID uuid.UUID) error {
-	_, err := r.db.ExecContext(ctx,
-		`UPDATE wallets SET updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond') WHERE tenant_id = $1 AND id = $2`,
-		tenantID, walletID)
+// RecordRechargeOutcome stores the outcome of auto-recharge attempt `attempt`.
+// The attempt guard makes concurrent sweeps that charged under the same key
+// record it once. updated_at moves strictly forward (like every wallet write,
+// never back to an earlier NOW()), which sends the wallet to the back of the
+// recharge queue.
+func (r *WalletRepository) RecordRechargeOutcome(ctx context.Context, tenantID, walletID uuid.UUID, attempt int, o port.RechargeOutcome) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE wallets
+		SET recharge_attempt = recharge_attempt + CASE WHEN $4 THEN 1 ELSE 0 END,
+		    recharge_failures = $5, recharge_retry_at = $6, recharge_blocked_ref = $7,
+		    updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond')
+		WHERE tenant_id = $1 AND id = $2 AND recharge_attempt = $3`,
+		tenantID, walletID, attempt, o.Answered, o.Failures, o.RetryAt, nilIfEmpty(o.BlockedMethodRef))
 	if err != nil {
-		return fmt.Errorf("failed to mark wallet recharge attempted: %w", err)
+		return fmt.Errorf("failed to record wallet recharge outcome: %w", err)
 	}
 	return nil
 }

@@ -19,6 +19,10 @@ func (r *dueWalletRepo) ListDueForRecharge(context.Context, int) ([]domain.Walle
 	return r.due, nil
 }
 
+func (r *dueWalletRepo) RecordRechargeOutcome(context.Context, uuid.UUID, uuid.UUID, int, port.RechargeOutcome) error {
+	return nil
+}
+
 // noSavedMethodLookup reports no saved card, forcing the failure notice.
 type noSavedMethodLookup struct{}
 

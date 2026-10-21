@@ -32,6 +32,22 @@ type WalletCloseResult struct {
 	ForfeitTxID uuid.UUID
 }
 
+// RechargeOutcome is how one wallet auto-recharge attempt ended.
+type RechargeOutcome struct {
+	// Answered: the gateway gave an answer (paid or declined), so the next
+	// attempt is a new charge under a new idempotency key. After a lost
+	// response the payment may exist, so the next attempt replays the key.
+	Answered bool
+	// Failures is the run of failed attempts including this one; 0 on success.
+	Failures int
+	// RetryAt keeps the wallet out of the recharge sweep until then; nil
+	// makes it due again at once.
+	RetryAt *time.Time
+	// BlockedMethodRef is the saved method a hard decline came from:
+	// auto-recharge waits until the customer's saved method is another one.
+	BlockedMethodRef string
+}
+
 // WalletRepository persists prepaid wallets (Lago-parity B1). Drain and
 // TopUp are transactional: the movement row, the residue bookkeeping, and
 // the denormalized balance always change together.
@@ -66,13 +82,16 @@ type WalletRepository interface {
 	// expiry transactions and reducing balances. Returns one WalletExpiry per
 	// wallet touched so the caller can post the discharging ledger legs.
 	ExpireOverdue(ctx context.Context, now time.Time) ([]WalletExpiry, error)
-	// ListDueForRecharge returns wallets whose auto-recharge is configured
-	// and whose balance sits below the threshold.
+	// ListDueForRecharge returns wallets whose auto-recharge is configured,
+	// whose balance sits below the threshold, that are not backing off after
+	// a failed attempt, and whose hard-declined method (if any) is no longer
+	// the customer's saved method.
 	ListDueForRecharge(ctx context.Context, limit int) ([]domain.Wallet, error)
-	// MarkRechargeAttempted bumps the wallet's updated_at after a declined
-	// auto-recharge, so the next attempt gets a fresh idempotency key and the
-	// wallet moves to the back of the recharge queue.
-	MarkRechargeAttempted(ctx context.Context, tenantID, walletID uuid.UUID) error
+	// RecordRechargeOutcome stores how auto-recharge attempt `attempt` (the
+	// wallet's RechargeAttempt when it was charged) ended. It is conditional
+	// on that attempt still being current, so two sweeps that charged under
+	// the same key record it once.
+	RecordRechargeOutcome(ctx context.Context, tenantID, walletID uuid.UUID, attempt int, o RechargeOutcome) error
 
 	ListTransactions(ctx context.Context, tenantID, walletID uuid.UUID, limit int) ([]domain.WalletTransaction, error)
 }

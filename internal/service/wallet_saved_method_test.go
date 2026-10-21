@@ -106,19 +106,15 @@ func TestWalletRecharge_ChargesForTheWalletNotAnInvoice(t *testing.T) {
 // replay the first top-up's payment, and the credit would be dropped as a
 // duplicate, so the wallet is never refilled.
 func TestWalletRecharge_SameBalanceAgainIsANewCharge(t *testing.T) {
-	svc, repo, ledger, w := sarRechargeFixture()
+	svc, repo, ledger, _ := sarRechargeFixture()
 	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
 	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
 
-	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// Drained back to the same balance later: same balance, newer row.
-	again := *w
-	again.UpdatedAt = w.UpdatedAt.Add(time.Hour)
-	repo.dueList = []domain.Wallet{again}
-	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
-		t.Fatal(err)
+	// Two recharges of the same wallet at the same balance.
+	for i := 0; i < 2; i++ {
+		if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if len(charger.reqs) != 2 || charger.reqs[0].IdempotencyKey == charger.reqs[1].IdempotencyKey {
 		t.Fatalf("keys = %+v, want two different keys", charger.reqs)
@@ -126,46 +122,96 @@ func TestWalletRecharge_SameBalanceAgainIsANewCharge(t *testing.T) {
 	if len(repo.topUps) != 2 || len(ledger.topUps) != 2 {
 		t.Fatalf("top-ups=%d ledger=%d, want both recharges credited", len(repo.topUps), len(ledger.topUps))
 	}
+	if o := repo.outcomes[0]; !o.Answered || o.Failures != 0 || o.RetryAt != nil || o.BlockedMethodRef != "" {
+		t.Fatalf("success outcome = %+v, want answered with the failure run reset", o)
+	}
 }
 
-// After a confirmed decline the next sweep must try again under a new key;
-// replaying the declined payment's key would decline forever, even after the
-// customer fixes their card.
-func TestWalletRecharge_DeclineAdvancesTheKey(t *testing.T) {
-	svc, repo, _, w := sarRechargeFixture()
-	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: false, ErrorCode: "insufficient_funds"}}
-	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
+// After a decline the next attempt is a new charge under a new key (replaying
+// the declined payment's key would decline forever), but not on the next
+// sweep: every five minutes is a retry storm card networks fine. The wait
+// grows with each failure.
+func TestWalletRecharge_DeclineBacksOffAndAdvancesTheKey(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		priorFailures int
+		wantWait      time.Duration
+	}{{0, time.Hour}, {1, 6 * time.Hour}, {2, 24 * time.Hour}, {7, 24 * time.Hour}} {
+		svc, repo, _, _ := sarRechargeFixture()
+		repo.dueList[0].RechargeFailures = tc.priorFailures
+		charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: false, ErrorCode: "insufficient_funds"}}
+		svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
 
-	for i := 0; i < 2; i++ {
-		if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
-			t.Fatal(err)
+		for i := 0; i < 2; i++ {
+			if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		o := repo.outcomes[0]
+		if !o.Answered || o.Failures != tc.priorFailures+1 || o.RetryAt == nil || !o.RetryAt.Equal(now.Add(tc.wantWait)) || o.BlockedMethodRef != "" {
+			t.Fatalf("after %d failures: outcome = %+v, want answered, failure %d, retry at +%v", tc.priorFailures, o, tc.priorFailures+1, tc.wantWait)
+		}
+		if charger.reqs[0].IdempotencyKey == charger.reqs[1].IdempotencyKey {
+			t.Fatalf("key %q repeated after a decline", charger.reqs[0].IdempotencyKey)
 		}
 	}
-	if len(repo.attempted) != 2 || repo.attempted[0] != w.ID {
-		t.Fatalf("attempts recorded = %v, want the wallet twice", repo.attempted)
-	}
-	if charger.reqs[0].IdempotencyKey == charger.reqs[1].IdempotencyKey {
-		t.Fatalf("key %q repeated after a decline", charger.reqs[0].IdempotencyKey)
-	}
 }
 
-// An outage is not an answer: the payment may exist, so the next sweep must
-// replay the same key rather than risk a second charge.
-func TestWalletRecharge_ErrorKeepsTheKey(t *testing.T) {
-	svc, repo, _, _ := sarRechargeFixture()
+// A lost response is not an answer: the payment may exist, so every later
+// attempt replays the same key, even after the wallet was drained further in
+// between (its balance and updated_at both moved), until an answer arrives.
+func TestWalletRecharge_LostResponseKeepsTheKey(t *testing.T) {
+	svc, repo, ledger, _ := sarRechargeFixture()
 	charger := &fakeRenewalCharger{err: errors.New("timeout")}
 	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
 
-	for i := 0; i < 2; i++ {
-		if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	if len(repo.attempted) != 0 {
-		t.Fatalf("attempts recorded = %v, want none after an error", repo.attempted)
+	if o := repo.outcomes[0]; o.Answered || o.Failures != 1 || o.RetryAt == nil {
+		t.Fatalf("outcome = %+v, want unanswered with a backoff", o)
+	}
+	// Usage drained the wallet further before the next sweep.
+	repo.dueList[0].Balance -= 300
+	repo.dueList[0].UpdatedAt = repo.dueList[0].UpdatedAt.Add(time.Hour)
+	charger.err, charger.result = nil, &port.PaymentResult{Success: true}
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	if charger.reqs[0].IdempotencyKey != charger.reqs[1].IdempotencyKey {
-		t.Fatalf("keys %q and %q differ after an error", charger.reqs[0].IdempotencyKey, charger.reqs[1].IdempotencyKey)
+		t.Fatalf("keys %q and %q differ across a lost response", charger.reqs[0].IdempotencyKey, charger.reqs[1].IdempotencyKey)
+	}
+	if len(repo.topUps) != 1 || len(ledger.topUps) != 1 {
+		t.Fatalf("top-ups=%d ledger=%d, want the replayed payment credited once", len(repo.topUps), len(ledger.topUps))
+	}
+}
+
+// A hard decline (lost, stolen, closed card) stops auto-recharge until the
+// customer saves another method; the repository filters on it.
+func TestWalletRecharge_HardDeclineBlocksTheMethod(t *testing.T) {
+	svc, repo, _, _ := sarRechargeFixture()
+	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: false, ErrorCode: "lost_or_stolen", Permanent: true}}
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
+
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if o := repo.outcomes[0]; !o.Answered || o.BlockedMethodRef != "token_abc" {
+		t.Fatalf("outcome = %+v, want the declined token blocked", o)
+	}
+}
+
+// With nothing to charge the customer is told once per backoff step, not on
+// every sweep.
+func TestWalletRecharge_NoSavedMethodBacksOff(t *testing.T) {
+	svc, repo, _, _ := sarRechargeFixture()
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{}, moyasarRouter(&fakeRenewalCharger{}))
+
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.outcomes) != 1 || repo.outcomes[0].RetryAt == nil || repo.outcomes[0].Answered {
+		t.Fatalf("outcomes = %+v, want one backoff that keeps the key", repo.outcomes)
 	}
 }
 

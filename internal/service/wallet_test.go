@@ -20,7 +20,7 @@ type fakeWalletRepo struct {
 	drains     []int64 // maxAmount requested
 	drainGives int64   // amount the fake "drains"
 	dueList    []domain.Wallet
-	attempted  []uuid.UUID // MarkRechargeAttempted calls
+	outcomes   []port.RechargeOutcome
 }
 
 func (f *fakeWalletRepo) Create(ctx context.Context, w *domain.Wallet) error {
@@ -67,14 +67,19 @@ func (f *fakeWalletRepo) ListDueForRecharge(ctx context.Context, limit int) ([]d
 	return f.dueList, nil
 }
 
-// MarkRechargeAttempted records the call and, like the real row's
-// updated_at, moves the listed wallet's UpdatedAt forward.
-func (f *fakeWalletRepo) MarkRechargeAttempted(ctx context.Context, tenantID, walletID uuid.UUID) error {
-	f.attempted = append(f.attempted, walletID)
+// RecordRechargeOutcome records the outcome and, like the conditional
+// UPDATE, applies it to the listed wallet only while attempt is current.
+func (f *fakeWalletRepo) RecordRechargeOutcome(_ context.Context, _, walletID uuid.UUID, attempt int, o port.RechargeOutcome) error {
+	f.outcomes = append(f.outcomes, o)
 	for i := range f.dueList {
-		if f.dueList[i].ID == walletID {
-			f.dueList[i].UpdatedAt = f.dueList[i].UpdatedAt.Add(time.Second)
+		w := &f.dueList[i]
+		if w.ID != walletID || w.RechargeAttempt != attempt {
+			continue
 		}
+		if o.Answered {
+			w.RechargeAttempt++
+		}
+		w.RechargeFailures = o.Failures
 	}
 	return nil
 }
