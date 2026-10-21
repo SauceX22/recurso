@@ -24,15 +24,17 @@ func NewWalletRepository(db *sql.DB) port.WalletRepository {
 	return &WalletRepository{db: db}
 }
 
-const walletColumns = `id, tenant_id, entity_id, customer_id, currency, balance, auto_recharge_threshold, auto_recharge_amount, created_at, updated_at, closed_at, recharge_attempt, recharge_failures`
+const walletColumns = `id, tenant_id, entity_id, customer_id, currency, balance, auto_recharge_threshold, auto_recharge_amount, created_at, updated_at, closed_at, recharge_attempt, recharge_failures, recharge_declines, recharge_declines_ref`
 
 func scanWallet(row interface{ Scan(...any) error }) (*domain.Wallet, error) {
 	var w domain.Wallet
+	var declinesRef sql.NullString
 	if err := row.Scan(&w.ID, &w.TenantID, &w.EntityID, &w.CustomerID, &w.Currency, &w.Balance,
 		&w.AutoRechargeThreshold, &w.AutoRechargeAmount, &w.CreatedAt, &w.UpdatedAt, &w.ClosedAt,
-		&w.RechargeAttempt, &w.RechargeFailures); err != nil {
+		&w.RechargeAttempt, &w.RechargeFailures, &w.RechargeDeclines, &declinesRef); err != nil {
 		return nil, err
 	}
+	w.RechargeDeclinesRef = declinesRef.String
 	return &w, nil
 }
 
@@ -497,9 +499,11 @@ func (r *WalletRepository) RecordRechargeOutcome(ctx context.Context, tenantID, 
 		SET recharge_attempt = recharge_attempt + CASE WHEN $4 THEN 1 ELSE 0 END,
 		    recharge_amount = CASE WHEN $4 THEN NULL ELSE recharge_amount END,
 		    recharge_failures = $5, recharge_retry_at = $6, recharge_blocked_ref = $7,
+		    recharge_declines = $8, recharge_declines_ref = $9,
 		    updated_at = NOW()
 		WHERE tenant_id = $1 AND id = $2 AND recharge_attempt = $3`,
-		tenantID, walletID, attempt, o.Answered, o.Failures, o.RetryAt, nilIfEmpty(o.BlockedMethodRef))
+		tenantID, walletID, attempt, o.Answered, o.Failures, o.RetryAt, nilIfEmpty(o.BlockedMethodRef),
+		o.Declines, nilIfEmpty(o.DeclinesRef))
 	if err != nil {
 		return fmt.Errorf("failed to record wallet recharge outcome: %w", err)
 	}

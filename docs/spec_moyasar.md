@@ -49,7 +49,10 @@ payment in the same currency covering the amount (net of refunds) as success
 without charging, catching a payment whose response was lost under an earlier
 attempt's key. On a 400 it reads back `GET /payments/{given_id}`: a found
 payment is mapped as the result (`processing_error` if amount/currency
-differ); a 404 means a real rejection. A 4xx (except 401/403/429) whose
+differ); a 404 means a real rejection. If that payment was on another card
+(the customer saved a new one), a `failed` one is retried once on the current
+card under `<key>/card:<token>`; one still `initiated`/`authorized` answers
+with an error (no answer), so nothing else is charged until it settles. A 4xx (except 401/403/429) whose
 `errors` name the token or source, or whose message names the token, is the
 card: `invalid_payment_method`, Permanent. Any other 4xx is our request or
 account (bad `callback_url`, amount, `given_id`, account not live): an error
@@ -104,6 +107,10 @@ a method charges only when its provider is `SmartRouter.ProviderFor(currency)`
 (override, then INR→Razorpay, else Stripe). Exception: a Stripe method still
 charges a currency whose gateway has no saved-card charger (INR on Razorpay,
 EUR on GoCardless), as before. A refusal leaves the invoice to dunning.
+`SmartRouter.Refund` routes by payment id, not currency: `pi_`/`ch_` to
+Stripe, `pay_` to Razorpay, and a canonical UUID (only Moyasar issues them) to
+the registered Moyasar gateway, so a tenant that later connected its own
+Stripe still refunds its older Moyasar payments on Moyasar.
 
 ### Settlement (`service/gateway_settlement.go`)
 
@@ -143,10 +150,15 @@ past_due, so a payment that lands during the charge is never reverted.
 **Wallet auto-recharge.** The attempt number in the key advances only when the
 gateway answers (paid or declined), so a lost response replays the same charge,
 for the amount frozen with the attempt (`recharge_amount`), whatever else
-changed on the wallet. Failed attempts back off 1h, 6h, then daily; a hard
-decline, or the 8th failure since the last success, stops auto-recharge until
-the customer's saved method changes. The decline email goes out on the first
-failure and when auto-recharge stops.
+changed on the wallet. Failed attempts back off 1h, 6h, then daily
+(`recharge_failures`, every failure). A hard decline, or the 8th answered
+decline in a row on one saved method (`recharge_declines` against
+`recharge_declines_ref`; a different method starts at zero, and no-answer or
+lookup failures never count), stops auto-recharge until the customer's saved
+method changes. So does `ErrSavedMethodNotChargeable` from the router (e.g. a
+BYO-Stripe tenant's older Moyasar card), at once; a transient router error
+only backs off, with no email. The decline email goes out on the first
+decline and when auto-recharge stops.
 
 ### Webhook (`POST /webhooks/moyasar`)
 
@@ -176,8 +188,10 @@ SRI-checked assets (`moyasarAssets.js`) and mounts `Moyasar.init` (mada, visa,
 mastercard; `callback_url` `/checkout/<id>?gateway=moyasar`). The return calls
 `POST /checkout/:id/moyasar/verify {payment_id}`, which reads back, binds and
 settles only `paid`; void and draft invoices answer 409, and the route is
-limited per invoice and payment id (so other callers' verifies cannot lock the
-buyer out) as well as per IP. The browser never marks an invoice paid.
+limited per invoice and payment id (10/min), per invoice across all payment
+ids (30/min, so random ids can't make unbounded read-backs), and per IP. The
+per-invoice limiters (here and on `/pay`) key on the canonical invoice UUID,
+so another spelling of the id gets no fresh bucket. The browser never marks an invoice paid.
 
 **Arabic/RTL.** `lib/checkoutCopy.js` has English and Arabic copy, picked from
 the browser language; Arabic sets `dir="rtl"` and the form's `language: "ar"`.

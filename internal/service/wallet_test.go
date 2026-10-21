@@ -100,6 +100,7 @@ func (f *fakeWalletRepo) RecordRechargeOutcome(_ context.Context, _, walletID uu
 			delete(f.reserved, walletID)
 		}
 		w.RechargeFailures = o.Failures
+		w.RechargeDeclines, w.RechargeDeclinesRef = o.Declines, o.DeclinesRef
 	}
 	return nil
 }

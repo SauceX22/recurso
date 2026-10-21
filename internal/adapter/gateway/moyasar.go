@@ -328,13 +328,20 @@ func (g *MoyasarGateway) ChargeSavedPaymentMethod(ctx context.Context, req port.
 			// Never created: the 400 is a genuine rejection, handled below.
 		case ferr != nil:
 			return &port.PaymentResult{Success: false, ErrorCode: "gateway_error", ErrorMsg: ferr.Error()}, ferr
-		case existing.Status != "paid" && existing.Source.Token != "" && existing.Source.Token != req.MethodRef &&
+		case existing.Status != "paid" && existing.Status != "failed" && existing.Source.Token != "" &&
+			existing.Source.Token != req.MethodRef && !strings.HasSuffix(req.IdempotencyKey, cardKeySuffix(req.MethodRef)):
+			// The earlier attempt on another card hasn't finished (initiated,
+			// authorized): it may still be paid, so charging this card too
+			// could charge twice. No answer yet: the caller keeps the key and
+			// replays once that attempt is settled.
+			err := fmt.Errorf("moyasar charge: payment %s for this key on another card is still %s", existing.ID, existing.Status)
+			return &port.PaymentResult{Success: false, PaymentID: existing.ID, ErrorCode: "processing_error", ErrorMsg: err.Error()}, err
+		case existing.Status == "failed" && existing.Source.Token != "" && existing.Source.Token != req.MethodRef &&
 			!strings.HasSuffix(req.IdempotencyKey, cardKeySuffix(req.MethodRef)):
-			// The earlier attempt charged another card (the customer saved a
-			// new one since): its decline says nothing about this card. It
-			// wasn't paid (a paid one for the invoice was found above), so
-			// charge this card once, under a key bound to it that a replay
-			// of this charge reuses.
+			// The earlier attempt failed on another card (the customer saved
+			// a new one since): its decline says nothing about this card, and
+			// it can't be paid any more, so charge this card once, under a
+			// key bound to it that a replay of this charge reuses.
 			slog.WarnContext(ctx, "moyasar: idempotency key replayed an attempt on another card; charging the current card",
 				"payment_id", existing.ID, "status", existing.Status)
 			req.IdempotencyKey += cardKeySuffix(req.MethodRef)

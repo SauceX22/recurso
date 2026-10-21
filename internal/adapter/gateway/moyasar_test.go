@@ -660,6 +660,51 @@ func TestMoyasarChargeReplayOfAnotherCardChargesThisCard(t *testing.T) {
 	}
 }
 
+// An earlier attempt on another card that hasn't finished (initiated, or
+// authorized under manual capture) may still be paid: charging the new card
+// too could charge the customer twice. The replay reports no answer, so the
+// caller keeps the key and retries later, and nothing new is charged.
+func TestMoyasarChargeReplayOfAnotherCardInFlightChargesNothing(t *testing.T) {
+	oldID := moyasarGivenID("wallet-recharge-w-3")
+	for _, status := range []string{"initiated", "authorized"} {
+		t.Run(status, func(t *testing.T) {
+			var mu sync.Mutex
+			posts := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/payments/"+oldID:
+					_, _ = w.Write([]byte(moyasarPaymentJSON(oldID, status, "", "")))
+				case r.Method == http.MethodPost && r.URL.Path == "/payments":
+					var body map[string]any
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					mu.Lock()
+					posts++
+					mu.Unlock()
+					if body["given_id"] == oldID {
+						w.WriteHeader(http.StatusBadRequest)
+						_, _ = w.Write([]byte(`{"type":"invalid_request_error","message":"Payment is already created.","errors":null}`))
+						return
+					}
+					_, _ = w.Write([]byte(strings.Replace(moyasarPaymentJSON(body["given_id"].(string), "paid", "00", "APPROVED"), "token_abc", "token_new", 1)))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			res, err := testMoyasar(srv.URL).ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{
+				MethodRef: "token_new", Amount: 10000, Currency: "SAR", WalletID: "w", IdempotencyKey: "wallet-recharge-w-3"})
+			if err == nil || res == nil || res.Success {
+				t.Fatalf("res = %+v, err = %v; want no answer while the other card's attempt is in flight", res, err)
+			}
+			if posts != 1 {
+				t.Fatalf("POSTs = %d, want 1 (the replay only, no charge on the new card)", posts)
+			}
+		})
+	}
+}
+
 // The read-back of a replay goes through the same decline mapping, when it
 // was this card or the read-back doesn't name a card (nothing says it's stale).
 func TestMoyasarChargeReplayOfHardDeclineIsPermanent(t *testing.T) {

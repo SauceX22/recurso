@@ -100,11 +100,13 @@ func TestWalletRechargeOutcome_Postgres(t *testing.T) {
 	if _, err := conn.Exec(`UPDATE customers SET default_payment_method = 'token_lost' WHERE id = $1`, w.CustomerID); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.RecordRechargeOutcome(ctx, w.TenantID, w.ID, 0, port.RechargeOutcome{Answered: true, Failures: 2, BlockedMethodRef: "token_lost"}); err != nil {
+	if err := repo.RecordRechargeOutcome(ctx, w.TenantID, w.ID, 0, port.RechargeOutcome{Answered: true, Failures: 2, BlockedMethodRef: "token_lost",
+		Declines: 1, DeclinesRef: "token_lost"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := load(); got.RechargeAttempt != 1 || got.RechargeFailures != 2 {
-		t.Fatalf("attempt/failures = %d/%d, want 1/2", got.RechargeAttempt, got.RechargeFailures)
+	if got := load(); got.RechargeAttempt != 1 || got.RechargeFailures != 2 || got.RechargeDeclines != 1 || got.RechargeDeclinesRef != "token_lost" {
+		t.Fatalf("attempt/failures/declines/ref = %d/%d/%d/%q, want 1/2/1/token_lost",
+			got.RechargeAttempt, got.RechargeFailures, got.RechargeDeclines, got.RechargeDeclinesRef)
 	}
 	if isDue(t, repo, w.ID) {
 		t.Fatal("a wallet whose saved method hard-declined is listed as due")
