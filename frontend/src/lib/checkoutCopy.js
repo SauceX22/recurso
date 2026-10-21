@@ -98,9 +98,9 @@ const en = {
   stripeIncomplete: "Payment is not complete. Please try another method.",
 
   saveCardConsent:
-    "By paying, you agree that your card will be saved and charged automatically for future renewals of this subscription.",
+    "By paying, you agree that your card will be saved and charged automatically for future renewals of your subscriptions. It replaces any card already saved on your account.",
   cardOnFileConsent: ({ merchant, amount, period }) =>
-    `By paying, you authorise ${merchant} to save this card and charge it ${amount} ${period} until you cancel. This card replaces any card already saved for this subscription. You can cancel at any time from your billing portal.`,
+    `By paying, you authorise ${merchant} to save this card and charge it ${amount} ${period} until you cancel. This card replaces the card saved on your account and is used for all your subscriptions with ${merchant}. You can cancel at any time from your billing portal.`,
   every: (unit, count) => {
     const [one, many] = EN_UNITS[unit];
     return count === 1 ? `every ${one}` : `every ${count} ${many}`;
@@ -172,9 +172,9 @@ const ar = {
   stripeIncomplete: "لم يكتمل الدفع. يرجى تجربة وسيلة دفع أخرى.",
 
   saveCardConsent:
-    "بإتمام الدفع، توافق على حفظ بطاقتك وخصم مبالغ التجديدات القادمة لهذا الاشتراك منها تلقائيًا.",
+    "بإتمام الدفع، توافق على حفظ بطاقتك وخصم مبالغ التجديدات القادمة لاشتراكاتك منها تلقائيًا، وتحل محل أي بطاقة محفوظة في حسابك.",
   cardOnFileConsent: ({ merchant, amount, period }) =>
-    `بإتمام الدفع، تفوّض ${isolate(merchant)} بحفظ هذه البطاقة وخصم ${isolate(amount)} منها ${period} حتى تلغي الاشتراك. تحل هذه البطاقة محل أي بطاقة محفوظة سابقًا لهذا الاشتراك. يمكنك الإلغاء في أي وقت من بوابة الفوترة.`,
+    `بإتمام الدفع، تفوّض ${isolate(merchant)} بحفظ هذه البطاقة وخصم ${isolate(amount)} منها ${period} حتى تلغي الاشتراك. تحل هذه البطاقة محل البطاقة المحفوظة في حسابك، وتُستخدم لجميع اشتراكاتك لدى ${isolate(merchant)}. يمكنك الإلغاء في أي وقت من بوابة الفوترة.`,
   // Arabic counts take the dual for 2, the plural for 3–10 and the
   // accusative singular from 11.
   every: (unit, count) => {

@@ -189,7 +189,7 @@ describe("Checkout — Moyasar embedded form", () => {
     const consent = await screen.findByText(
       /authorise Acme Gym to save this card and charge it SAR 99\.00 every month until you cancel/
     );
-    expect(consent).toHaveTextContent(/replaces any card already saved/);
+    expect(consent).toHaveTextContent(/replaces the card saved on your account and is used for all your subscriptions/);
     expect(document.querySelector(".mysr-form")).toHaveAttribute("aria-describedby", consent.id);
   });
 

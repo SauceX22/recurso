@@ -43,7 +43,7 @@ describe("saveCardConsentText", () => {
   it("names the merchant, the amount, the period, the replacement and how to stop", () => {
     expect(saveCardConsentText(en, terms)).toBe(
       `By paying, you authorise Acme Gym to save this card and charge it ${SAR99} every month until you cancel. ` +
-        "This card replaces any card already saved for this subscription. You can cancel at any time from your billing portal."
+        "This card replaces the card saved on your account and is used for all your subscriptions with Acme Gym. You can cancel at any time from your billing portal."
     );
   });
 
