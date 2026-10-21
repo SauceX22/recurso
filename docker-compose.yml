@@ -26,6 +26,17 @@ services:
       # Deterministic secret so the E2E suite can sign GoCardless webhook
       # deliveries (step 6c). Overrides any real secret from .env.
       - GOCARDLESS_WEBHOOK_SECRET=e2e_gc_webhook_secret
+      # Moyasar (SAR) in test mode against scripts/moyasar_stub.py, which the
+      # E2E suite runs on the host (step 6d). MOYASAR_API_URL is test-only:
+      # boot refuses it with a live key. Set MOYASAR_API_URL= (empty) in .env
+      # to use a real Moyasar sandbox account instead.
+      - MOYASAR_SECRET_KEY=${MOYASAR_SECRET_KEY:-sk_test_e2e}
+      - MOYASAR_PUBLISHABLE_KEY=${MOYASAR_PUBLISHABLE_KEY:-pk_test_e2e}
+      - MOYASAR_WEBHOOK_SECRET=${MOYASAR_WEBHOOK_SECRET:-e2e_moyasar_webhook_secret}
+      - MOYASAR_API_URL=${MOYASAR_API_URL-http://host.docker.internal:8091/v1}
+      - GATEWAY_CURRENCY_OVERRIDES=${GATEWAY_CURRENCY_OVERRIDES:-SAR=moyasar}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     depends_on:
       postgres:

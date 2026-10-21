@@ -301,6 +301,98 @@ else
     exit 1
 fi
 
+# 6d. Moyasar (SAR) end to end against scripts/moyasar_stub.py, which the API
+# reaches through the test-only MOYASAR_API_URL (docker-compose.yml). Covers:
+# the pay response, server-side verify (in flight, then paid), webhook secret
+# enforcement, webhook settlement, a credit-note refund through the gateway,
+# and (step 7) a clean ledger afterwards.
+echo "Step 6d: Moyasar checkout, webhook and refund (stubbed API)..."
+MOYASAR_STUB_PORT="${MOYASAR_STUB_PORT:-8091}"
+MOYASAR_STUB="http://localhost:$MOYASAR_STUB_PORT"
+MOYASAR_WEBHOOK_SECRET="${MOYASAR_WEBHOOK_SECRET:-e2e_moyasar_webhook_secret}"
+python3 -I "$(dirname "$0")/moyasar_stub.py" --port "$MOYASAR_STUB_PORT" &
+MOYASAR_STUB_PID=$!
+trap 'kill $MOYASAR_STUB_PID 2>/dev/null' EXIT
+for _ in $(seq 1 25); do
+  curl -s -o /dev/null "$MOYASAR_STUB/v1/payments" && break
+  sleep 0.2
+done
+
+fail_6d() {
+  echo -e "${RED}  ❌ $1${NC}"
+  [ -n "${2:-}" ] && echo "Response: $2"
+  exit 1
+}
+
+CUST_SAR_RES=$(post_json "$API_URL/v1/customers" '{
+    "name": "Sara Alharbi",
+    "email": "sara.sar@example.com",
+    "billing_address": {"country": "SA", "postal_code": "11564"}
+  }' "$API_KEY")
+CUST_ID_SAR=$(get_json_value "$CUST_SAR_RES" "data.id")
+PLAN_SAR_RES=$(post_json "$API_URL/v1/plans" '{
+    "code": "PRO-SAR",
+    "name": "Pro Plan SAR",
+    "interval_unit": "month",
+    "interval_count": 1,
+    "amount": 11500,
+    "currency": "SAR"
+  }' "$API_KEY")
+PLAN_ID_SAR=$(get_json_value "$PLAN_SAR_RES" "data.id")
+SUB_SAR_RES=$(post_json "$API_URL/v1/subscriptions" "$(jq -n \
+  --arg customer_id "$CUST_ID_SAR" --arg plan_id "$PLAN_ID_SAR" \
+  '{customer_id: $customer_id, plan_id: $plan_id}')" "$API_KEY")
+SUB_ID_SAR=$(get_json_value "$SUB_SAR_RES" "data.id")
+INV_SAR=$(get_json "$API_URL/v1/invoices" "$API_KEY" | jq -r --arg sid "$SUB_ID_SAR" \
+  '[.data[] | select(.subscription_id == $sid)][0].id')
+[ -n "$INV_SAR" ] && [ "$INV_SAR" != "null" ] || fail_6d "SAR subscription produced no invoice" "$SUB_SAR_RES"
+
+PAY_RES=$(post_json "$API_URL/checkout/$INV_SAR/pay" '{}')
+SAR_DUE=$(echo "$PAY_RES" | jq -r '.data.amount')
+if [ "$(echo "$PAY_RES" | jq -r '.data.gateway')" != "moyasar" ] || [ "$(echo "$PAY_RES" | jq -r '.data.save_card')" != "true" ]; then
+  fail_6d "SAR /pay did not return the Moyasar form for a renewing subscription" "$PAY_RES"
+fi
+echo -e "${GREEN}  ✅ SAR /pay returns the Moyasar form (amount $SAR_DUE, save_card)${NC}"
+
+# The buyer's payment, still waiting on 3DS: verify must not settle it.
+PAYMENT_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+stub_payment() {
+  curl -s -X PUT "$MOYASAR_STUB/_stub/payments/$PAYMENT_ID" -H 'Content-Type: application/json' \
+    --data @- > /dev/null <<<"$(jq -n --arg inv "$INV_SAR" --arg status "$1" --argjson amount "$SAR_DUE" \
+      '{status: $status, amount: $amount, currency: "SAR", metadata: {invoice_id: $inv},
+        source: {type: "creditcard", company: "visa", number: "4111-11XX-XXXX-1111", token: "token_e2e_sar"}}')"
+}
+stub_payment initiated
+VERIFY_RES=$(post_json "$API_URL/checkout/$INV_SAR/moyasar/verify" "$(jq -n --arg id "$PAYMENT_ID" '{payment_id: $id}')")
+[ "$(echo "$VERIFY_RES" | jq -r '.data.status')" = "processing" ] || fail_6d "verify of an initiated payment must report processing" "$VERIFY_RES"
+echo -e "${GREEN}  ✅ Verify of an unfinished payment reports processing, settles nothing${NC}"
+
+stub_payment paid
+moyasar_webhook() {
+  curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/webhooks/moyasar" -H 'Content-Type: application/json' \
+    --data @- <<<"$(jq -n --arg secret "$1" --arg pid "$PAYMENT_ID" --arg ev "$2" \
+      '{id: $ev, type: "payment_paid", secret_token: $secret, live: false, data: {id: $pid}}')"
+}
+WH_BAD=$(moyasar_webhook "not-the-secret" "ev_e2e_bad_$TIMESTAMP")
+[ "$WH_BAD" = "401" ] || fail_6d "Moyasar webhook with a wrong secret returned $WH_BAD, want 401"
+WH_OK=$(moyasar_webhook "$MOYASAR_WEBHOOK_SECRET" "ev_e2e_paid_$TIMESTAMP")
+[ "$WH_OK" = "200" ] || fail_6d "Moyasar payment_paid webhook returned $WH_OK, want 200"
+INV_SAR_RES=$(get_json "$API_URL/v1/invoices/$INV_SAR" "$API_KEY")
+[ "$(echo "$INV_SAR_RES" | jq -r '.data.status')" = "paid" ] || fail_6d "invoice not paid after the webhook" "$INV_SAR_RES"
+echo -e "${GREEN}  ✅ Wrong webhook secret 401; payment_paid webhook settled the invoice${NC}"
+
+VERIFY_RES=$(post_json "$API_URL/checkout/$INV_SAR/moyasar/verify" "$(jq -n --arg id "$PAYMENT_ID" '{payment_id: $id}')")
+[ "$(echo "$VERIFY_RES" | jq -r '.data.status')" = "paid" ] || fail_6d "verify after settlement must report paid" "$VERIFY_RES"
+
+CN_RES=$(post_json "$API_URL/v1/credit-notes" "$(jq -n --arg c "$CUST_ID_SAR" --arg i "$INV_SAR" \
+  '{customer_id: $c, invoice_id: $i, amount: 1000, currency: "SAR", type: "refund", reason: "e2e partial refund"}')" "$API_KEY")
+CN_REFUND=$(echo "$CN_RES" | jq -r '.data.refund_status')
+STUB_REFUNDED=$(curl -s -u sk_test_e2e: "$MOYASAR_STUB/v1/payments/$PAYMENT_ID" | jq -r '.refunded')
+if [ "$CN_REFUND" != "processed" ] || [ "$STUB_REFUNDED" != "1000" ]; then
+  fail_6d "credit-note refund: refund_status=$CN_REFUND, Moyasar refunded=$STUB_REFUNDED (want processed / 1000)" "$CN_RES"
+fi
+echo -e "${GREEN}  ✅ Credit-note refund went through Moyasar (refunded 1000)${NC}"
+
 # 7. Audit-grade gate: after everything above, the ledger must reconcile with
 # ZERO discrepancies — the end-to-end version of the invariant harness. Any
 # invoice-creating flow that forgets its ledger leg fails the whole run here.
