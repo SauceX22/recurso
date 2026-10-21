@@ -101,7 +101,7 @@ func (p *PaymentMethodUpdatePolicy) savedProvider(ctx context.Context, customerI
 	if err != nil || m.PaymentMethodRef == "" {
 		return ""
 	}
-	if provider := domain.GatewayProvider(m.Provider); provider != "" {
+	if provider := m.Provider; provider != "" {
 		return provider
 	}
 	return domain.GatewayStripe

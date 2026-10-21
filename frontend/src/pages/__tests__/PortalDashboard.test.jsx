@@ -68,14 +68,14 @@ describe("PortalDashboard payment-method update", () => {
     );
 
   it("offers the card-update dialog for a Stripe-saved card", async () => {
-    stubPortal({ name: "Test Cust", payment_method: { provider: "stripe" } });
+    stubPortal({ name: "Test Cust", payment_method_provider: "stripe", card_update_supported: true });
     renderDashboard();
     expect(await screen.findByRole("button", { name: /update payment method/i })).toBeInTheDocument();
     expect(screen.queryByText(/pay your next open invoice/i)).toBeNull();
   });
 
   it("replaces the update button with pay-an-invoice guidance for a Moyasar card", async () => {
-    stubPortal({ name: "Test Cust", payment_method: { provider: "moyasar" } });
+    stubPortal({ name: "Test Cust", payment_method_provider: "moyasar", card_update_supported: false });
     renderDashboard();
     expect(await screen.findByText(/pay your next open invoice/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /update payment method/i })).toBeNull();

@@ -121,6 +121,9 @@ func TestRenewalSavedMethod_MethodOnAnotherGatewayIsSkipped(t *testing.T) {
 	settler := &fakeRenewalSettler{}
 	svc.SetSavedMethodCharging(stripe, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, settler)
 	router := NewSavedCardGatewayRouter(nil, nil, stripe)
+	// Production always registers the gateway an override names (boot fails
+	// otherwise), and the guard keys off that registration.
+	router.RegisterProvider(domain.GatewayMoyasar, &fakeRenewalCharger{})
 	router.SetCurrencyRouting(fixedRoutes{"SAR": domain.GatewayMoyasar})
 	svc.SetChargerRouter(router)
 
