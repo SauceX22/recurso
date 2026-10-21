@@ -42,16 +42,19 @@ on hard declines from any gateway that reports them.
 | extra `FetchPayment`, `FetchToken` | `GET /payments/{id}` → `port.GatewayPayment`; `GET /tokens/{id}` → card expiry |
 
 **Idempotency.** `given_id = uuid.NewSHA1(fixed namespace, key)`, so replays of
-`renewal-<inv>`, `retry-<inv>-<n>` or `wallet-recharge-<wallet>-<updated_at>`
+`renewal-<inv>`, `retry-<inv>-<n>` or `wallet-recharge-<wallet>-<attempt>`
 hit the same payment; an empty key is refused. Before charging an invoice the
 adapter lists `metadata[invoice_id]=<inv>&status=paid` and returns a paid
 payment in the same currency covering the amount (net of refunds) as success
 without charging, catching a payment whose response was lost under an earlier
 attempt's key. On a 400 it reads back `GET /payments/{given_id}`: a found
 payment is mapped as the result (`processing_error` if amount/currency
-differ); a 404 means a real rejection, which like any 4xx except 401/403/429
-maps to `invalid_payment_method`, Permanent. Wallet top-ups carry
-`metadata.wallet_id`, never `invoice_id`.
+differ); a 404 means a real rejection. A 4xx (except 401/403/429) whose
+`errors` name the token or source, or whose message names the token, is the
+card: `invalid_payment_method`, Permanent. Any other 4xx is our request or
+account (bad `callback_url`, amount, `given_id`, account not live): an error
+and an ERROR log, so callers back off rather than treat it as a decline.
+Wallet top-ups carry `metadata.wallet_id`, never `invoice_id`.
 
 **Declines** (Moyasar doesn't classify codes; the grouping is Recurso's):
 
@@ -64,8 +67,12 @@ maps to `invalid_payment_method`, Permanent. Wallet top-ups carry
 | `initiated` (issuer wants 3DS) / other status | `authentication_required` / `processing_error` | no |
 
 **Refund read-back.** No refund key, so exactly one call, never retried; after
-a transport error or 5xx the payment is re-read and the refund succeeds only if
-`refunded` grew by the amount. `RefundID` = `<payment id>:<refunded total>`.
+a transport error or 5xx the payment is re-read (with a detached context) and
+the refund succeeds if `refunded` grew by the amount. `RefundID` =
+`<payment id>:<refunded total>`. If the read-back fails or doesn't show it yet,
+the refund is `pending` (`<payment id>:unknown:<uuid>`), never failed: it holds
+the refundable amount so it can't be re-issued; an operator confirms it on the
+Moyasar dashboard. Refunds of one payment are serialized within a process.
 
 ### Saved methods and routing
 
@@ -76,7 +83,9 @@ in `default_payment_method`, brand/last4/expiry in the card columns.
 
 Renewal, dunning retry and wallet auto-recharge charge through
 `SavedCardGatewayRouter.ChargerFor` (`service/saved_card_gateway.go`), with
-Moyasar added via `RegisterProvider`. **Currency guard** (`SetCurrencyRouting`):
+Moyasar added via `RegisterProvider`. A method the router can never charge as
+configured returns `ErrSavedMethodNotChargeable`; any other router or lookup
+error is transient. **Currency guard** (`SetCurrencyRouting`):
 a method charges only when its provider is `SmartRouter.ProviderFor(currency)`
 (override, then INR→Razorpay, else Stripe). Exception: a Stripe method still
 charges a currency whose gateway has no saved-card charger (INR on Razorpay,
@@ -90,7 +99,8 @@ Checkout verify and the webhook share `Settle`: `BindPaymentToInvoice`
 `ClaimGatewayPaymentID` (another payment on a settled invoice is logged as a
 duplicate charge) → save the card → on the paid transition, close the dunning
 campaign and reward the retry bandit. Renewal and retry-worker successes
-settle synchronously and record the payment id.
+settle synchronously and record the payment id with the same conditional claim
+(`RecordSettlingPayment`), warning when it loses.
 
 **Card consent.** `SavesCard` is true only for a subscription that will renew
 (not canceled, not `cancel_at_period_end`); one-off invoices never save.
@@ -98,9 +108,24 @@ Checkout sends it as `save_card` and shows the consent text before payment.
 The expiry (`FetchToken`) feeds the card-expiry notice.
 
 **Dunning handoff** (`worker/retry_worker.go`). A `Permanent` decline, or
-`no_saved_payment_method` (Moyasar `RetryPayment`, when no saved method routes
-to the currency), stops worker retries: `past_due`, `NextRetryAt = nil`,
-`DunningManagedBy = "scheduler"`; the scheduler's emails and pay link take over.
+`no_saved_payment_method` from any gateway's `RetryPayment` (Moyasar, and
+Stripe for a card-less invoice — before, Stripe kept such invoices on worker
+retries), stops worker retries: `past_due`, `NextRetryAt = nil`,
+`DunningManagedBy = "scheduler"`; the scheduler's emails and pay link take
+over. A hard decline records the declined method (`declined_method_ref`) and
+doesn't count as a retry (the scheduler's email counter stays in step); when
+the scheduler hands the invoice back, that method is not charged again until
+the customer saves another. A lookup or router failure is not "no method": it
+takes the infrastructure retry. Infrastructure errors back off from 5 minutes
+(doubling, 6h cap) and hand the invoice to email dunning after 6 in a row.
+Every post-attempt write is conditional on the invoice still being open or
+past_due, so a payment that lands during the charge is never reverted.
+
+**Wallet auto-recharge.** The attempt number in the key advances only when the
+gateway answers (paid or declined), so a lost response replays the same charge
+whatever else changed on the wallet. Failed attempts back off 1h, 6h, then
+daily; a hard decline stops auto-recharge until the customer's saved method
+changes.
 
 ### Webhook (`POST /webhooks/moyasar`)
 
@@ -140,12 +165,17 @@ next open invoice with the new card, and dunning/card-expiry emails link there.
 | `MOYASAR_PUBLISHABLE_KEY` | browser key; `pk_test_`/`pk_live_`, same mode |
 | `MOYASAR_WEBHOOK_SECRET` | shared secret on the Moyasar webhook |
 | `GATEWAY_CURRENCY_OVERRIDES` | includes `SAR=moyasar` |
+| `MOYASAR_API_URL` | test only: replaces the API base (the e2e stub); refused with `sk_live_` |
 
 `validateMoyasarConfig` (`cmd/api/gateway_config.go`): fatal on a bad key
-prefix or mixed test/live keys; warns on a missing publishable key (SAR
-checkout 503) or webhook secret. An override naming an unregistered gateway is
-fatal; `sk_live_` counts as live in `gatewayModeFromEnv`; `DEMO_MODE` skips
-Moyasar. Token charges' `callback_url` uses `DASHBOARD_URL` (else `BASE_URL`).
+prefix, mixed test/live keys, a `DASHBOARD_URL` (else `BASE_URL`) that isn't an
+absolute URL (public https with a live key; it is token charges'
+`callback_url`), or `MOYASAR_API_URL` with a live key; warns on a missing
+publishable key (SAR checkout 503) or webhook secret. An override naming an
+unregistered gateway is fatal; `DEMO_MODE` skips Moyasar. In
+`gatewayModeFromEnv` Stripe/Razorpay set the server's live/test mode when
+configured; Moyasar (`sk_live_`), GoCardless and Adyen set it only without
+them, and a live/test mix is a boot warning.
 
 ## Residency
 
@@ -175,7 +205,10 @@ names only cards and Apple Pay). A refusal or 3DS demand returns `failed` or
 - CSP: none set yet; it must allow jsDelivr and Moyasar.
 - Moyasar charges are not written to the tenant payments log.
 - `CreatePlan.jsx` offers only USD/INR/EUR/GBP; SAR plans need the API.
-- Pre-existing: the retry worker writes back the whole (possibly stale) row.
+- Refund serialization is per process; two instances refunding the same
+  payment at once can still misread each other's amount.
+- A `pending` refund is confirmed by an operator; the `payment_refunded`
+  webhook doesn't resolve it yet.
 - Pre-existing: Stripe/Razorpay checkout orders charge `Total`, not `AmountDue`.
 
 ## Founder-gated: sandbox verification before dropping EXPERIMENTAL
