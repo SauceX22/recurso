@@ -41,6 +41,13 @@ type renewalSettler interface {
 	MarkInvoicePaid(ctx context.Context, invoiceID uuid.UUID) (bool, error)
 }
 
+// renewalPaymentRecorder writes a renewal charge's outcome on the invoice;
+// *db.InvoiceRepository satisfies it.
+type renewalPaymentRecorder interface {
+	gatewayPaymentClaimer
+	UpdateRetryState(ctx context.Context, tenantID, invoiceID uuid.UUID, s port.InvoiceRetryState) (bool, error)
+}
+
 type RenewalService struct {
 	subs     renewalSubscriptionRepo
 	plans    port.PlanRepository
@@ -53,8 +60,8 @@ type RenewalService struct {
 	chargerRouter savedChargerRouter
 	settler       renewalSettler
 	// payments records the settling payment id as the invoice's refund
-	// target. nil-safe.
-	payments gatewayPaymentClaimer
+	// target, and a hard-declined method. nil-safe.
+	payments renewalPaymentRecorder
 
 	now func() time.Time // injectable for tests
 }
@@ -77,8 +84,9 @@ func (s *RenewalService) SetSavedMethodCharging(lookup savedMethodLookup, router
 }
 
 // SetPaymentRecorder wires recording of the gateway payment that settles a
-// renewal invoice, so refunds don't depend on a webhook. nil-safe.
-func (s *RenewalService) SetPaymentRecorder(r gatewayPaymentClaimer) {
+// renewal invoice, so refunds don't depend on a webhook, and of a hard-declined
+// method, so dunning doesn't charge it again. nil-safe.
+func (s *RenewalService) SetPaymentRecorder(r renewalPaymentRecorder) {
 	s.payments = r
 }
 
@@ -223,6 +231,9 @@ func (s *RenewalService) attemptPayment(ctx context.Context, inv *domain.Invoice
 	if err != nil || result == nil || !result.Success {
 		logChargeFailure(ctx, "renewal payment attempt failed; invoice left open for dunning", result, err,
 			"invoice_id", inv.ID, "provider", m.Provider)
+		if result != nil && result.Permanent && s.payments != nil {
+			s.recordHardDecline(ctx, inv, result.ErrorCode, m.PaymentMethodRef)
+		}
 		return
 	}
 	transitioned, err := s.settler.MarkInvoicePaid(ctx, inv.ID)
@@ -233,5 +244,20 @@ func (s *RenewalService) attemptPayment(ctx context.Context, inv *domain.Invoice
 	}
 	if s.payments != nil {
 		RecordSettlingPayment(ctx, s.payments, inv, transitioned, result.PaymentID)
+	}
+}
+
+// recordHardDecline marks the method as hard-declined on the invoice, the same
+// bookkeeping the retry worker writes, so the retry that dunning schedules skips
+// that method until the customer saves another card. The invoice stays open.
+func (s *RenewalService) recordHardDecline(ctx context.Context, inv *domain.Invoice, errorCode, methodRef string) {
+	if _, err := s.payments.UpdateRetryState(ctx, inv.TenantID, inv.ID, port.InvoiceRetryState{
+		Status:            domain.InvoiceStatusOpen,
+		RetryCount:        inv.RetryCount,
+		LastPaymentError:  errorCode,
+		DeclinedMethodRef: methodRef,
+	}); err != nil {
+		slog.ErrorContext(ctx, "renewal: failed to record the hard-declined method; dunning may charge it again",
+			"invoice_id", inv.ID, "error", err)
 	}
 }

@@ -199,6 +199,12 @@ func TestRenewalSavedMethod_LookupErrorLeavesInvoiceOpen(t *testing.T) {
 type fakePaymentRecorder struct {
 	calls    []recordedPayment
 	recorded string
+	declines []port.InvoiceRetryState
+}
+
+func (f *fakePaymentRecorder) UpdateRetryState(_ context.Context, _, _ uuid.UUID, s port.InvoiceRetryState) (bool, error) {
+	f.declines = append(f.declines, s)
+	return true, nil
 }
 
 type recordedPayment struct {
@@ -249,5 +255,36 @@ func TestRenewalSavedMethod_DoesNotRecordPaymentThatDidNotSettle(t *testing.T) {
 	}
 	if len(rec.calls) != 0 {
 		t.Fatalf("recorded = %+v, want nothing", rec.calls)
+	}
+}
+
+// A hard decline at renewal records the declined card, so dunning's first
+// retry does not charge the same card again; a soft decline records nothing.
+func TestRenewalSavedMethod_HardDeclineRecordsDeclinedMethod(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		permanent bool
+	}{{"hard", true}, {"soft", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, sub := sarRenewalFixture()
+			moyasar := &fakeRenewalCharger{result: &port.PaymentResult{Success: false, ErrorCode: "expired_card", Permanent: tc.permanent}}
+			svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(moyasar), &fakeRenewalSettler{})
+			rec := &fakePaymentRecorder{}
+			svc.SetPaymentRecorder(rec)
+
+			if err := svc.RenewSubscription(context.Background(), sub); err != nil {
+				t.Fatal(err)
+			}
+			if !tc.permanent {
+				if len(rec.declines) != 0 {
+					t.Fatalf("soft decline recorded %+v", rec.declines)
+				}
+				return
+			}
+			want := port.InvoiceRetryState{Status: domain.InvoiceStatusOpen, LastPaymentError: "expired_card", DeclinedMethodRef: "token_abc"}
+			if len(rec.declines) != 1 || rec.declines[0] != want {
+				t.Fatalf("declines = %+v, want [%+v]", rec.declines, want)
+			}
+		})
 	}
 }
