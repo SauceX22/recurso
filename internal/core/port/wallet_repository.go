@@ -87,6 +87,12 @@ type WalletRepository interface {
 	// a failed attempt, and whose hard-declined method (if any) is no longer
 	// the customer's saved method.
 	ListDueForRecharge(ctx context.Context, limit int) ([]domain.Wallet, error)
+	// ReserveRechargeAmount freezes the amount auto-recharge attempt `attempt`
+	// charges and returns it: amount on the attempt's first charge, the
+	// amount frozen then on a replay. ok is false when the attempt is no
+	// longer current (another sweep recorded its outcome). The amount is
+	// cleared when the attempt is answered.
+	ReserveRechargeAmount(ctx context.Context, tenantID, walletID uuid.UUID, attempt int, amount int64) (frozen int64, ok bool, err error)
 	// RecordRechargeOutcome stores how auto-recharge attempt `attempt` (the
 	// wallet's RechargeAttempt when it was charged) ended. It is conditional
 	// on that attempt still being current, so two sweeps that charged under

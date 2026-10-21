@@ -136,7 +136,7 @@ func TestWalletRecharge_DeclineBacksOffAndAdvancesTheKey(t *testing.T) {
 	for _, tc := range []struct {
 		priorFailures int
 		wantWait      time.Duration
-	}{{0, time.Hour}, {1, 6 * time.Hour}, {2, 24 * time.Hour}, {7, 24 * time.Hour}} {
+	}{{0, time.Hour}, {1, 6 * time.Hour}, {2, 24 * time.Hour}, {maxRechargeFailures - 2, 24 * time.Hour}} {
 		svc, repo, _, _ := sarRechargeFixture()
 		repo.dueList[0].RechargeFailures = tc.priorFailures
 		charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: false, ErrorCode: "insufficient_funds"}}
@@ -235,5 +235,106 @@ func TestWalletSavedMethod_StripeCustomerUnchanged(t *testing.T) {
 	}
 	if got := stripe.reqs[0]; got.CustomerRef != "cus_1" || got.MethodRef != "pm_1" {
 		t.Fatalf("stripe charge refs = %q/%q, want cus_1/pm_1", got.CustomerRef, got.MethodRef)
+	}
+}
+
+// keyedCharger is a gateway that keeps every payment under its idempotency
+// key, as Moyasar's given_id does: a replay with the same amount returns the
+// stored payment, one with another amount is refused as a processing error
+// with no error (moyasar.go's mismatch read-back). dropFirst loses the first
+// response after the payment was captured.
+type keyedCharger struct {
+	payments  map[string]int64
+	dropFirst bool
+	reqs      []port.SavedMethodCharge
+}
+
+func (c *keyedCharger) ChargeSavedPaymentMethod(_ context.Context, req port.SavedMethodCharge) (*port.PaymentResult, error) {
+	c.reqs = append(c.reqs, req)
+	if amount, ok := c.payments[req.IdempotencyKey]; ok {
+		if amount != req.Amount {
+			return &port.PaymentResult{Success: false, ErrorCode: "processing_error"}, nil
+		}
+		return &port.PaymentResult{Success: true, PaymentID: req.IdempotencyKey}, nil
+	}
+	c.payments[req.IdempotencyKey] = req.Amount
+	if c.dropFirst {
+		c.dropFirst = false
+		return nil, errors.New("connection reset")
+	}
+	return &port.PaymentResult{Success: true, PaymentID: req.IdempotencyKey}, nil
+}
+
+// A recharge whose response was lost replays the amount it charged, even when
+// the auto-recharge amount changed in between: the replay finds the captured
+// payment and credits it, instead of being refused as a decline (which
+// advanced the key, so the captured payment was never credited and the
+// customer was charged again).
+func TestWalletRecharge_LostResponseReplaysTheChargedAmount(t *testing.T) {
+	svc, repo, ledger, _ := sarRechargeFixture()
+	charger := &keyedCharger{payments: map[string]int64{}, dropFirst: true}
+	svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
+
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	more := int64(60000)
+	repo.dueList[0].AutoRechargeAmount = &more
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(charger.reqs) != 2 || charger.reqs[1].Amount != 50000 || charger.reqs[1].IdempotencyKey != charger.reqs[0].IdempotencyKey {
+		t.Fatalf("charges = %+v, want the lost 50000 charge replayed under its key", charger.reqs)
+	}
+	if len(repo.topUps) != 1 || repo.topUps[0].Amount != 50000 || len(ledger.topUps) != 1 {
+		t.Fatalf("top-ups = %+v, want the captured 50000 credited once", repo.topUps)
+	}
+	if o := repo.outcomes[len(repo.outcomes)-1]; !o.Answered || o.Failures != 0 {
+		t.Fatalf("last outcome = %+v, want a success", o)
+	}
+
+	// The next recharge is a new charge at the new amount.
+	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := charger.reqs[2]; got.Amount != 60000 || got.IdempotencyKey == charger.reqs[0].IdempotencyKey {
+		t.Fatalf("next recharge = %+v, want 60000 under a new key", got)
+	}
+}
+
+// Soft declines are capped: card networks limit reattempts on a declined
+// card, so after maxRechargeFailures failed attempts since the last success
+// auto-recharge stops on that method until the customer saves another, as
+// for a hard decline. The customer hears about the first failure and about
+// the stop, not about every daily retry in between.
+func TestWalletRecharge_SoftDeclinesAreCapped(t *testing.T) {
+	for _, tc := range []struct {
+		priorFailures int
+		wantBlocked   bool
+		wantEmail     bool
+	}{
+		{0, false, true},
+		{1, false, false},
+		{maxRechargeFailures - 2, false, false},
+		{maxRechargeFailures - 1, true, true},
+	} {
+		svc, repo, _, _ := sarRechargeFixture()
+		repo.dueList[0].RechargeFailures = tc.priorFailures
+		notifier := &recordingNotifier{}
+		svc.SetNotifier(notifier)
+		charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: false, ErrorCode: "insufficient_funds"}}
+		svc.SetSavedMethodCharging(moyasarLookup(), moyasarRouter(charger))
+
+		if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		o := repo.outcomes[0]
+		if blocked := o.BlockedMethodRef == "token_abc"; blocked != tc.wantBlocked || !o.Answered || o.Failures != tc.priorFailures+1 {
+			t.Fatalf("after %d prior failures: outcome = %+v, want blocked=%v", tc.priorFailures, o, tc.wantBlocked)
+		}
+		if emailed := len(notifier.to) == 1; emailed != tc.wantEmail || len(notifier.to) > 1 {
+			t.Fatalf("after %d prior failures: emails = %v, want emailed=%v", tc.priorFailures, notifier.to, tc.wantEmail)
+		}
 	}
 }

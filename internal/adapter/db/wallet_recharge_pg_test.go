@@ -117,44 +117,43 @@ func TestWalletRechargeOutcome_Postgres(t *testing.T) {
 	}
 }
 
-// updated_at orders the recharge queue and must only move forward, even when
-// the row's value is ahead of this database's clock (another writer's clock
-// ran ahead), on a recorded attempt and on a top-up alike.
-func TestWalletUpdatedAtNeverMovesBackwards_Postgres(t *testing.T) {
+// An attempt's amount is frozen by its first reservation and replayed by
+// every later one, whatever auto_recharge_amount says, until the attempt is
+// answered; a stale attempt reserves nothing.
+func TestWalletReserveRechargeAmount_Postgres(t *testing.T) {
 	dbx := openCustomerPMTestDB(t)
-	conn := dbx.DB
-	repo, w := seedRechargeWallet(t, conn)
+	repo, w := seedRechargeWallet(t, dbx.DB)
 	ctx := context.Background()
-	read := func() time.Time {
+	reserve := func(attempt int, amount int64) (int64, bool) {
 		t.Helper()
-		got, err := repo.GetByID(ctx, w.TenantID, w.ID)
-		if err != nil || got == nil {
-			t.Fatalf("load wallet: %v", err)
-		}
-		return got.UpdatedAt
-	}
-	for _, step := range []struct {
-		name string
-		run  func() error
-	}{
-		{"recorded attempt", func() error {
-			return repo.RecordRechargeOutcome(ctx, w.TenantID, w.ID, 0, port.RechargeOutcome{Answered: true})
-		}},
-		{"top-up", func() error {
-			_, err := repo.TopUp(ctx, &domain.WalletTransaction{ID: uuid.New(), TenantID: w.TenantID, WalletID: w.ID,
-				Type: domain.WalletTxTopUp, Source: domain.WalletSourceManual, Amount: 100, CreatedAt: time.Now().UTC()})
-			return err
-		}},
-	} {
-		if _, err := conn.Exec(`UPDATE wallets SET updated_at = NOW() + INTERVAL '1 hour' WHERE id = $1`, w.ID); err != nil {
+		got, ok, err := repo.ReserveRechargeAmount(ctx, w.TenantID, w.ID, attempt, amount)
+		if err != nil {
 			t.Fatal(err)
 		}
-		before := read()
-		if err := step.run(); err != nil {
-			t.Fatalf("%s: %v", step.name, err)
-		}
-		if after := read(); !after.After(before) {
-			t.Fatalf("%s: updated_at went %v -> %v", step.name, before, after)
-		}
+		return got, ok
+	}
+
+	if got, ok := reserve(0, 5000); !ok || got != 5000 {
+		t.Fatalf("first reservation = %d/%v, want 5000/true", got, ok)
+	}
+	// A lost response keeps the attempt and its amount.
+	if err := repo.RecordRechargeOutcome(ctx, w.TenantID, w.ID, 0, port.RechargeOutcome{Failures: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := reserve(0, 6000); !ok || got != 5000 {
+		t.Fatalf("replay reservation = %d/%v, want the frozen 5000", got, ok)
+	}
+	if _, ok := reserve(1, 6000); ok {
+		t.Fatal("a stale attempt number reserved an amount")
+	}
+	if _, ok, err := repo.ReserveRechargeAmount(ctx, uuid.New(), w.ID, 0, 6000); err != nil || ok {
+		t.Fatalf("another tenant reserved: ok=%v err=%v", ok, err)
+	}
+	// An answer clears it: the next attempt charges the current amount.
+	if err := repo.RecordRechargeOutcome(ctx, w.TenantID, w.ID, 0, port.RechargeOutcome{Answered: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := reserve(1, 6000); !ok || got != 6000 {
+		t.Fatalf("next attempt reservation = %d/%v, want 6000/true", got, ok)
 	}
 }

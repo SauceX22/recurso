@@ -44,7 +44,7 @@ func (r *DunningSuccessRecorder) Record(ctx context.Context, inv *domain.Invoice
 		InvoiceID:     inv.ID,
 		ContextKey:    inv.DunningContextKey,
 		ActionID:      inv.DunningActionID,
-		RetryInterval: int64(actionByID(inv.DunningActionID).Interval.Seconds()),
+		RetryInterval: DunningActionIntervalSeconds(inv.DunningActionID),
 		Outcome:       "success",
 		Reward:        1.0,
 		CreatedAt:     time.Now(),

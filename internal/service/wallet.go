@@ -503,13 +503,24 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 		return false
 	}
 
-	amount := *w.AutoRechargeAmount
 	// The key advances only once an attempt's outcome is known (paid or
 	// declined), so a sweep after a lost response replays the same charge,
 	// whatever else changed on the wallet meanwhile, and each legitimate
 	// recharge gets a fresh key. Gateway keys can live forever (Moyasar's
 	// given_id does), so a key that repeated across recharges would replay
-	// an old payment instead of charging.
+	// an old payment instead of charging. The amount is frozen with the
+	// attempt: a replay at another amount is refused by the gateway, and the
+	// payment the lost response captured would never be credited.
+	amount, current, err := s.wallets.ReserveRechargeAmount(ctx, w.TenantID, w.ID, w.RechargeAttempt, *w.AutoRechargeAmount)
+	if err != nil {
+		slog.WarnContext(ctx, "wallet auto-recharge: could not reserve the attempt", "wallet_id", w.ID, "error", err)
+		s.recordRechargeFailure(ctx, w, false, "")
+		return false
+	}
+	if !current {
+		// Another sweep already recorded this attempt's outcome.
+		return false
+	}
 	idemKey := fmt.Sprintf("wallet-recharge-%s-%d", w.ID, w.RechargeAttempt)
 	result, err := charger.ChargeSavedPaymentMethod(ctx, port.SavedMethodCharge{
 		CustomerRef:    m.CustomerRef,
@@ -527,12 +538,17 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 	}
 	if !result.Success {
 		logChargeFailure(ctx, "wallet auto-recharge charge declined", result, nil, "wallet_id", w.ID, "provider", m.Provider)
+		failures := w.RechargeFailures + 1
 		blocked := ""
-		if result.Permanent {
+		if result.Permanent || failures >= maxRechargeFailures {
 			blocked = m.PaymentMethodRef
 		}
 		s.recordRechargeFailure(ctx, w, true, blocked)
-		s.notifyRechargeFailure(ctx, w, "payment failed")
+		// Tell the customer once when declines start, and once when
+		// auto-recharge stops; not on every backed-off retry in between.
+		if failures == 1 || blocked != "" {
+			s.notifyRechargeFailure(ctx, w, "payment failed")
+		}
 		return false
 	}
 
@@ -569,6 +585,11 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 	slog.InfoContext(ctx, "wallet auto-recharged", "wallet_id", w.ID, "amount", amount)
 	return true
 }
+
+// maxRechargeFailures caps failed recharges since the last success: the
+// decline that reaches it stops auto-recharge on that method until the
+// customer saves another (card networks limit reattempts on a declined card).
+const maxRechargeFailures = 8
 
 // rechargeBackoff is how long a wallet waits after its nth failed recharge in
 // a row: retrying a declined card every sweep breaks card-network retry rules

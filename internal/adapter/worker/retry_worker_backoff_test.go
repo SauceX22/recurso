@@ -114,3 +114,58 @@ func TestRetryWorker_AnswerResetsInfraFailures(t *testing.T) {
 		t.Fatalf("RetryInfraFailures = %d after a decline, want 0", got.RetryInfraFailures)
 	}
 }
+
+// An infrastructure failure on a handed-back invoice keeps the hard-declined
+// method on record, on a backed-off retry and on the escalation hand-off.
+// Otherwise the next attempt, once the lookup recovers, charges the
+// lost/stolen card again.
+func TestRetryWorker_InfraErrorKeepsDeclinedMethod(t *testing.T) {
+	for _, prior := range []int{0, maxInfraFailures} {
+		inv := pastDueSARInvoice(2)
+		inv.DeclinedMethodRef = "token_lost"
+		inv.LastPaymentError = "lost_or_stolen"
+		inv.RetryInfraFailures = prior
+		repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
+		charger := &fakeSavedCharger{name: "moyasar"}
+		router := service.NewSavedCardGatewayRouter(nil, nil, nil)
+		router.RegisterProvider(domain.GatewayMoyasar, charger)
+
+		w := NewRetryWorker(repo, &countingDecider{}, &mockGateway{}, &mockNotifier{})
+		w.SetSavedMethodCharging(&fakeCustomerLookup{err: errors.New("connection reset")}, router)
+		w.processRetries(context.Background())
+
+		got := repo.updated[len(repo.updated)-1]
+		if got.DeclinedMethodRef != "token_lost" {
+			t.Fatalf("prior=%d: DeclinedMethodRef = %q after an infra error, want token_lost kept", prior, got.DeclinedMethodRef)
+		}
+
+		// The lookup recovers and still returns the declined card: not charged.
+		back := *got
+		back.DunningManagedBy = "worker"
+		repo = &mockInvoiceRepo{invoices: []*domain.Invoice{&back}}
+		w = NewRetryWorker(repo, &countingDecider{}, &mockGateway{}, &mockNotifier{})
+		w.SetSavedMethodCharging(&fakeCustomerLookup{provider: domain.GatewayMoyasar, ref: "token_lost"}, router)
+		w.processRetries(context.Background())
+		if charger.charges != 0 {
+			t.Fatalf("prior=%d: hard-declined card charged %d times after an infra error", prior, charger.charges)
+		}
+	}
+}
+
+// An infrastructure failure is not an attempt, so it changes nothing but the
+// backoff: an open invoice stays open, and the last decline (which the
+// scheduler's emails and the declined-method hand-back read) stays.
+func TestRetryWorker_InfraErrorChangesOnlyTheBackoff(t *testing.T) {
+	inv := pastDueSARInvoice(1)
+	inv.Status = domain.InvoiceStatusOpen
+	inv.LastPaymentError = "insufficient_funds"
+	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
+	w := NewRetryWorker(repo, &countingDecider{}, &mockGateway{}, &mockNotifier{})
+	w.SetSavedMethodCharging(&fakeCustomerLookup{err: errors.New("connection reset")}, service.NewSavedCardGatewayRouter(nil, nil, nil))
+	w.processRetries(context.Background())
+
+	got := repo.updated[0]
+	if got.Status != domain.InvoiceStatusOpen || got.LastPaymentError != "insufficient_funds" || got.RetryInfraFailures != 1 {
+		t.Fatalf("status=%s last_error=%q infra_failures=%d; want open/insufficient_funds/1", got.Status, got.LastPaymentError, got.RetryInfraFailures)
+	}
+}

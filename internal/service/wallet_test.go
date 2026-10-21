@@ -21,6 +21,7 @@ type fakeWalletRepo struct {
 	drainGives int64   // amount the fake "drains"
 	dueList    []domain.Wallet
 	outcomes   []port.RechargeOutcome
+	reserved   map[uuid.UUID]int64
 }
 
 func (f *fakeWalletRepo) Create(ctx context.Context, w *domain.Wallet) error {
@@ -67,6 +68,24 @@ func (f *fakeWalletRepo) ListDueForRecharge(ctx context.Context, limit int) ([]d
 	return f.dueList, nil
 }
 
+// ReserveRechargeAmount freezes the attempt's amount like the conditional
+// UPDATE: the first reservation of the current attempt wins.
+func (f *fakeWalletRepo) ReserveRechargeAmount(_ context.Context, _, walletID uuid.UUID, attempt int, amount int64) (int64, bool, error) {
+	if f.reserved == nil {
+		f.reserved = map[uuid.UUID]int64{}
+	}
+	for _, w := range f.dueList {
+		if w.ID == walletID && w.RechargeAttempt != attempt {
+			return 0, false, nil
+		}
+	}
+	if frozen, ok := f.reserved[walletID]; ok {
+		return frozen, true, nil
+	}
+	f.reserved[walletID] = amount
+	return amount, true, nil
+}
+
 // RecordRechargeOutcome records the outcome and, like the conditional
 // UPDATE, applies it to the listed wallet only while attempt is current.
 func (f *fakeWalletRepo) RecordRechargeOutcome(_ context.Context, _, walletID uuid.UUID, attempt int, o port.RechargeOutcome) error {
@@ -78,6 +97,7 @@ func (f *fakeWalletRepo) RecordRechargeOutcome(_ context.Context, _, walletID uu
 		}
 		if o.Answered {
 			w.RechargeAttempt++
+			delete(f.reserved, walletID)
 		}
 		w.RechargeFailures = o.Failures
 	}

@@ -116,16 +116,18 @@ over. A hard decline records the declined method (`declined_method_ref`) and
 doesn't count as a retry (the scheduler's email counter stays in step); when
 the scheduler hands the invoice back, that method is not charged again until
 the customer saves another. A lookup or router failure is not "no method": it
-takes the infrastructure retry. Infrastructure errors back off from 5 minutes
-(doubling, 6h cap) and hand the invoice to email dunning after 6 in a row.
+takes the infrastructure retry. Infrastructure errors back off from 5 minutes,
+doubling up to 160 min, then email dunning: the invoice is handed off after 6 in a row.
 Every post-attempt write is conditional on the invoice still being open or
 past_due, so a payment that lands during the charge is never reverted.
 
 **Wallet auto-recharge.** The attempt number in the key advances only when the
-gateway answers (paid or declined), so a lost response replays the same charge
-whatever else changed on the wallet. Failed attempts back off 1h, 6h, then
-daily; a hard decline stops auto-recharge until the customer's saved method
-changes.
+gateway answers (paid or declined), so a lost response replays the same charge,
+for the amount frozen with the attempt (`recharge_amount`), whatever else
+changed on the wallet. Failed attempts back off 1h, 6h, then daily; a hard
+decline, or the 8th failure since the last success, stops auto-recharge until
+the customer's saved method changes. The decline email goes out on the first
+failure and when auto-recharge stops.
 
 ### Webhook (`POST /webhooks/moyasar`)
 

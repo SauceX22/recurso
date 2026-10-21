@@ -120,7 +120,7 @@ func (r *WalletRepository) ListByTenant(ctx context.Context, tenantID uuid.UUID,
 
 func (r *WalletRepository) UpdateAutoRecharge(ctx context.Context, tenantID, id uuid.UUID, threshold, amount *int64) error {
 	res, err := r.db.ExecContext(ctx, `
-		UPDATE wallets SET auto_recharge_threshold = $3, auto_recharge_amount = $4, updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond')
+		UPDATE wallets SET auto_recharge_threshold = $3, auto_recharge_amount = $4, updated_at = NOW()
 		WHERE tenant_id = $1 AND id = $2`,
 		tenantID, id, threshold, amount)
 	if err != nil {
@@ -174,7 +174,7 @@ func (r *WalletRepository) TopUp(ctx context.Context, wtx *domain.WalletTransact
 		return false, nil
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE wallets SET balance = $3, updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond') WHERE tenant_id = $1 AND id = $2`,
+		`UPDATE wallets SET balance = $3, updated_at = NOW() WHERE tenant_id = $1 AND id = $2`,
 		wtx.TenantID, wtx.WalletID, balance); err != nil {
 		return false, fmt.Errorf("failed to update wallet balance: %w", err)
 	}
@@ -326,7 +326,7 @@ func (r *WalletRepository) Drain(ctx context.Context, tenantID, walletID uuid.UU
 		return 0, fmt.Errorf("failed to insert wallet drain: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE wallets SET balance = $3, updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond') WHERE tenant_id = $1 AND id = $2`,
+		`UPDATE wallets SET balance = $3, updated_at = NOW() WHERE tenant_id = $1 AND id = $2`,
 		tenantID, walletID, balance); err != nil {
 		return 0, fmt.Errorf("failed to update wallet balance after drain: %w", err)
 	}
@@ -433,7 +433,7 @@ func (r *WalletRepository) finishExpiry(ctx context.Context, tx *sql.Tx, tenantI
 		return uuid.Nil, fmt.Errorf("failed to insert expiry transaction: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE wallets SET balance = $3, updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond') WHERE tenant_id = $1 AND id = $2`,
+		`UPDATE wallets SET balance = $3, updated_at = NOW() WHERE tenant_id = $1 AND id = $2`,
 		tenantID, walletID, balance); err != nil {
 		return uuid.Nil, fmt.Errorf("failed to update wallet balance after expiry: %w", err)
 	}
@@ -468,17 +468,36 @@ func (r *WalletRepository) ListDueForRecharge(ctx context.Context, limit int) ([
 	return wallets, rows.Err()
 }
 
+// ReserveRechargeAmount freezes the amount of auto-recharge attempt `attempt`
+// (the first reservation wins) and returns it; ok is false once the attempt
+// is no longer current.
+func (r *WalletRepository) ReserveRechargeAmount(ctx context.Context, tenantID, walletID uuid.UUID, attempt int, amount int64) (int64, bool, error) {
+	var frozen int64
+	err := r.db.QueryRowContext(ctx, `
+		UPDATE wallets SET recharge_amount = COALESCE(recharge_amount, $4)
+		WHERE tenant_id = $1 AND id = $2 AND recharge_attempt = $3
+		RETURNING recharge_amount`,
+		tenantID, walletID, attempt, amount).Scan(&frozen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to reserve wallet recharge amount: %w", err)
+	}
+	return frozen, true, nil
+}
+
 // RecordRechargeOutcome stores the outcome of auto-recharge attempt `attempt`.
 // The attempt guard makes concurrent sweeps that charged under the same key
-// record it once. updated_at moves strictly forward (like every wallet write,
-// never back to an earlier NOW()), which sends the wallet to the back of the
+// record it once. Touching updated_at sends the wallet to the back of the
 // recharge queue.
 func (r *WalletRepository) RecordRechargeOutcome(ctx context.Context, tenantID, walletID uuid.UUID, attempt int, o port.RechargeOutcome) error {
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE wallets
 		SET recharge_attempt = recharge_attempt + CASE WHEN $4 THEN 1 ELSE 0 END,
+		    recharge_amount = CASE WHEN $4 THEN NULL ELSE recharge_amount END,
 		    recharge_failures = $5, recharge_retry_at = $6, recharge_blocked_ref = $7,
-		    updated_at = GREATEST(NOW(), updated_at + INTERVAL '1 microsecond')
+		    updated_at = NOW()
 		WHERE tenant_id = $1 AND id = $2 AND recharge_attempt = $3`,
 		tenantID, walletID, attempt, o.Answered, o.Failures, o.RetryAt, nilIfEmpty(o.BlockedMethodRef))
 	if err != nil {

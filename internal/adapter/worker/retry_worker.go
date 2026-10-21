@@ -40,15 +40,21 @@ type retryDecider interface {
 	RecordOutcome(ctx context.Context, history domain.DunningHistory) error
 }
 
+// dunningRecoveryMarker closes an invoice's dunning campaign once it is paid.
+// Implemented by *service.DunningCampaignService.
+type dunningRecoveryMarker interface {
+	MarkRecovered(ctx context.Context, invoiceID uuid.UUID) error
+}
+
 type RetryWorker struct {
-	invoiceRepo            port.InvoiceRepository
-	retryService           retryDecider
-	gateway                port.PaymentGateway
-	notifier               port.Notifier
-	dunningCampaignService *service.DunningCampaignService
-	customerLookup         customerPaymentLookup
-	chargerRouter          savedCardChargerRouter
-	settler                invoiceSettler
+	invoiceRepo    port.InvoiceRepository
+	retryService   retryDecider
+	gateway        port.PaymentGateway
+	notifier       port.Notifier
+	recovery       *service.DunningSuccessRecorder
+	customerLookup customerPaymentLookup
+	chargerRouter  savedCardChargerRouter
+	settler        invoiceSettler
 }
 
 func NewRetryWorker(
@@ -62,11 +68,14 @@ func NewRetryWorker(
 		retryService: retryService,
 		gateway:      gateway,
 		notifier:     notifier,
+		recovery:     service.NewDunningSuccessRecorder(nil, retryService),
 	}
 }
 
-func (w *RetryWorker) SetDunningCampaignService(svc *service.DunningCampaignService) {
-	w.dunningCampaignService = svc
+// SetDunningCampaignService closes the invoice's dunning campaign when a retry
+// collects, through the recorder every settlement path shares.
+func (w *RetryWorker) SetDunningCampaignService(campaigns dunningRecoveryMarker) {
+	w.recovery = service.NewDunningSuccessRecorder(campaigns, w.retryService)
 }
 
 // SetSettler routes successful retries through the ledger-posting
@@ -200,21 +209,16 @@ func (w *RetryWorker) processRetries(ctx context.Context) {
 }
 
 // Infrastructure errors (gateway outage, revoked key, rate limit, lookup
-// failure) back off exponentially from 5 minutes, and after maxInfraFailures
-// in a row the invoice goes to email dunning: a key that stays broken must
-// not call the gateway every few minutes forever.
+// failure) back off exponentially from 5 minutes (at most 160 minutes), and
+// after maxInfraFailures in a row the invoice goes to email dunning: a key
+// that stays broken must not call the gateway every few minutes forever.
 const (
 	infraRetryBase   = 5 * time.Minute
-	infraRetryMax    = 6 * time.Hour
 	maxInfraFailures = 6
 )
 
 func infraRetryDelay(failures int) time.Duration {
-	d := infraRetryBase
-	for i := 1; i < failures && d < infraRetryMax; i++ {
-		d *= 2
-	}
-	return min(d, infraRetryMax)
+	return infraRetryBase << (failures - 1)
 }
 
 func (w *RetryWorker) processInvoice(ctx context.Context, inv *domain.Invoice) {
@@ -248,40 +252,34 @@ func (w *RetryWorker) processInvoice(ctx context.Context, inv *domain.Invoice) {
 		return
 	}
 
-	// 2. Record outcome for the PREVIOUS action (if one was tracked)
-	if inv.DunningActionID != "" && inv.DunningContextKey != "" {
-		outcome := "failure"
-		reward := 0.0
-		if result.Success {
-			outcome = "success"
-			reward = 1.0
-		}
+	// A success closes the invoice's dunning (campaign, bandit reward) once it
+	// settles.
+	if result.Success {
+		w.settle(ctx, inv, result.PaymentID)
+		return
+	}
 
+	// The previous action (if one was tracked) failed to collect.
+	if inv.DunningActionID != "" && inv.DunningContextKey != "" {
 		historyErr := w.retryService.RecordOutcome(ctx, domain.DunningHistory{
 			ID:            uuid.New(),
 			TenantID:      inv.TenantID,
 			InvoiceID:     inv.ID,
 			ContextKey:    inv.DunningContextKey,
 			ActionID:      inv.DunningActionID,
-			RetryInterval: getDurationSeconds(inv.DunningActionID),
-			Outcome:       outcome,
-			Reward:        reward,
+			RetryInterval: service.DunningActionIntervalSeconds(inv.DunningActionID),
+			Outcome:       "failure",
+			Reward:        0.0,
 			CreatedAt:     time.Now(),
 		})
 		if historyErr != nil {
 			slog.Error("retry worker: failed to record outcome", "invoice_number", inv.InvoiceNumber, "error", historyErr)
 		} else {
-			slog.Info("retry worker: recorded outcome", "outcome", outcome, "action_id", inv.DunningActionID, "context_key", inv.DunningContextKey)
+			slog.Info("retry worker: recorded outcome", "outcome", "failure", "action_id", inv.DunningActionID, "context_key", inv.DunningContextKey)
 		}
 	}
 
-	// 3. Handle result
-	if result.Success {
-		w.settle(ctx, inv, result.PaymentID)
-		return
-	}
-
-	// 4. Payment failed
+	// Payment failed.
 	errorCode := result.ErrorCode
 	if errorCode == "" {
 		errorCode = "GENERIC_FAILURE"
@@ -301,7 +299,6 @@ func (w *RetryWorker) processInvoice(ctx context.Context, inv *domain.Invoice) {
 	}
 
 	inv.RetryCount++
-	inv.LastPaymentError = errorCode
 	decision := w.retryService.DecideRetry(ctx, inv, errorCode)
 	if decision == nil {
 		slog.Warn("retry worker: max retries reached, marking uncollectible", "invoice_number", inv.InvoiceNumber)
@@ -407,13 +404,7 @@ func (w *RetryWorker) settle(ctx context.Context, inv *domain.Invoice, paymentID
 	if err := w.invoiceRepo.ClearRetryState(tenantCtx, inv.TenantID, inv.ID); err != nil {
 		slog.Error("retry worker: failed to clear dunning state", "invoice_id", inv.ID, "error", err)
 	}
-
-	// Mark dunning campaign as recovered
-	if w.dunningCampaignService != nil {
-		if err := w.dunningCampaignService.MarkRecovered(ctx, inv.ID); err != nil {
-			slog.Error("retry worker: failed to mark dunning campaign recovered", "invoice_id", inv.ID, "error", err)
-		}
-	}
+	w.recovery.Record(tenantCtx, inv)
 }
 
 // noChargeDue is the PaymentID of a "success" where nothing was charged.
@@ -422,13 +413,3 @@ const noChargeDue = "no_charge_due"
 // dunningManagedByScheduler puts an invoice on the dunning scheduler's email
 // ladder (ClaimOverdueForDunning) instead of the worker's retry claim.
 const dunningManagedByScheduler = "scheduler"
-
-// getDurationSeconds maps action ID to its interval in seconds
-func getDurationSeconds(actionID string) int64 {
-	for _, a := range domain.DefaultDunningActions {
-		if a.ID == actionID {
-			return int64(a.Interval.Seconds())
-		}
-	}
-	return 86400 // default 24h
-}

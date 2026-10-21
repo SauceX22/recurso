@@ -267,3 +267,42 @@ func TestSavedCardGatewayRouter_ErrorKinds(t *testing.T) {
 		t.Fatal("a method on another gateway than the currency's must count as not chargeable")
 	}
 }
+
+// A BYO connection whose stored secret opens to "" never builds a charger (an
+// empty API key would send the charge unauthenticated), and it can never be
+// charged as configured, so callers fall back instead of retrying it.
+func TestSavedCardGatewayRouter_EmptySecretBuildsNothing(t *testing.T) {
+	connID := uuid.New()
+	built := 0
+	build := func(string) SavedCardCharger { built++; return &namedCharger{name: "byo"} }
+	opener := &fakeConnOpener{conn: &domain.GatewayConnection{ID: connID, Provider: domain.GatewayStripe}, secret: ""}
+	r := NewSavedCardGatewayRouter(opener, build, &namedCharger{name: "platform"})
+
+	c, err := r.ChargerFor(context.Background(), stripeMethod(&connID), "USD")
+	if !errors.Is(err, ErrSavedMethodNotChargeable) || c != nil || built != 0 {
+		t.Fatalf("charger=%v err=%v built=%d; want ErrSavedMethodNotChargeable and no charger built", c, err, built)
+	}
+}
+
+// A BYO method on a deployment with no connection store, or on a connection
+// whose provider has no BYO charger, can never be charged as configured:
+// callers must fall back (dunning, pay link), not retry it as a transient
+// failure.
+func TestSavedCardGatewayRouter_UnconfigurableBYOIsNotChargeable(t *testing.T) {
+	connID := uuid.New()
+	moyasarOnConn := moyasarMethod()
+	moyasarOnConn.GatewayConnectionID = &connID
+	for _, tc := range []struct {
+		name string
+		r    *SavedCardGatewayRouter
+		m    domain.SavedPaymentMethod
+	}{
+		{"no connection store", NewSavedCardGatewayRouter(nil, nil, &namedCharger{name: "platform"}), stripeMethod(&connID)},
+		{"no builder for provider", NewSavedCardGatewayRouter(&fakeConnOpener{conn: &domain.GatewayConnection{ID: connID, Provider: domain.GatewayMoyasar}, secret: "sk"},
+			func(string) SavedCardCharger { return &namedCharger{} }, &namedCharger{name: "platform"}), moyasarOnConn},
+	} {
+		if _, err := tc.r.ChargerFor(context.Background(), tc.m, "USD"); !errors.Is(err, ErrSavedMethodNotChargeable) {
+			t.Errorf("%s: err = %v, want ErrSavedMethodNotChargeable", tc.name, err)
+		}
+	}
+}
