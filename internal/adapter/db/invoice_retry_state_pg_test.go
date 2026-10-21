@@ -99,18 +99,49 @@ func TestClaimGatewayPaymentID_Postgres(t *testing.T) {
 	repo := NewInvoiceRepository(dbx.DB).(*InvoiceRepository)
 	ctx := context.Background()
 	for _, step := range []struct {
-		tenant uuid.UUID
-		id     string
-		want   bool
+		tenant       uuid.UUID
+		id           string
+		want         bool
+		wantWasEmpty bool
 	}{
-		{uuid.New(), "pay_A", false}, // other tenant
-		{tenantID, "pay_A", true},    // first claim
-		{tenantID, "pay_A", true},    // same payment again (redelivery)
-		{tenantID, "pay_B", false},   // a second payment
+		{uuid.New(), "pay_A", false, false}, // other tenant
+		{tenantID, "pay_A", true, true},     // first claim fills the empty slot
+		{tenantID, "pay_A", true, false},    // same payment again (redelivery)
+		{tenantID, "pay_B", false, false},   // a second payment
 	} {
-		got, err := repo.ClaimGatewayPaymentID(ctx, step.tenant, invID, step.id)
-		if err != nil || got != step.want {
-			t.Fatalf("claim %s under %s = %v, %v; want %v", step.id, step.tenant, got, err, step.want)
+		got, wasEmpty, err := repo.ClaimGatewayPaymentID(ctx, step.tenant, invID, step.id)
+		if err != nil || got != step.want || wasEmpty != step.wantWasEmpty {
+			t.Fatalf("claim %s under %s = %v, %v, %v; want %v, %v", step.id, step.tenant, got, wasEmpty, err, step.want, step.wantWasEmpty)
+		}
+	}
+
+	// Concurrent claims of the same payment (webhook and verify): exactly one
+	// sees the slot empty. Of two different payments, exactly one wins.
+	for _, ids := range [][2]string{{"pay_C", "pay_C"}, {"pay_D", "pay_E"}} {
+		inv := seedRetryInvoice(t, dbx.DB, tenantID, custID, "open")
+		type result struct{ claimed, wasEmpty bool }
+		out := make(chan result, 2)
+		for _, id := range ids {
+			go func() {
+				c, e, err := repo.ClaimGatewayPaymentID(ctx, tenantID, inv, id)
+				if err != nil {
+					t.Error(err)
+				}
+				out <- result{c, e}
+			}()
+		}
+		var claimed, empty int
+		for range 2 {
+			r := <-out
+			if r.claimed {
+				claimed++
+			}
+			if r.wasEmpty {
+				empty++
+			}
+		}
+		if want := map[bool]int{true: 2, false: 1}[ids[0] == ids[1]]; claimed != want || empty != 1 {
+			t.Fatalf("%v: claimed=%d wasEmpty=%d, want %d and 1", ids, claimed, empty, want)
 		}
 	}
 }

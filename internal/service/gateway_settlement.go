@@ -55,9 +55,10 @@ type paidInvoiceMarker interface {
 }
 
 // gatewayPaymentClaimer records the payment that settled an invoice unless a
-// different one is already recorded. Satisfied by *db.InvoiceRepository.
+// different one is already recorded, and says whether none was recorded
+// before. Satisfied by *db.InvoiceRepository.
 type gatewayPaymentClaimer interface {
-	ClaimGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (bool, error)
+	ClaimGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (claimed, wasEmpty bool, err error)
 }
 
 type settlementSubscriptionReader interface {
@@ -265,21 +266,7 @@ func (s *GatewaySettlementService) Settle(ctx context.Context, inv *domain.Invoi
 			"excess", excess, "currency", inv.Currency)
 	}
 
-	// The invoice's recorded payment is its refund target. A second payment
-	// for an invoice another payment already settled is a duplicate charge.
-	owns := transitioned
-	if s.payments != nil {
-		claimed, err := s.payments.ClaimGatewayPaymentID(ctx, inv.TenantID, inv.ID, p.ID)
-		if err != nil {
-			log.ErrorContext(ctx, "failed to record gateway payment id", "error", err)
-		} else {
-			owns = claimed
-		}
-	}
-	if !owns {
-		log.WarnContext(ctx, "invoice already settled by another payment — duplicate charge, review for refund",
-			"amount", p.Amount, "currency", p.Currency)
-	} else {
+	if recordSettlingPayment(ctx, log, s.payments, inv, transitioned, p.ID) {
 		s.saveCard(ctx, tenantCtx, inv, p)
 	}
 
@@ -287,6 +274,47 @@ func (s *GatewaySettlementService) Settle(ctx context.Context, inv *domain.Invoi
 		s.recovery.Record(tenantCtx, inv)
 	}
 	return transitioned, nil
+}
+
+// RecordSettlingPayment records paymentID, a payment that just succeeded on
+// inv, as the invoice's refund target; transitioned is whether settling inv
+// for it marked it paid. Renewal, the retry worker and Settle share it, so
+// every path applies the same duplicate-charge rule.
+func RecordSettlingPayment(ctx context.Context, claimer gatewayPaymentClaimer, inv *domain.Invoice, transitioned bool, paymentID string) {
+	recordSettlingPayment(ctx, slog.With("invoice_id", inv.ID, "payment_id", paymentID), claimer, inv, transitioned, paymentID)
+}
+
+// recordSettlingPayment claims the invoice's refund target for paymentID and
+// reports whether paymentID is the payment that settled inv. The claim is
+// conditional, so it never overwrites another payment. It logs a possible
+// duplicate charge, for an operator to review for a refund, when the claim
+// loses to another payment, or when the invoice was already settled some
+// other way (offline, manually) with no payment recorded. Finding paymentID
+// already recorded (the webhook settled it first) is not a duplicate. Without
+// a claimer, or when the claim fails, only the paid transition decides.
+func recordSettlingPayment(ctx context.Context, log *slog.Logger, claimer gatewayPaymentClaimer, inv *domain.Invoice, transitioned bool, paymentID string) bool {
+	if paymentID == "" {
+		return transitioned
+	}
+	if claimer == nil {
+		if !transitioned {
+			log.WarnContext(ctx, "invoice was already settled before this payment — possible duplicate charge, review for refund")
+		}
+		return transitioned
+	}
+	claimed, wasEmpty, err := claimer.ClaimGatewayPaymentID(ctx, inv.TenantID, inv.ID, paymentID)
+	switch {
+	case err != nil:
+		log.ErrorContext(ctx, "failed to record the settling payment id; refunds need it", "error", err)
+		return transitioned
+	case !claimed:
+		log.WarnContext(ctx, "invoice already settled by another payment — duplicate charge, review for refund")
+		return false
+	case !transitioned && wasEmpty:
+		log.WarnContext(ctx, "invoice was settled another way before this payment — possible duplicate charge, review for refund")
+		return false
+	}
+	return true
 }
 
 func (s *GatewaySettlementService) saveCard(ctx, tenantCtx context.Context, inv *domain.Invoice, p *port.GatewayPayment) {

@@ -1521,25 +1521,33 @@ func (r *InvoiceRepository) SetGatewayPaymentID(ctx context.Context, tenantID, i
 }
 
 // ClaimGatewayPaymentID records paymentID as the payment that settled the
-// invoice unless a different payment is already recorded. It reports whether
-// paymentID is now the recorded one; false means another payment got there
-// first, so paymentID is a duplicate charge. Conditional in SQL so two
-// concurrent settlers cannot both win.
-func (r *InvoiceRepository) ClaimGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (bool, error) {
-	res, err := r.db.ExecContext(ctx, `
-		UPDATE invoices
+// invoice unless a different payment is already recorded. claimed reports
+// whether paymentID is now the recorded one; false means another payment got
+// there first, so paymentID is a duplicate charge. wasEmpty reports that no
+// payment was recorded before this call (false when paymentID already was).
+// The row is locked while it is read, so two concurrent settlers cannot both
+// win or both see it empty.
+func (r *InvoiceRepository) ClaimGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (claimed, wasEmpty bool, err error) {
+	err = r.db.QueryRowContext(ctx, `
+		WITH prior AS (
+			SELECT id, COALESCE(gateway_payment_id, '') AS payment_id
+			FROM invoices
+			WHERE id = $2 AND tenant_id = $3
+			FOR UPDATE
+		)
+		UPDATE invoices i
 		SET gateway_payment_id = $1
-		WHERE id = $2 AND tenant_id = $3
-		  AND (gateway_payment_id IS NULL OR gateway_payment_id = '' OR gateway_payment_id = $1)`,
-		paymentID, invoiceID, tenantID)
-	if err != nil {
-		return false, fmt.Errorf("failed to claim gateway payment id: %w", err)
+		FROM prior
+		WHERE i.id = prior.id AND (prior.payment_id = '' OR prior.payment_id = $1)
+		RETURNING prior.payment_id = ''`,
+		paymentID, invoiceID, tenantID).Scan(&wasEmpty)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
 	}
-	n, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("failed to claim gateway payment id: %w", err)
+		return false, false, fmt.Errorf("failed to claim gateway payment id: %w", err)
 	}
-	return n > 0, nil
+	return true, wasEmpty, nil
 }
 
 // VoidIfOpen atomically voids a still-open (unpaid) invoice. Returns true only

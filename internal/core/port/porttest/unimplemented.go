@@ -886,7 +886,7 @@ func (UnimplementedInvoiceRepository) SetGatewayPaymentID(context.Context, uuid.
 	panic("porttest: InvoiceRepository.SetGatewayPaymentID is not implemented")
 }
 
-func (UnimplementedInvoiceRepository) ClaimGatewayPaymentID(context.Context, uuid.UUID, uuid.UUID, string) (bool, error) {
+func (UnimplementedInvoiceRepository) ClaimGatewayPaymentID(context.Context, uuid.UUID, uuid.UUID, string) (bool, bool, error) {
 	panic("porttest: InvoiceRepository.ClaimGatewayPaymentID is not implemented")
 }
 
