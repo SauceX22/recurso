@@ -114,7 +114,7 @@ func TestCreditNote_ResolveUnknownRefunds(t *testing.T) {
 	got := map[uuid.UUID]domain.CreditNoteRefundStatus{}
 	for _, u := range f.repo.updates {
 		got[u.id] = u.status
-		if u.refundID == nil || !(*u.refundID == *applied.RefundID || *u.refundID == *notApplied.RefundID) {
+		if u.refundID == nil || (*u.refundID != *applied.RefundID && *u.refundID != *notApplied.RefundID) {
 			t.Fatalf("update %+v changed the refund id", u)
 		}
 	}
