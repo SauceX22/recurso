@@ -6,6 +6,7 @@ import { Plus, Gift, Package } from "lucide-react";
 import { endpoints } from "../lib/api";
 import { useDebounce } from "../hooks/useDebounce";
 import { useUrlState, useResetPageOnChange } from "@/lib/useUrlState";
+import { BILLING_CURRENCIES } from "@/lib/utils";
 import BuyGiftModal from "../components/BuyGiftModal";
 import { Money } from "@/components/ui/money";
 import { PageHeader } from "@/components/patterns/PageHeader";
@@ -20,7 +21,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-const CURRENCY_FILTERS = ["all", "USD", "INR"];
+const CURRENCY_FILTERS = ["all", ...BILLING_CURRENCIES];
 const INTERVAL_FILTERS = ["all", "month", "year"];
 const PAGE_SIZE = 10;
 

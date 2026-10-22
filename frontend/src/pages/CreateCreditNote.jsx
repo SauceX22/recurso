@@ -4,7 +4,7 @@ import { useNavigate } from "react-router";
 
 import { endpoints } from "../lib/api";
 import { useCustomers } from "@/lib/useCustomers";
-import { toMinorUnits, formatCurrency, shortId } from "@/lib/utils";
+import { toMinorUnits, formatCurrency, shortId, BILLING_CURRENCIES } from "@/lib/utils";
 import { FormField } from "@/components/patterns/FormField";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -25,6 +25,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
+// Credit note types the API accepts (POST /v1/credit-notes `type`).
+const ADJUSTMENT = "adjustment";
+const REFUND = "refund";
+
 const CreateCreditNote = () => {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -35,8 +39,11 @@ const CreateCreditNote = () => {
   const [errors, setErrors] = useState({});
   const [formData, setFormData] = useState({
     customer_id: "",
+    type: ADJUSTMENT,
     amount: "",
-    currency: "USD",
+    // Empty until known: the customer's billing currency, the linked
+    // invoice's, or the operator's pick — never an assumed USD.
+    currency: "",
     reason: "",
     invoice_id: "", // Optional
     expires_at: "", // Optional — blank means the credit never expires
@@ -57,26 +64,43 @@ const CreateCreditNote = () => {
         : [],
     [allInvoices, formData.customer_id]
   );
+  const linkedInvoice = customerInvoices.find((i) => i.id === formData.invoice_id);
+  // The API refunds only a paid invoice, up to what was paid on it (less any
+  // earlier refunds, which the server enforces).
+  const canRefund = linkedInvoice?.status === "paid" && (linkedInvoice.amount_paid || 0) > 0;
+  const isRefund = formData.type === REFUND;
 
   const close = () => navigate("/credit-notes");
 
   // Selecting a customer resets any linked invoice (the list changes) and
-  // returns the currency to the USD default for a standalone credit.
+  // defaults the currency to the one that customer is billed in (their latest
+  // invoice), keeping the current pick when they have no invoices yet.
   const selectCustomer = (id) =>
-    setFormData((prev) => ({ ...prev, customer_id: id, invoice_id: "", currency: "USD" }));
+    setFormData((prev) => {
+      const billed = allInvoices.find((i) => i.customer_id === id)?.currency;
+      return {
+        ...prev,
+        customer_id: id,
+        invoice_id: "",
+        type: ADJUSTMENT,
+        currency: billed || prev.currency,
+      };
+    });
 
   // Linking an invoice locks the credit to that invoice's currency — a credit
-  // against an invoice must be issued in the same currency.
+  // against an invoice must be issued in the same currency. A refund needs a
+  // paid invoice, so changing the link drops back to a balance credit.
   const NONE = "__none__";
   const selectInvoice = (value) => {
     if (value === NONE) {
-      setFormData((prev) => ({ ...prev, invoice_id: "", currency: "USD" }));
+      setFormData((prev) => ({ ...prev, invoice_id: "", type: ADJUSTMENT }));
       return;
     }
     const inv = customerInvoices.find((i) => i.id === value);
     setFormData((prev) => ({
       ...prev,
       invoice_id: value,
+      type: ADJUSTMENT,
       currency: inv?.currency || prev.currency,
     }));
   };
@@ -88,18 +112,27 @@ const CreateCreditNote = () => {
   const validate = () => {
     const next = {};
     if (!formData.customer_id) next.customer_id = "Select a customer.";
+    if (!formData.currency) next.currency = "Select a currency.";
     if (!formData.amount) next.amount = "Enter a credit amount.";
+    else if (
+      isRefund &&
+      toMinorUnits(formData.amount, formData.currency) > (linkedInvoice?.amount_paid || 0)
+    )
+      next.amount = "A refund can't be more than was paid on the invoice.";
     setErrors(next);
     return Object.keys(next).length === 0;
   };
 
   const createMutation = useMutation({
     mutationFn: (payload) => endpoints.createCreditNote(payload),
-    onSuccess: () => {
+    onSuccess: (res, payload) => {
       // Read-your-write: the list is cached for 60s, so invalidate before
       // navigating or the new credit note won't show until the cache expires.
       queryClient.invalidateQueries({ queryKey: ["credit-notes"] });
-      navigate("/credit-notes");
+      // A refund's outcome (refund_status: succeeded, failed, manual) shows on
+      // the note's own page, so open it rather than the list.
+      const id = res?.data?.data?.id;
+      navigate(payload.type === REFUND && id ? `/credit-notes/${id}` : "/credit-notes");
     },
     onError: (err) => {
       console.error(err);
@@ -122,9 +155,10 @@ const CreateCreditNote = () => {
       invoice_id: formData.invoice_id ? formData.invoice_id : null,
     };
     if (!payload.invoice_id) delete payload.invoice_id;
-    // Expiry is optional; send an end-of-day RFC3339 timestamp so the credit is
-    // usable through the selected date, or omit it entirely (never expires).
-    if (formData.expires_at) {
+    // Expiry is optional and applies only to a spendable balance credit; send
+    // an end-of-day RFC3339 timestamp so the credit is usable through the
+    // selected date, or omit it entirely (never expires).
+    if (formData.expires_at && !isRefund) {
       payload.expires_at = new Date(`${formData.expires_at}T23:59:59Z`).toISOString();
     } else {
       delete payload.expires_at;
@@ -133,13 +167,19 @@ const CreateCreditNote = () => {
     createMutation.mutate(payload);
   };
 
+  const typeDescription = isRefund
+    ? `Sends the money back through the payment gateway to the card or account that paid. Up to ${formatCurrency(linkedInvoice?.amount_paid || 0, formData.currency)}, less any earlier refunds. A payment taken offline is marked for a manual refund.`
+    : canRefund
+      ? "Adds spendable credit the customer's next invoices draw down. No money moves."
+      : "Adds spendable credit the customer's next invoices draw down. A refund needs a linked paid invoice.";
+
   return (
     <Sheet open onOpenChange={(open) => !open && close()}>
       <SheetContent side="right" className="w-full sm:max-w-lg">
         <SheetHeader>
           <SheetTitle>Create credit note</SheetTitle>
           <SheetDescription>
-            Issue a credit to a customer that can be applied to an invoice.
+            Credit a customer's balance, or refund a paid invoice to the original payment.
           </SheetDescription>
         </SheetHeader>
 
@@ -177,9 +217,63 @@ const CreateCreditNote = () => {
             </Select>
           </FormField>
 
+          <FormField
+            label="Linked invoice (optional)"
+            htmlFor="invoice_id"
+            description={
+              formData.invoice_id
+                ? "The credit is issued in this invoice's currency."
+                : undefined
+            }
+          >
+            <Select
+              value={
+                formData.customer_id ? formData.invoice_id || NONE : undefined
+              }
+              onValueChange={selectInvoice}
+              disabled={!formData.customer_id}
+            >
+              <SelectTrigger id="invoice_id">
+                <SelectValue
+                  placeholder={
+                    formData.customer_id
+                      ? "No linked invoice"
+                      : "Select a customer first"
+                  }
+                />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NONE}>No linked invoice</SelectItem>
+                {customerInvoices.map((inv) => (
+                  <SelectItem key={inv.id} value={inv.id}>
+                    {(inv.invoice_number || shortId(inv.id))} —{" "}
+                    {formatCurrency(inv.total, inv.currency)} · {inv.status}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </FormField>
+
+          <FormField label="Type" htmlFor="type" description={typeDescription}>
+            <Select
+              value={formData.type}
+              onValueChange={(v) => setFormData((prev) => ({ ...prev, type: v }))}
+            >
+              <SelectTrigger id="type">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ADJUSTMENT}>Credit to balance</SelectItem>
+                <SelectItem value={REFUND} disabled={!canRefund}>
+                  Refund to the original payment
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </FormField>
+
           <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
             <FormField
-              label="Credit amount"
+              label={isRefund ? "Refund amount" : "Credit amount"}
               htmlFor="amount"
               required
               error={errors.amount}
@@ -201,60 +295,50 @@ const CreateCreditNote = () => {
               </div>
             </FormField>
 
-            <FormField
-              label="Linked invoice (optional)"
-              htmlFor="invoice_id"
-              description={
-                formData.invoice_id
-                  ? "The credit is issued in this invoice's currency."
-                  : undefined
-              }
-            >
-              <Select
-                value={
-                  formData.customer_id ? formData.invoice_id || NONE : undefined
-                }
-                onValueChange={selectInvoice}
-                disabled={!formData.customer_id}
+            {!formData.invoice_id && (
+              <FormField
+                label="Currency"
+                htmlFor="currency"
+                required
+                error={errors.currency}
               >
-                <SelectTrigger id="invoice_id">
-                  <SelectValue
-                    placeholder={
-                      formData.customer_id
-                        ? "No linked invoice"
-                        : "Select a customer first"
-                    }
-                  />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={NONE}>No linked invoice</SelectItem>
-                  {customerInvoices.map((inv) => (
-                    <SelectItem key={inv.id} value={inv.id}>
-                      {(inv.invoice_number || shortId(inv.id))} —{" "}
-                      {formatCurrency(inv.total, inv.currency)} · {inv.status}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </FormField>
+                <Select
+                  value={formData.currency || undefined}
+                  onValueChange={(v) => setFormData((prev) => ({ ...prev, currency: v }))}
+                >
+                  <SelectTrigger id="currency">
+                    <SelectValue placeholder="Select currency" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {BILLING_CURRENCIES.map((c) => (
+                      <SelectItem key={c} value={c}>
+                        {c}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FormField>
+            )}
           </div>
 
-          <FormField
-            label="Expires on (optional)"
-            htmlFor="expires_at"
-            description="Leave blank for a credit that never expires. On this date, any unused balance is written off."
-          >
-            <Input
-              id="expires_at"
-              type="date"
-              name="expires_at"
-              value={formData.expires_at}
-              onChange={handleChange}
-              className="sm:max-w-[12rem]"
-            />
-          </FormField>
+          {!isRefund && (
+            <FormField
+              label="Expires on (optional)"
+              htmlFor="expires_at"
+              description="Leave blank for a credit that never expires. On this date, any unused balance is written off."
+            >
+              <Input
+                id="expires_at"
+                type="date"
+                name="expires_at"
+                value={formData.expires_at}
+                onChange={handleChange}
+                className="sm:max-w-[12rem]"
+              />
+            </FormField>
+          )}
 
-          <FormField label="Reason for credit" htmlFor="reason">
+          <FormField label={isRefund ? "Reason for refund" : "Reason for credit"} htmlFor="reason">
             <Textarea
               id="reason"
               name="reason"
@@ -271,7 +355,11 @@ const CreateCreditNote = () => {
             Cancel
           </Button>
           <Button type="submit" form="create-credit-note-form" disabled={loading}>
-            {loading ? "Issuing..." : "Issue credit note"}
+            {loading
+              ? "Issuing..."
+              : isRefund
+                ? "Issue refund"
+                : "Issue credit note"}
           </Button>
         </SheetFooter>
       </SheetContent>

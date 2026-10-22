@@ -343,3 +343,43 @@ describe("InvoicePage", () => {
     expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
   });
 });
+
+describe("InvoicePage — payment link", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    endpoints.getEUEInvoice.mockResolvedValue({ data: { data: null } });
+    endpoints.getInvoiceJournalEntries.mockResolvedValue({ data: { data: { entries: [] } } });
+    endpoints.getInvoicePaymentAttempts.mockResolvedValue({ data: { data: { attempts: [] } } });
+    endpoints.getInvoiceStatusHistory.mockResolvedValue({ data: { data: { history: [] } } });
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn().mockResolvedValue(undefined) },
+      configurable: true,
+    });
+  });
+
+  it.each(["open", "past_due", "uncollectible"])(
+    "copies the hosted checkout link for a %s invoice",
+    async (status) => {
+      endpoints.getInvoice.mockResolvedValue({
+        data: { data: { ...baseInvoice, status, amount_paid: 0, currency: "SAR" } },
+      });
+      renderPage();
+      const button = await screen.findByRole("button", { name: "Copy payment link" });
+      fireEvent.click(button);
+      await waitFor(() =>
+        expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+          `${window.location.origin}/checkout/inv-1`
+        )
+      );
+    }
+  );
+
+  it.each(["paid", "void", "draft"])("offers no payment link for a %s invoice", async (status) => {
+    endpoints.getInvoice.mockResolvedValue({
+      data: { data: { ...baseInvoice, status, currency: "SAR" } },
+    });
+    renderPage();
+    await screen.findByRole("heading", { name: "INV-1" });
+    expect(screen.queryByRole("button", { name: "Copy payment link" })).not.toBeInTheDocument();
+  });
+});
