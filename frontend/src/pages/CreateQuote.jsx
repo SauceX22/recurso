@@ -5,7 +5,7 @@ import { useNavigate, useParams } from "react-router";
 import { Plus, Trash2 } from "lucide-react";
 
 import { endpoints } from "../lib/api";
-import { formatCurrency, toMinorUnits, fromMinorUnits } from "@/lib/utils";
+import { BILLING_CURRENCIES, formatCurrency, toMinorUnits, fromMinorUnits } from "@/lib/utils";
 import { FormField } from "@/components/patterns/FormField";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -246,10 +246,11 @@ const CreateQuote = () => {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="USD">USD</SelectItem>
-                    <SelectItem value="EUR">EUR</SelectItem>
-                    <SelectItem value="GBP">GBP</SelectItem>
-                    <SelectItem value="INR">INR</SelectItem>
+                    {BILLING_CURRENCIES.map((c) => (
+                      <SelectItem key={c} value={c}>
+                        {c}
+                      </SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
               </FormField>

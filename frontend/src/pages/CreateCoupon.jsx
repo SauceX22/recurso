@@ -5,7 +5,7 @@ import { useNavigate } from "react-router";
 import { Sparkles } from "lucide-react";
 
 import { endpoints } from "../lib/api";
-import { cn, toMinorUnits, currencyDecimals } from "@/lib/utils";
+import { BILLING_CURRENCIES, cn, toMinorUnits, currencyDecimals } from "@/lib/utils";
 import { useFormErrors } from "@/lib/useFormErrors";
 import { usePlans } from "@/lib/useCustomers";
 import { FormField } from "@/components/patterns/FormField";
@@ -28,8 +28,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-// Currency choices when the tenant has no plans yet (mirrors CreatePlan).
-const FALLBACK_CURRENCIES = ["USD", "INR", "EUR", "GBP"];
 
 const symbolFor = (cur) => {
   try {
@@ -77,7 +75,7 @@ const CreateCoupon = () => {
       }
     }
     const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([c]) => c);
-    return sorted.length ? sorted : FALLBACK_CURRENCIES;
+    return sorted.length ? sorted : BILLING_CURRENCIES;
   }, [plans]);
   const [pickedCurrency, setPickedCurrency] = useState(null);
   const currency = pickedCurrency || currencies[0];

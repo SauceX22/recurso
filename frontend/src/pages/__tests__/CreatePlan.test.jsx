@@ -33,6 +33,12 @@ describe("CreatePlan (Sheet form)", () => {
     endpoints.createPlan.mockResolvedValue({ data: { data: { id: "plan_1" } } });
   });
 
+  it("offers SAR among the plan currencies", () => {
+    renderPage();
+    const options = [...document.querySelectorAll("select option")].map((o) => o.value);
+    expect(options).toEqual(expect.arrayContaining(["USD", "INR", "EUR", "GBP", "SAR"]));
+  });
+
   it("refuses to submit without a name and code", async () => {
     renderPage();
     expect(screen.getByText("Create a new plan")).toBeInTheDocument();

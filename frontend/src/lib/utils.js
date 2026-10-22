@@ -47,6 +47,9 @@ export function toMinorUnits(amount, currency = "USD") {
  * returns money in the smallest currency unit; the decimals shown are the
  * currency's own (Intl decides — 2 for USD, 0 for JPY, 3 for KWD).
  */
+// Currencies a tenant can bill in: each has a gateway route (SAR via Moyasar).
+export const BILLING_CURRENCIES = ["USD", "INR", "EUR", "GBP", "SAR"];
+
 export function formatCurrency(amountMinor, currency = "USD") {
   return new Intl.NumberFormat("en-US", {
     style: "currency",
