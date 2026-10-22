@@ -382,7 +382,8 @@ func (r *SubscriptionRepository) GetSubscriptionsDueTomorrow(ctx context.Context
 			s.id, s.tenant_id, s.customer_id, s.plan_id, s.status,
 			s.current_period_end,
 			c.name as customer_name, c.email as customer_email,
-			p.name as plan_name, pr.amount as amount, pr.currency
+			p.name as plan_name, pr.amount as amount, pr.currency,
+			COALESCE(c.card_last4, '')
 		FROM subscriptions s
 		JOIN customers c ON s.customer_id = c.id
 		JOIN plans p ON s.plan_id = p.id
@@ -412,6 +413,7 @@ func (r *SubscriptionRepository) GetSubscriptionsDueTomorrow(ctx context.Context
 			&nextBilling,
 			&customerName, &sub.CustomerEmail,
 			&sub.PlanName, &sub.Amount, &sub.Currency,
+			&sub.PaymentMethodLast4,
 		); err != nil {
 			return nil, err
 		}
