@@ -1,4 +1,4 @@
-// Countries offered in country pickers (signup, legal-entity settings). The
+// Countries offered in country pickers (signup, settings, customer form). The
 // ISO-2 code is what the API stores; the backend accepts any ISO-2 code, so
 // this list is a UX convenience, not a validation boundary.
 export const COUNTRIES = [
@@ -15,6 +15,7 @@ export const COUNTRIES = [
   { code: "AU", name: "Australia" },
   { code: "SG", name: "Singapore" },
   { code: "AE", name: "United Arab Emirates" },
+  { code: "SA", name: "Saudi Arabia" },
 ];
 
 export const COUNTRY_NAME = Object.fromEntries(COUNTRIES.map((c) => [c.code, c.name]));

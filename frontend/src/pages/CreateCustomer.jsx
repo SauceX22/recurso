@@ -6,6 +6,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "@/components/ui/sonner";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { COUNTRIES } from "@/lib/countries";
 import { useFormErrors } from "@/lib/useFormErrors";
 import { FormField } from "@/components/patterns/FormField";
 import { Button } from "@/components/ui/button";
@@ -27,13 +28,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-// ISO country map — identical mapping to the previous implementation.
-const COUNTRY_ISO = {
-  "United States": "US",
-  India: "IN",
-  Canada: "CA",
-  "United Kingdom": "GB",
-};
+// Countries whose addresses carry a state/province: the tax engines read it
+// for the US (sales tax) and India (place of supply); CA/AU print one.
+const STATE_COUNTRIES = new Set(["US", "IN", "CA", "AU"]);
 
 const INDIA_STATES = [
   { code: "TN", name: "Tamil Nadu" },
@@ -54,8 +51,9 @@ export default function CreateCustomer() {
     email: "",
     phone: "",
     address: "",
-    country: "United States",
-    state: "California",
+    // ISO-2 code; empty until chosen — never a silent default country.
+    country: "",
+    state: "",
     tax_id: "",
     tax_exempt: false,
     tax_exemption_number: "",
@@ -63,7 +61,11 @@ export default function CreateCustomer() {
     tax_exemption_expires_at: "",
   });
 
-  const isIndia = form.country === "India";
+  const isIndia = form.country === "IN";
+  // The exemption only feeds the US sales-tax engine (tax_resolver
+  // exemptForCustomer), so it is offered for US customers only.
+  const isUS = form.country === "US";
+  const hasState = STATE_COUNTRIES.has(form.country);
   const setField = (key, value) => setForm((f) => ({ ...f, [key]: value }));
   const close = () => navigate("/customers");
 
@@ -94,8 +96,6 @@ export default function CreateCustomer() {
   const handleSubmit = (e) => {
     e.preventDefault();
     if (!validate()) return;
-    const isoCountry = COUNTRY_ISO[form.country] || "US";
-    // Payload is byte-for-byte identical to the original create-customer form.
     createMutation.mutate({
       name: form.name,
       email: form.email,
@@ -104,13 +104,14 @@ export default function CreateCustomer() {
       gstin: isIndia ? form.tax_id : "",
       place_of_supply: isIndia ? form.state : "",
       line1: form.address,
-      country: isoCountry,
-      state: form.state,
-      // US sales-tax exemption (D2) — only meaningful outside India.
-      tax_exempt: isIndia ? false : form.tax_exempt,
-      tax_exemption_number: isIndia ? "" : form.tax_exemption_number,
-      tax_exemption_code: isIndia ? "" : form.tax_exemption_code,
-      tax_exemption_expires_at: isIndia || !form.tax_exempt ? "" : form.tax_exemption_expires_at,
+      // Empty when not chosen: the API accepts "" (omitempty,len=2).
+      country: form.country,
+      state: hasState ? form.state : "",
+      // US sales-tax exemption (D2) — only the US engine reads it.
+      tax_exempt: isUS ? form.tax_exempt : false,
+      tax_exemption_number: isUS ? form.tax_exemption_number : "",
+      tax_exemption_code: isUS ? form.tax_exemption_code : "",
+      tax_exemption_expires_at: isUS && form.tax_exempt ? form.tax_exemption_expires_at : "",
     });
   };
 
@@ -188,44 +189,46 @@ export default function CreateCustomer() {
                   }
                 >
                   <SelectTrigger id="country">
-                    <SelectValue />
+                    <SelectValue placeholder="Select a country" />
                   </SelectTrigger>
                   <SelectContent>
-                    {Object.keys(COUNTRY_ISO).map((c) => (
-                      <SelectItem key={c} value={c}>
-                        {c}
+                    {COUNTRIES.map((c) => (
+                      <SelectItem key={c.code} value={c.code}>
+                        {c.name}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               </FormField>
 
-              <FormField
-                label={isIndia ? "Place of supply (State)" : "State / Province"}
-                htmlFor="state"
-              >
-                {isIndia ? (
-                  <Select value={form.state} onValueChange={(v) => setField("state", v)}>
-                    <SelectTrigger id="state">
-                      <SelectValue placeholder="Select state" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {INDIA_STATES.map((s) => (
-                        <SelectItem key={s.code} value={s.code}>
-                          {s.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                ) : (
-                  <Input
-                    id="state"
-                    placeholder="e.g. California"
-                    value={form.state}
-                    onChange={(e) => setField("state", e.target.value)}
-                  />
-                )}
-              </FormField>
+              {hasState && (
+                <FormField
+                  label={isIndia ? "Place of supply (State)" : "State / Province"}
+                  htmlFor="state"
+                >
+                  {isIndia ? (
+                    <Select value={form.state} onValueChange={(v) => setField("state", v)}>
+                      <SelectTrigger id="state">
+                        <SelectValue placeholder="Select state" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {INDIA_STATES.map((s) => (
+                          <SelectItem key={s.code} value={s.code}>
+                            {s.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <Input
+                      id="state"
+                      placeholder={isUS ? "e.g. California" : "e.g. Ontario"}
+                      value={form.state}
+                      onChange={(e) => setField("state", e.target.value)}
+                    />
+                  )}
+                </FormField>
+              )}
             </div>
 
             <FormField
@@ -240,7 +243,7 @@ export default function CreateCustomer() {
               />
             </FormField>
 
-            {!isIndia && (
+            {isUS && (
               <div className="rounded-lg border border-border p-4">
                 <div className="flex items-center justify-between gap-4">
                   <div>
