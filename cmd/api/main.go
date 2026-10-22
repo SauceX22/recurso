@@ -1470,12 +1470,14 @@ func main() {
 
 	// GST & PDF (P30)
 	pdfService := service.NewInvoicePDFService(
-		getEnvDefault("PDF_COMPANY_NAME", "Your Company Name"),
-		getEnvDefault("PDF_COMPANY_ADDRESS", "123 Business Street, City, State - 000000"),
+		// No placeholder seller details: they would print on real customer
+		// invoices. Tenant branding (Settings) overrides name and bank details.
+		getEnvDefault("PDF_COMPANY_NAME", ""),
+		getEnvDefault("PDF_COMPANY_ADDRESS", ""),
 		getEnvDefault("PDF_COMPANY_GSTIN", ""),
 		getEnvDefault("PDF_COMPANY_PAN", ""),
 		getEnvDefault("PDF_COMPANY_STATE", ""),
-		getEnvDefault("PDF_BANK_DETAILS", "Bank: HDFC Bank\nAccount: 00000000000000\nIFSC: HDFC0000000"),
+		getEnvDefault("PDF_BANK_DETAILS", ""),
 		getEnvDefault("PDF_COMPANY_COUNTRY", companyCountry),
 		getEnvDefault("PDF_COMPANY_TAX_ID", ""),
 	)

@@ -669,8 +669,10 @@ const GSTInvoicePDFTemplate = `<!DOCTYPE html>
         <!-- Footer -->
         <div class="footer">
             <div class="footer-left">
+                {{if .BankDetails}}
                 <div class="bank-title">Bank Details</div>
                 <div style="white-space: pre-line;">{{.BankDetails}}</div>
+                {{end}}
             </div>
             <div class="footer-right">
                 <div class="label">For {{.SellerName}}</div>

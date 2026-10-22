@@ -167,3 +167,18 @@ func TestCompareReportHTML_Renders(t *testing.T) {
 		t.Error("ready verdict not rendered")
 	}
 }
+
+// With no bank details configured (env or tenant branding), the invoice
+// prints no "Bank Details" block rather than an empty or placeholder one.
+func TestGenerateInvoiceHTML_NoBankDetailsNoBankBlock(t *testing.T) {
+	svc := NewInvoicePDFService("Thyab Co", "Riyadh", "", "", "", "", "SA", "300000000000003")
+	inv := &domain.Invoice{InvoiceNumber: "INV-SA-1", Currency: "SAR", Subtotal: 11500, Total: 11500,
+		CreatedAt: time.Now(), DueDate: time.Now()}
+	html, err := svc.GenerateInvoiceHTML(svc.BuildInvoiceData(inv, &domain.Customer{Name: pdfStr("Sara")}))
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(html, "Bank Details") {
+		t.Fatal("invoice without bank details must not print a Bank Details block")
+	}
+}
