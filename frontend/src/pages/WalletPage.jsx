@@ -363,7 +363,7 @@ export default function WalletPage() {
             Drained before adjustment credit notes and the payment gateway, oldest-expiring
             residue first.
             {residueReconciles
-              ? " On closure the paid portion is refunded to the customer and the promotional portion is forfeited."
+              ? " On closure the paid portion is booked as returned to the customer (no money is sent; pay it out yourself) and the promotional portion is forfeited."
               : ""}
           </p>
         </ObjectSection>
@@ -563,8 +563,8 @@ export default function WalletPage() {
         title="Close this wallet?"
         description={
           residueReconciles
-            ? `The remaining balance settles now: ${fromMinorUnits(paidResidue, currency)} ${currency} is refunded to the customer and ${fromMinorUnits(promoResidue, currency)} ${currency} of promotional credit is forfeited. This can't be undone.`
-            : `The remaining balance of ${fromMinorUnits(wallet.balance, currency)} ${currency} settles now: the paid portion is refunded to the customer, the promotional portion is forfeited. This can't be undone.`
+            ? `The remaining balance settles now: ${fromMinorUnits(paidResidue, currency)} ${currency} is booked as returned to the customer and ${fromMinorUnits(promoResidue, currency)} ${currency} of promotional credit is forfeited. No money is sent — pay the customer back yourself, e.g. as a refund in your payment gateway. This can't be undone.`
+            : `The remaining balance of ${fromMinorUnits(wallet.balance, currency)} ${currency} settles now: the paid portion is booked as returned to the customer, the promotional portion is forfeited. No money is sent — pay the customer back yourself, e.g. as a refund in your payment gateway. This can't be undone.`
         }
         confirmLabel="Close wallet"
         destructive
@@ -583,7 +583,7 @@ export default function WalletPage() {
           </DialogHeader>
           <div className="space-y-2 text-sm">
             <div className="flex items-center justify-between">
-              <span className="text-muted-foreground">Refunded to customer</span>
+              <span className="text-muted-foreground">Booked as returned to customer</span>
               <span className="tabular-nums font-medium">
                 <Money amountMinor={closeResult?.refunded || 0} currency={currency} />
               </span>
@@ -594,6 +594,11 @@ export default function WalletPage() {
                 <Money amountMinor={closeResult?.forfeited || 0} currency={currency} />
               </span>
             </div>
+            {closeResult?.refunded > 0 && (
+              <p className="pt-1 text-muted-foreground">
+                Recurso sent no money: issue the refund in your payment gateway or by bank transfer.
+              </p>
+            )}
           </div>
           <DialogFooter>
             <Button onClick={() => setCloseResult(null)}>Done</Button>
