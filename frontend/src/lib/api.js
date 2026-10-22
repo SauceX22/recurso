@@ -65,6 +65,10 @@ export const endpoints = {
       withCredentials: false,
     }),
 
+  // Public build info: { version, gateway_mode } — gateway_mode is "none"
+  // when the server has no env-configured payment gateway.
+  getVersion: () => axios.get(`${API_ROOT}/version`),
+
   // --- Auth (session, cookie-based) ---
   authRegister: (data) => axios.post(`${API_ROOT}/auth/register`, data),
   authLogin: (email, password) =>

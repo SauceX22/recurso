@@ -22,6 +22,10 @@ vi.mock('../../lib/api', () => ({
         runReconciliation: vi.fn(),
         getCollectionsFunnel: vi.fn(),
         getCollectionsQueue: vi.fn(),
+        // Onboarding checklist probes (left unresolved: not under test here).
+        getGatewayConnections: vi.fn(() => new Promise(() => {})),
+        getVersion: vi.fn(() => new Promise(() => {})),
+        getPlans: vi.fn(() => new Promise(() => {})),
     }
 }));
 
