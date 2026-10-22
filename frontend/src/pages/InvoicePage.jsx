@@ -45,6 +45,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 
+// Invoice statuses the customer can still pay on hosted checkout.
+const PAYABLE_STATUSES = new Set(["open", "past_due", "uncollectible"]);
+
 // A single line in the amount breakdown box.
 function Row({ label, value, strong, danger, border }) {
   return (
@@ -412,6 +415,23 @@ export default function InvoicePage() {
                     ) : null,
                   },
                   { label: "Invoice ID", value: <CopyableId value={invoice.id} /> },
+                  // The hosted checkout page, for sending the customer a pay
+                  // link without email (and so a first payment can save the
+                  // card for renewals).
+                  ...(PAYABLE_STATUSES.has(invoice.status)
+                    ? [
+                        {
+                          label: "Payment link",
+                          value: (
+                            <CopyableId
+                              value={`${window.location.origin}/checkout/${invoice.id}`}
+                              label="payment link"
+                              full
+                            />
+                          ),
+                        },
+                      ]
+                    : []),
                 ]}
               />
             </ObjectSection>
