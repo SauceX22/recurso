@@ -8,7 +8,7 @@ services:
         - VITE_RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-}
     restart: always
     ports:
-      - "80:8080"
+      - "5168:8080"
     environment:
       - API_UPSTREAM=http://api:8080
     depends_on:
@@ -73,7 +73,11 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=${POSTGRES_DB}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -86,7 +90,7 @@ services:
   tigerbeetle:
     image: ghcr.io/tigerbeetle/tigerbeetle:latest
     restart: always
-    command: [ "start", "--addresses=0.0.0.0:3000", "/data/0_0.tigerbeetle" ]
+    command: ["start", "--addresses=0.0.0.0:3000", "/data/0_0.tigerbeetle"]
     volumes:
       - tigerbeetle_data:/data
     networks:
@@ -103,7 +107,6 @@ volumes:
   postgres_data:
   tigerbeetle_data:
   redis_data:
-
 
 networks:
   recurso_net:
