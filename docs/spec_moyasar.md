@@ -229,9 +229,10 @@ test cards settle real invoices); any other live/test mix is a boot warning.
 
 ## Self-hosting runbook
 
-1. **Don't run the repo `docker-compose.yml` as production.** It is the e2e
-   stack: it defaults `MOYASAR_API_URL` to the e2e stub, uses `sk_test_e2e`
-   keys and runs the renewal sweep every 5s. Set your own env, and leave
+1. **Deploy with `docker-compose.coolify.yml` (Coolify) or
+   `docker-compose.prod.yml`**, never the repo `docker-compose.yml`: that is
+   the e2e stack (stub `MOYASAR_API_URL`, `sk_test_e2e` keys, a 5s renewal
+   sweep). Both production files pin `APP_ENV=production`; leave
    `MOYASAR_API_URL` unset.
 2. **Moyasar account:** the **Tokenization** feature must be enabled for the
    merchant (without it no card is saved and renewals never auto-charge).
@@ -239,12 +240,16 @@ test cards settle real invoices); any other live/test mix is a boot warning.
    Webhooks) with `MOYASAR_WEBHOOK_SECRET` as its shared secret, for at least
    `payment_paid`, `payment_failed` and `payment_refunded`.
 3. **Env:** `MOYASAR_SECRET_KEY`, `MOYASAR_PUBLISHABLE_KEY`,
-   `MOYASAR_WEBHOOK_SECRET`, `GATEWAY_CURRENCY_OVERRIDES=SAR=moyasar`, and
-   `DASHBOARD_URL` = the public https origin buyers open checkout links on.
+   `MOYASAR_WEBHOOK_SECRET`, `GATEWAY_CURRENCY_OVERRIDES=SAR=moyasar`,
+   `COMPANY_COUNTRY=SA`, and `BASE_URL` = `DASHBOARD_URL` = `PORTAL_URL` = the
+   public https origin. Set `PDF_COMPANY_NAME`, `PDF_COMPANY_ADDRESS`,
+   `PDF_COMPANY_TAX_ID` and `PDF_BANK_DETAILS` (or the name and bank details in
+   the dashboard's invoice branding); unset ones print nothing. Moyasar is not
+   on the "Connect a payment gateway" page: that page is for bring-your-own
+   Stripe/Razorpay/GoCardless.
 4. **Serve the dashboard and API on one origin** through `frontend/nginx.conf`:
    `/checkout/:id` is both the SPA page and the invoice API, split on Accept.
-5. **SAR plans** are created through the API (`POST /v1/plans`); the plan form
-   offers USD/INR/EUR/GBP only.
+5. **SAR plans:** the plan, coupon and quote forms offer SAR.
 6. **Refunds** are `POST /v1/credit-notes` with `type: "refund"` and the
    `invoice_id`; the dashboard has no refund action for any gateway.
 7. **VAT:** 15% KSA VAT needs the KSA VAT change and the tenant's legal entity
@@ -277,7 +282,6 @@ names only cards and Apple Pay). A refusal or 3DS demand returns `failed` or
 - Moyasar-dashboard refunds only log a webhook WARN; nothing posts a reversal.
 - CSP: none set yet; it must allow jsDelivr and Moyasar.
 - Moyasar charges are not written to the tenant payments log.
-- `CreatePlan.jsx` offers only USD/INR/EUR/GBP; SAR plans need the API.
 - Refund serialization is per process; two instances refunding the same
   payment at once can still misread each other's amount.
 - A refund of unknown outcome that Moyasar never applied gets no
