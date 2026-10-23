@@ -27,6 +27,7 @@ Where a doc and the code disagree, the code wins (see
 | [DOCUMENTATION_RULES.md](DOCUMENTATION_RULES.md) | How these docs stay true; every-PR checklist | any PR |
 | [evidence/](evidence/) | Raw code-cited inspection findings | verifying a claim |
 | [../REMEDIATION.md](../REMEDIATION.md) | Live audit-remediation status | remediation work |
+| [followups/](followups/README.md) | Living tracker of open bugs, gaps and deferred work (SAR/Moyasar fork) | picking up deferred work |
 
 ## The through-line
 
