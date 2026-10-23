@@ -233,12 +233,19 @@ func main() {
 	reconciliationService.SetReportingResolver(ledgerService)                      // label discrepancy amounts with the tenant's reporting currency
 
 	// 5. Initialize Gateways
+	// Without a key, outside demo and development, the stand-in gateway is
+	// inert: a simulated "successful" dunning retry or mandate debit would mark
+	// real invoices paid with no money collected.
+	unconfiguredGateway := gateway.NewInertMockGateway
+	if os.Getenv("APP_ENV") == "development" {
+		unconfiguredGateway = gateway.NewMockGateway
+	}
 	var razorpayGateway port.PaymentGateway
 	if keyID := os.Getenv("RAZORPAY_KEY_ID"); keyID != "" {
 		razorpayGateway = gateway.NewRazorpayGateway(keyID, os.Getenv("RAZORPAY_KEY_SECRET"))
 		log.Println("Using Real Razorpay Gateway")
 	} else {
-		razorpayGateway = gateway.NewMockGateway()
+		razorpayGateway = unconfiguredGateway()
 		log.Println("Using Razorpay Gateway (Mock — set RAZORPAY_KEY_ID for real payments)")
 	}
 
@@ -247,7 +254,7 @@ func main() {
 		stripeGateway = gateway.NewStripeGateway(key, os.Getenv("STRIPE_WEBHOOK_SECRET"))
 		log.Println("Using Real Stripe Gateway")
 	} else {
-		stripeGateway = gateway.NewMockGateway()
+		stripeGateway = unconfiguredGateway()
 		log.Println("Using Stripe Gateway (Mock)")
 	}
 
