@@ -50,7 +50,7 @@ type InvoiceTax struct {
 //     tenant has no config/country, the lookup fails, or no provider is wired.
 //
 // Engine selection follows tax.NewTaxEngine: IN -> GST, US -> sales tax,
-// EU/GB -> VAT, anything else defaults to GST (India-focused product).
+// EU/GB -> VAT, SA -> KSA VAT, anything else -> no tax (0% with an audit note).
 // A missing or broken tenant config never fails invoice generation.
 type TaxResolver struct {
 	gstConfigs     GSTConfigProvider
@@ -202,9 +202,15 @@ func (r *TaxResolver) ResolveInvoiceTax(ctx context.Context, tenantID uuid.UUID,
 		return r.resolveUSSalesTax(ctx, engine, tenantID, customer, currency, amount)
 	case *tax.EUVATEngine:
 		return r.resolveEUVAT(ctx, engine, sellerCountry, customer, currency, amount)
+	case *tax.KSAVATEngine:
+		return r.resolveKSAVAT(ctx, engine, customer, currency, amount)
+	case *tax.NoTaxEngine:
+		// Unsupported seller jurisdiction (ENG-152): the engine's own 0% + audit
+		// note. It must NOT reach resolveIndiaGST, whose non-INR branch labels
+		// the invoice an India "Zero-rated export (no LUT …)".
+		return r.resolveNoTax(ctx, engine, customer, currency, amount)
 	default:
-		// *tax.GSTEngine — both for IN sellers and the factory's default for
-		// unsupported seller countries (India-focused product).
+		// *tax.GSTEngine — India sellers.
 		return r.resolveIndiaGST(ctx, engine, cfg, customer, currency, amount, hsn)
 	}
 }
@@ -305,15 +311,15 @@ func (r *TaxResolver) SellerCountry(ctx context.Context, tenantID uuid.UUID) str
 
 // RegimeForCountry maps a seller ISO-2 country to an invoice presentation regime
 // (domain.TaxRegime*). Empty or IN ⇒ GST (the India-focused default that mirrors
-// sellerJurisdiction's env fallback); US ⇒ sales tax; an EU/UK country ⇒ VAT;
-// anything else ⇒ plain.
+// sellerJurisdiction's env fallback); US ⇒ sales tax; an EU/UK country or SA ⇒
+// VAT; anything else ⇒ plain.
 func RegimeForCountry(country string) string {
 	switch {
 	case country == "" || strings.EqualFold(country, "IN"):
 		return domain.TaxRegimeGST
 	case strings.EqualFold(country, "US"):
 		return domain.TaxRegimeSalesTax
-	case isEUCountry(country):
+	case isVATCountry(country):
 		return domain.TaxRegimeVAT
 	default:
 		return domain.TaxRegimePlain
@@ -514,6 +520,39 @@ func (r *TaxResolver) resolveEUVAT(ctx context.Context, engine port.TaxEngine, s
 		return InvoiceTax{}
 	}
 	return InvoiceTax{Total: calc.TotalTax, TaxType: calc.TaxType, Note: joinNotes(calc.Note, extraNote), Rate: calc.TaxRate}
+}
+
+// resolveKSAVAT applies KSA VAT for a Saudi seller: 15% on domestic supplies
+// (B2C and B2B alike), zero-rated exports to buyers outside the Kingdom. The
+// engine decides; there is no VIES-style validation step because KSA has no
+// domestic reverse charge to gate.
+func (r *TaxResolver) resolveKSAVAT(ctx context.Context, engine port.TaxEngine, customer *domain.Customer, currency string, amount int64) InvoiceTax {
+	calc, err := engine.CalculateTax(ctx, &port.TaxRequest{
+		Amount:        amount,
+		Currency:      currency,
+		BuyerCountry:  normalizeCountry(customer.BillingAddress.Country),
+		SellerCountry: "SA",
+		IsBusiness:    isBusinessBuyer(customer),
+	})
+	if err != nil || calc == nil {
+		r.logger.WarnContext(ctx, "KSA VAT calculation failed; invoicing without tax", "error", err)
+		return InvoiceTax{}
+	}
+	return InvoiceTax{Total: calc.TotalTax, TaxType: calc.TaxType, Note: calc.Note, Rate: calc.TaxRate}
+}
+
+// resolveNoTax passes an unsupported-jurisdiction engine's 0% result (and its
+// "No tax configured for XX" note) straight through.
+func (r *TaxResolver) resolveNoTax(ctx context.Context, engine port.TaxEngine, customer *domain.Customer, currency string, amount int64) InvoiceTax {
+	calc, err := engine.CalculateTax(ctx, &port.TaxRequest{
+		Amount:       amount,
+		Currency:     currency,
+		BuyerCountry: normalizeCountry(customer.BillingAddress.Country),
+	})
+	if err != nil || calc == nil {
+		return InvoiceTax{}
+	}
+	return InvoiceTax{Total: calc.TotalTax, TaxType: calc.TaxType, Note: calc.Note, Rate: calc.TaxRate}
 }
 
 // reverseChargeDecision returns the IsBusiness flag the VAT engine should see
@@ -735,6 +774,9 @@ var countryNameToISO2 = map[string]string{
 	"canada":                   "CA",
 	"australia":                "AU",
 	"singapore":                "SG",
+	"saudi arabia":             "SA",
+	"kingdom of saudi arabia":  "SA",
+	"ksa":                      "SA",
 	"united arab emirates":     "AE",
 	"uae":                      "AE",
 }

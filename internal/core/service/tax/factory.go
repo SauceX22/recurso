@@ -38,6 +38,9 @@ func NewTaxEngineWithSalesTaxProvider(country, state string, salesTax SalesTaxPr
 	case country == "GB":
 		// UK uses VAT but post-Brexit has its own rules
 		return NewEUVATEngine(country)
+	case country == "SA":
+		// Saudi Arabia: 15% KSA VAT, zero-rated exports (ksa_vat.go).
+		return NewKSAVATEngine()
 	default:
 		// Unsupported jurisdiction: charge no tax rather than misapplying India
 		// GST to (say) a Brazilian or Japanese customer (ENG-152). The seller
