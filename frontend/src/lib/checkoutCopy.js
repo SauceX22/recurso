@@ -56,6 +56,7 @@ const en = {
   paidTitle: "Payment successful",
   paidBody: (n) => `Invoice ${n} has been paid.`,
   closePage: "You can close this page.",
+  redirecting: "You are being redirected to the provider.",
   failedTitle: "Payment not completed",
   failedBody: (n) =>
     `Your payment for invoice ${n} was declined or cancelled. You have not been charged.`,
@@ -136,6 +137,7 @@ const ar = {
   paidTitle: "تم الدفع بنجاح",
   paidBody: (n) => `تم دفع الفاتورة ${isolate(n)}.`,
   closePage: "يمكنك إغلاق هذه الصفحة.",
+  redirecting: "تتم إعادة توجيهك إلى مزود الخدمة.",
   failedTitle: "لم تكتمل عملية الدفع",
   failedBody: (n) => `تم رفض أو إلغاء الدفع للفاتورة ${isolate(n)}. لم يتم خصم أي مبلغ منك.`,
   tryAgain: "حاول مرة أخرى",
