@@ -596,8 +596,6 @@ export default function Checkout() {
           {initiating ? t.starting : t.pay(money(amountDue))}
         </Button>
       )}
-
-      <p className="mt-4 text-center text-xs text-subtle">{t.poweredBy}</p>
     </CheckoutShell>
   );
 }
