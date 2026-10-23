@@ -140,6 +140,9 @@ func (s *RenewalService) ProcessDueRenewals(ctx context.Context) (int, error) {
 //     elapsed period's usage, the period advances via the anchor-preserving
 //     CalculateNextBillingDate, and payment is attempted best-effort.
 func (s *RenewalService) RenewSubscription(ctx context.Context, sub *domain.Subscription) error {
+	// The billing-cycle sweep runs on a tenantless background context, but the
+	// plan lookup, invoice generation and settlement are all tenant-scoped.
+	ctx = context.WithValue(ctx, domain.TenantIDKey, sub.TenantID)
 	now := s.now()
 
 	if sub.CancelAtPeriodEnd {
