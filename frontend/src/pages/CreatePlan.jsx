@@ -34,7 +34,7 @@ export default function CreatePlan() {
     name: "",
     code: "",
     price: 99,
-    currency: "USD",
+    currency: "SAR",
     interval: "month",
   });
 

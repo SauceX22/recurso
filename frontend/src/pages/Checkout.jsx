@@ -182,6 +182,29 @@ export default function Checkout() {
   const [locale] = useState(detectCheckoutLocale);
   const t = checkoutCopy(locale);
 
+  // A callbackUrl search param means an embedding provider wants the buyer sent
+  // back once the invoice is paid. Gateways drop query params across their
+  // redirect (see moyasarAssets), so stash it per invoice to survive the
+  // round-trip. Reject non-http(s) schemes so a crafted link can't turn the
+  // redirect into a javascript: payload.
+  const callbackUrl = useMemo(() => {
+    const key = `checkout:callback:${id}`;
+    let raw = new URLSearchParams(window.location.search).get("callbackUrl");
+    try {
+      if (raw) sessionStorage.setItem(key, raw);
+      else raw = sessionStorage.getItem(key);
+    } catch {
+      // storage disabled; the URL param alone still works when it survives
+    }
+    if (!raw) return null;
+    try {
+      const u = new URL(raw, window.location.origin);
+      return u.protocol === "https:" || u.protocol === "http:" ? u.href : null;
+    } catch {
+      return null;
+    }
+  }, [id]);
+
   const [invoice, setInvoice] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -260,6 +283,20 @@ export default function Checkout() {
     startedRef.current = gatewayReturn;
     runVerify();
   }, [gatewayReturn, runVerify]);
+
+  // Once paid, bounce back to the provider's callbackUrl after a short pause.
+  useEffect(() => {
+    if (status !== "paid" || !callbackUrl) return;
+    const timer = setTimeout(() => {
+      try {
+        sessionStorage.removeItem(`checkout:callback:${id}`);
+      } catch {
+        // nothing to clean up
+      }
+      window.location.assign(callbackUrl);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [status, callbackUrl, id]);
 
   const handleCheckAgain = () => {
     setVerifyError(null);
@@ -392,7 +429,9 @@ export default function Checkout() {
       <CheckoutShell locale={locale}>
         <StatusScreen tone="success" title={t.paidTitle}>
           {t.paidBody(invoiceNumber)}
-          <span className="mt-4 block text-xs text-subtle">{t.closePage}</span>
+          <span className="mt-4 block text-xs text-subtle">
+            {callbackUrl ? t.redirecting : t.closePage}
+          </span>
         </StatusScreen>
       </CheckoutShell>
     );
@@ -596,8 +635,6 @@ export default function Checkout() {
           {initiating ? t.starting : t.pay(money(amountDue))}
         </Button>
       )}
-
-      <p className="mt-4 text-center text-xs text-subtle">{t.poweredBy}</p>
     </CheckoutShell>
   );
 }

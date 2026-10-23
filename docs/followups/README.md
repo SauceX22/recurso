@@ -54,6 +54,7 @@ written. Where an item and the code disagree, the code wins: fix the item.
 | MOY-11 | Webhook log noise when unconfigured; no secret rotation | Moyasar | low | open | [moyasar.md](moyasar.md) |
 | MOY-12 | Checkout-link holders can rate-limit the real buyer | Moyasar | low | open | [moyasar.md](moyasar.md) |
 | MOY-13 | 3DS return with a failed fetch shows "Invoice not found" | Moyasar | low | open | [moyasar.md](moyasar.md) |
+| MOY-14 | Checkout `callbackUrl` redirects the buyer to any site | Moyasar | medium | open | [moyasar.md](moyasar.md) |
 | REF-1 | Moyasar-dashboard refunds and voids never reach the books | dunning/refunds | medium | open | [dunning-refunds.md](dunning-refunds.md) |
 | REF-2 | Unknown-outcome refunds need an operator action or reconciler | dunning/refunds | medium | open | [dunning-refunds.md](dunning-refunds.md) |
 | REF-3 | Refund serialization is per process | dunning/refunds | low | open | [dunning-refunds.md](dunning-refunds.md) |

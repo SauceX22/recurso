@@ -78,7 +78,10 @@ export default function MoyasarForm({ order, invoiceId, locale, t }) {
         // Moyasar rejects any callback that isn't a native async function (it
         // checks the constructor name or the "async" source prefix). Keep them
         // async, and never add a build transform that down-levels async.
-        on_initiating: async () => setFormError(null),
+        on_initiating: async () => {
+          setFormError(null);
+          return true;
+        },
         // Fires once the payment exists, before any 3DS redirect.
         on_completed: async (payment) => {
           if (payment?.id) rememberMoyasarPayment(invoiceId, payment.id);

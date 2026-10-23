@@ -62,7 +62,7 @@ describe("CreatePlan (Sheet form)", () => {
       expect(endpoints.createPlan).toHaveBeenCalledWith({
         name: "Pro",
         code: "pro-yearly",
-        currency: "USD",
+        currency: "SAR", // the form defaults to SAR (Moyasar deployments)
         amount: 4999,
         interval_unit: "year",
         interval_count: 1,

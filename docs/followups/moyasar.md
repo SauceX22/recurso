@@ -206,6 +206,26 @@ Refund follow-ups are in [dunning-refunds.md](dunning-refunds.md).
   invoice with a higher invoice-wide ceiling.
 - **Source:** `review3_money_security.md` L3 (partly addressed in `42664906`).
 
+### MOY-14: Checkout `callbackUrl` redirects the buyer to any site
+
+- **Status:** open
+- **Severity:** medium
+- **What's wrong:** after payment, the checkout page sends the buyer to the
+  link's `callbackUrl` query parameter (stored per invoice in sessionStorage).
+  Any `http:` or `https:` URL is accepted, so anyone can share a genuine
+  checkout link that lands the buyer on their own page after a real payment.
+- **Evidence:** `frontend/src/pages/Checkout.jsx:185` (`callbackUrl` memo:
+  only the scheme is checked), and the `status === "paid"` redirect effect
+  below it (commit `ebdef25e`).
+- **Consequence:** a phishing page that inherits the trust of a real payment
+  ("payment received, now confirm your card"). `http:` also allows a
+  plaintext target.
+- **Proposed fix:** allow only origins the server lists (e.g. a
+  `CHECKOUT_CALLBACK_ORIGINS` env var or per-tenant setting, exposed on the
+  pay response), `https:` only; or have the server sign the callback URL when
+  it issues the link.
+- **Source:** review of the teammate's commit `ebdef25e` (2026-10-23).
+
 ### MOY-13: Returning from 3DS, a failed invoice fetch shows "Invoice not found"
 
 - **Status:** open
