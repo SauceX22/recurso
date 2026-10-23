@@ -82,5 +82,7 @@ Already-fixed items from the source reviews are listed in each area file's
   #4 (`feat/ksa-vat`).
 - [../spec_moyasar.md](../spec_moyasar.md) "Known limitations" and
   "Founder-gated".
-- Review files kept outside the repo: `review_sar_ux.md`, `review4.md` and the
-  R4b report, `review*_*.md`, `fix_plan_r2.md`, `fix_plan_r3.md`.
+- Review reports and fix plans from the Moyasar work, kept outside the repo
+  in the maintainer's workspace archive (`archive/2026-10-moyasar/reviews/`
+  and `plans/`): `review_sar_ux.md`, `review4.md`, `review*_*.md`,
+  `fix_plan_r2.md`, `fix_plan_r3.md`.
