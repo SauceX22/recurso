@@ -1,18 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/json"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/recurso-dev/recurso/internal/adapter/db"
 	"github.com/recurso-dev/recurso/internal/adapter/handler"
 	"github.com/recurso-dev/recurso/internal/adapter/httperr"
 	"github.com/recurso-dev/recurso/internal/adapter/metrics"
+	"github.com/recurso-dev/recurso/internal/adapter/middleware"
 	"github.com/recurso-dev/recurso/internal/service"
 	"github.com/redis/go-redis/v9"
 )
@@ -154,10 +159,24 @@ func registerPublicRoutes(r *gin.Engine, h *publicHandlers) {
 		log.Fatalf("Failed to register OpenAPI routes: %v", err)
 	}
 
+	// Showing the page reads only the database. Paying checks the gateway for
+	// an earlier capture with the secret key (and creates an order), spending
+	// quota that renewals and retries share, so it is also bounded per invoice:
+	// rotating IPs past the per-IP limit cannot spend it without bound. The
+	// per-invoice limiters key on the canonical invoice id (invoiceKey), so
+	// another spelling of the same id gets no fresh bucket.
+	payPerInvoice := middleware.ParamRateLimitMiddleware(h.rdb, "checkout_pay", invoiceKeyParam, 10, time.Minute)
 	r.GET("/checkout/:id", h.publicLimit, h.checkoutHandler.ShowCheckout)
-	r.POST("/checkout/:id/pay", h.publicLimit, h.checkoutHandler.InitiatePayment)
+	r.POST("/checkout/:id/pay", h.publicLimit, invoiceKey, payPerInvoice, h.checkoutHandler.InitiatePayment)
 	r.GET("/checkout/:id/success", h.publicLimit, h.checkoutHandler.CheckoutSuccess)
 	r.POST("/checkout/:id/razorpay/verify", h.publicLimit, h.checkoutHandler.RazorpayVerify)
+	// Each verify spends a secret-key read-back, so it is bounded per invoice
+	// and payment (re-posting one payment from rotating IPs gains nothing),
+	// and per invoice across all payment ids, since every fresh random
+	// payment id would otherwise get a fresh bucket.
+	verifyPerPayment := middleware.ParamRateLimitMiddleware(h.rdb, "checkout_verify", verifyKeyParam, 10, time.Minute)
+	verifyPerInvoice := middleware.ParamRateLimitMiddleware(h.rdb, "checkout_verify_invoice", invoiceKeyParam, verifyPerInvoiceLimit, time.Minute)
+	r.POST("/checkout/:id/moyasar/verify", h.publicLimit, invoiceKey, verifyKey, verifyPerPayment, verifyPerInvoice, h.checkoutHandler.MoyasarVerify)
 	r.POST("/payments/order", h.publicLimit, h.paymentHandler.CreateOrder)
 	// Recurso Cloud waitlist (ENG-12): public demand capture from the website.
 	r.POST("/waitlist", h.publicLimit, h.waitlistHandler.Join)
@@ -170,10 +189,62 @@ func registerPublicRoutes(r *gin.Engine, h *publicHandlers) {
 	r.POST("/webhooks/stripe/:connID", h.webhookHandler.HandleStripe)
 	r.POST("/webhooks/gocardless", h.webhookHandler.HandleGoCardless)
 	r.POST("/webhooks/gocardless/:connID", h.webhookHandler.HandleGoCardless)
+	// Moyasar: env-configured shared secret only (no BYO connections yet).
+	r.POST("/webhooks/moyasar", h.webhookHandler.HandleMoyasar)
 
 	// OAuth callbacks arrive as bare browser redirects from the provider (no
 	// session cookie, no API key) — authentication is the HMAC-signed state
 	// the handler verifies. Locally this was a hard 401; in production it only
 	// worked when the operator's dashboard cookie happened to ride along.
 	r.GET("/v1/accounting/callback/:provider", h.publicLimit, h.accountingHandler.OAuthCallback)
+}
+
+// verifyKeyParam is the path parameter verifyKey adds: "<invoice id>:<payment id>".
+const verifyKeyParam = "verify_key"
+
+// invoiceKeyParam is the path parameter invoiceKey adds: the canonical :id.
+const invoiceKeyParam = "invoice_key"
+
+// verifyPerInvoiceLimit caps verifies per invoice per minute across all
+// payment ids: above any real buyer's retries, but a bound on read-backs.
+const verifyPerInvoiceLimit = 30
+
+// invoiceKey adds the invoice_key parameter the per-invoice limiters key on:
+// :id in canonical form, since uuid.Parse accepts upper case, braces,
+// urn:uuid: and the undashed form for one invoice. An id that is not a UUID
+// is refused by the handler before any gateway call, so all of those share
+// one (empty) bucket.
+func invoiceKey(c *gin.Context) {
+	key := ""
+	if id, err := uuid.Parse(c.Param("id")); err == nil {
+		key = id.String()
+	}
+	c.Params = append(c.Params, gin.Param{Key: invoiceKeyParam, Value: key})
+}
+
+// maxVerifyBody bounds what verifyKey reads; a verify body is one payment id.
+const maxVerifyBody = 4 << 10
+
+// verifyKey adds the verify_key parameter the per-payment verify limiter keys
+// on, from invoice_key (set by invoiceKey, which runs first) and the body's
+// payment_id, and restores the body for the
+// handler. A payment id that is not a UUID is refused before any gateway
+// call, so all of those share one bucket.
+func verifyKey(c *gin.Context) {
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxVerifyBody))
+	if err != nil {
+		httperr.Abort(c, http.StatusBadRequest, httperr.CodeValidationFailed, "failed to read request body")
+		return
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	var req struct {
+		PaymentID string `json:"payment_id"`
+	}
+	paymentID := ""
+	if json.Unmarshal(body, &req) == nil {
+		if id, err := uuid.Parse(req.PaymentID); err == nil {
+			paymentID = id.String()
+		}
+	}
+	c.Params = append(c.Params, gin.Param{Key: verifyKeyParam, Value: c.Param(invoiceKeyParam) + ":" + paymentID})
 }

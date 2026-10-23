@@ -34,6 +34,14 @@ export default function OnboardingChecklist() {
     staleTime: 30_000,
     retry: false,
   });
+  // A gateway configured on the server itself (env keys, e.g. Moyasar) has
+  // no connection row; /version reports it as gateway_mode != "none".
+  const { data: version } = useQuery({
+    queryKey: ["onboarding", "version"],
+    queryFn: () => endpoints.getVersion(),
+    staleTime: 30_000,
+    retry: false,
+  });
   const { data: plans } = useQuery({
     queryKey: ["onboarding", "plans"],
     queryFn: () => endpoints.getPlans({ limit: 1 }),
@@ -54,13 +62,18 @@ export default function OnboardingChecklist() {
   });
 
   const count = (res) => (res?.data?.data || res?.data || []).length;
+  // /gateway-connections wraps { connections: [...], vault_ready }.
+  const connectionCount = gateways?.data?.data?.connections?.length || 0;
+  const serverGateway = Boolean(
+    version?.data?.gateway_mode && version.data.gateway_mode !== "none"
+  );
 
   const steps = [
     {
       label: "Connect a payment gateway",
-      hint: "Stripe, Razorpay, or GoCardless — your keys, your money flow.",
+      hint: "Your own gateway keys, so payments land in your account.",
       to: "/integrations",
-      done: count(gateways) > 0,
+      done: connectionCount > 0 || serverGateway,
     },
     {
       label: "Create your first plan",

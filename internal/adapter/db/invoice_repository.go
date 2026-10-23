@@ -280,7 +280,8 @@ func (r *InvoiceRepository) getByIDInternal(ctx context.Context, id uuid.UUID, t
 			COALESCE(last_payment_error, ''), COALESCE(dunning_managed_by, 'scheduler'),
 			COALESCE(payment_wall_active, FALSE),
 			COALESCE(gateway_payment_id, ''),
-			COALESCE(billing_reason, ''), entity_id, COALESCE(tax_type, '')
+			COALESCE(billing_reason, ''), entity_id, COALESCE(tax_type, ''),
+			COALESCE(declined_method_ref, ''), retry_infra_failures
 		FROM invoices WHERE id = $1
 	`
 	args := []interface{}{id}
@@ -305,6 +306,7 @@ func (r *InvoiceRepository) getByIDInternal(ctx context.Context, id uuid.UUID, t
 		&inv.PaymentWallActive,
 		&inv.GatewayPaymentID,
 		&inv.BillingReason, &entityID, &inv.TaxType,
+		&inv.DeclinedMethodRef, &inv.RetryInfraFailures,
 	)
 
 	inv.HSNCode = hsnCode.String
@@ -387,6 +389,48 @@ func (r *InvoiceRepository) Update(ctx context.Context, inv *domain.Invoice) err
 	return nil
 }
 
+// UpdateRetryState writes only the retry bookkeeping columns, and only while
+// the invoice is unpaid. The worker charges between its claim and this write,
+// and a checkout or webhook may settle the invoice in that window; a full-row
+// write from the claimed copy would put it back to past_due with the old
+// amount_paid, and the next settlement would post the payment twice.
+func (r *InvoiceRepository) UpdateRetryState(ctx context.Context, tenantID, invoiceID uuid.UUID, s port.InvoiceRetryState) (bool, error) {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE invoices
+		SET status = $3, next_retry_at = $4, retry_count = $5,
+		    dunning_action_id = $6, dunning_context_key = $7, last_payment_error = $8,
+		    dunning_managed_by = COALESCE($9, dunning_managed_by),
+		    declined_method_ref = $10, retry_infra_failures = $11,
+		    updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2 AND status IN ('open', 'past_due')`,
+		invoiceID, tenantID, s.Status, s.NextRetryAt, s.RetryCount,
+		nilIfEmpty(s.DunningActionID), nilIfEmpty(s.DunningContextKey), nilIfEmpty(s.LastPaymentError),
+		nilIfEmpty(s.DunningManagedBy), nilIfEmpty(s.DeclinedMethodRef), s.RetryInfraFailures)
+	if err != nil {
+		return false, fmt.Errorf("failed to update invoice retry state: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to read rows affected: %w", err)
+	}
+	return n == 1, nil
+}
+
+// ClearRetryState drops a settled invoice's retry schedule and dunning action;
+// status and amounts belong to MarkPaid.
+func (r *InvoiceRepository) ClearRetryState(ctx context.Context, tenantID, invoiceID uuid.UUID) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE invoices
+		SET next_retry_at = NULL, dunning_action_id = NULL, dunning_context_key = NULL,
+		    last_payment_error = NULL, declined_method_ref = NULL, retry_infra_failures = 0,
+		    updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2`, invoiceID, tenantID)
+	if err != nil {
+		return fmt.Errorf("failed to clear invoice retry state: %w", err)
+	}
+	return nil
+}
+
 // MarkPaid atomically settles an invoice via a single conditional UPDATE. The
 // `AND status <> 'paid'` guard means only the first of several concurrent
 // settlers (inline checkout, gateway webhook, retry worker, offline payment)
@@ -450,7 +494,8 @@ const retryInvoiceColumns = `
 	signed_qr_code, e_invoice_status, tds_amount,
 	created_at, due_date, paid_at, next_retry_at, retry_count,
 	COALESCE(dunning_action_id, ''), COALESCE(dunning_context_key, ''),
-	COALESCE(last_payment_error, ''), COALESCE(dunning_managed_by, 'scheduler')`
+	COALESCE(last_payment_error, ''), COALESCE(dunning_managed_by, 'scheduler'),
+	COALESCE(declined_method_ref, ''), retry_infra_failures`
 
 // ClaimDueForRetry atomically leases up to `limit` due retry invoices for THIS
 // worker instance and returns them, pushing each claimed row's next_retry_at
@@ -507,6 +552,7 @@ func scanRetryInvoices(rows *sql.Rows) ([]*domain.Invoice, error) {
 			&inv.CreatedAt, &dueDate, &inv.PaidAt, &inv.NextRetryAt, &inv.RetryCount,
 			&dunAction, &dunCtx,
 			&lastErr, &dunMgr,
+			&inv.DeclinedMethodRef, &inv.RetryInfraFailures,
 		); err != nil {
 			return nil, err
 		}
@@ -1474,6 +1520,36 @@ func (r *InvoiceRepository) SetGatewayPaymentID(ctx context.Context, tenantID, i
 	return nil
 }
 
+// ClaimGatewayPaymentID records paymentID as the payment that settled the
+// invoice unless a different payment is already recorded. claimed reports
+// whether paymentID is now the recorded one; false means another payment got
+// there first, so paymentID is a duplicate charge. wasEmpty reports that no
+// payment was recorded before this call (false when paymentID already was).
+// The row is locked while it is read, so two concurrent settlers cannot both
+// win or both see it empty.
+func (r *InvoiceRepository) ClaimGatewayPaymentID(ctx context.Context, tenantID, invoiceID uuid.UUID, paymentID string) (claimed, wasEmpty bool, err error) {
+	err = r.db.QueryRowContext(ctx, `
+		WITH prior AS (
+			SELECT id, COALESCE(gateway_payment_id, '') AS payment_id
+			FROM invoices
+			WHERE id = $2 AND tenant_id = $3
+			FOR UPDATE
+		)
+		UPDATE invoices i
+		SET gateway_payment_id = $1
+		FROM prior
+		WHERE i.id = prior.id AND (prior.payment_id = '' OR prior.payment_id = $1)
+		RETURNING prior.payment_id = ''`,
+		paymentID, invoiceID, tenantID).Scan(&wasEmpty)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("failed to claim gateway payment id: %w", err)
+	}
+	return true, wasEmpty, nil
+}
+
 // VoidIfOpen atomically voids a still-open (unpaid) invoice. Returns true only
 // when this call performed the transition — a paid, already-void, or missing
 // invoice is left untouched. Used by gift cancellation: an unpaid purchase
@@ -1505,4 +1581,28 @@ func (r *InvoiceRepository) MarkAsUncollectible(ctx context.Context, invoiceID u
 		return fmt.Errorf("failed to mark invoice as uncollectible: %w", err)
 	}
 	return nil
+}
+
+// ListCardSavingInvoices returns up to limit of the customer's open or
+// past-due invoices on a subscription that will renew (not canceled, not
+// cancelling at period end), oldest due first: paying one saves the card for
+// the renewals. Cross-tenant by customer id: the portal session and the
+// card-expiry sweep carry no tenant, and customer ids are unique UUIDs.
+func (r *InvoiceRepository) ListCardSavingInvoices(ctx context.Context, customerID uuid.UUID, limit int) ([]*domain.Invoice, error) {
+	query := `SELECT ` + invoiceListColumns + `
+		FROM invoices i
+		WHERE i.customer_id = $1
+		  AND i.status IN ('open', 'past_due')
+		  AND EXISTS (
+			SELECT 1 FROM subscriptions s
+			WHERE s.id = i.subscription_id AND s.tenant_id = i.tenant_id
+			  AND s.status <> 'canceled' AND NOT s.cancel_at_period_end)
+		ORDER BY i.due_date ASC, i.created_at ASC
+		LIMIT $2`
+	rows, err := r.db.QueryContext(ctx, query, customerID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list card-saving invoices: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return scanInvoiceList(rows)
 }

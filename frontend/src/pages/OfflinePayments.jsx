@@ -8,7 +8,14 @@ import { useCustomers } from "@/lib/useCustomers";
 import { useUrlState } from "@/lib/useUrlState";
 import { LIST_PAGE_SIZE, pageOffset } from "@/lib/pagination";
 import { toast } from "@/components/ui/sonner";
-import { formatCurrency, toMinorUnits, fromMinorUnits, shortId, formatDateTime } from "@/lib/utils";
+import {
+  formatCurrency,
+  toMinorUnits,
+  fromMinorUnits,
+  shortId,
+  formatDateTime,
+  BILLING_CURRENCIES,
+} from "@/lib/utils";
 import { Money } from "@/components/ui/money";
 import { PageHeader } from "@/components/patterns/PageHeader";
 import { FormSheet } from "@/components/patterns/FormSheet";
@@ -40,7 +47,9 @@ const emptyPayment = {
   payment_type: "bank_transfer",
   amount: "",
   tds_amount: "",
-  currency: "INR",
+  // Chosen, or taken from the linked invoice — never assumed. The API falls
+  // back to INR when currency is omitted, so the form always sends one.
+  currency: "",
   reference_number: "",
   notes: "",
 };
@@ -327,7 +336,7 @@ const OfflinePayments = () => {
         submitLabel="Record payment"
         busyLabel="Recording…"
         busy={recording}
-        canSubmit={Boolean(payForm.customer_id.trim() && payForm.amount)}
+        canSubmit={Boolean(payForm.customer_id.trim() && payForm.amount && payForm.currency)}
         dirty={Boolean(payForm.customer_id || payForm.amount)}
       >
             <div>
@@ -377,6 +386,31 @@ const OfflinePayments = () => {
                 </SelectContent>
               </Select>
             </div>
+            <div>
+              <Label htmlFor="record-currency">Currency</Label>
+              <Select
+                value={payForm.currency || undefined}
+                onValueChange={(v) => setPayForm({ ...payForm, currency: v })}
+                disabled={Boolean(payForm.invoice_id)}
+              >
+                <SelectTrigger id="record-currency">
+                  <SelectValue placeholder="Select currency" />
+                </SelectTrigger>
+                <SelectContent>
+                  {/* A linked invoice's currency may sit outside the list. */}
+                  {[...new Set([...BILLING_CURRENCIES, payForm.currency].filter(Boolean))].map((c) => (
+                    <SelectItem key={c} value={c}>
+                      {c}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {payForm.invoice_id && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Recorded in the linked invoice&apos;s currency.
+                </p>
+              )}
+            </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <Label htmlFor="type">Type</Label>
@@ -397,7 +431,9 @@ const OfflinePayments = () => {
                 </Select>
               </div>
               <div>
-                <Label htmlFor="amount">Amount ({payForm.currency})</Label>
+                <Label htmlFor="amount">
+                  {payForm.currency ? `Amount (${payForm.currency})` : "Amount"}
+                </Label>
                 <Input id="amount"
                   type="number"
                   min="0.01"

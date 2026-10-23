@@ -278,3 +278,95 @@ func TestResolverKeepsExplicitEnvOverride(t *testing.T) {
 		t.Fatalf("GBP mandate: got %q want byo-gocardless", got)
 	}
 }
+
+// A tenant that brought its own Stripe collects card payments into its own
+// account. A platform-only gateway routed by an env override (SAR=moyasar,
+// the platform's Moyasar merchant account) must not take that tenant's SAR:
+// it stays on the tenant's Stripe, as before Moyasar existed. A tenant
+// without its own Stripe has no account of its own to protect and keeps the
+// platform routing, and the shared env router is never changed.
+func TestResolverBYOStripeTenantKeepsSAROffPlatformMoyasar(t *testing.T) {
+	byoStripe, byoRazorpay := uuid.New(), uuid.New()
+	vault := &fakeVault{conns: map[uuid.UUID][]*domain.GatewayConnection{
+		byoStripe:   {{ID: uuid.New(), Provider: domain.GatewayStripe, SecretKeyEnc: "sk", Active: true, UpdatedAt: time.Unix(1, 0)}},
+		byoRazorpay: {{ID: uuid.New(), Provider: domain.GatewayRazorpay, PublicKey: "rzp", SecretKeyEnc: "rs", Active: true, UpdatedAt: time.Unix(1, 0)}},
+	}}
+	resolver := newTestResolver(vault)
+	resolver.env.RegisterGateway("moyasar", &stubGateway{name: "env-moyasar"})
+	if err := resolver.env.SetCurrencyOverrides("SAR=moyasar"); err != nil {
+		t.Fatal(err)
+	}
+	tg := NewTenantGateway(resolver, resolver.env)
+
+	ctx := context.WithValue(context.Background(), domain.TenantIDKey, byoStripe)
+	if got := orderGateway(t, tg, ctx, "SAR"); got != "byo-stripe:sk" {
+		t.Fatalf("BYO-Stripe tenant SAR: got %q want byo-stripe:sk", got)
+	}
+	if got := resolver.For(ctx, byoStripe).ProviderFor("SAR"); got != domain.GatewayStripe {
+		t.Fatalf("BYO-Stripe tenant SAR provider: got %q want stripe", got)
+	}
+
+	other := context.WithValue(context.Background(), domain.TenantIDKey, byoRazorpay)
+	if got := orderGateway(t, tg, other, "SAR"); got != "env-moyasar" {
+		t.Fatalf("tenant without its own Stripe, SAR: got %q want env-moyasar", got)
+	}
+	if got := resolver.env.ProviderFor("SAR"); got != domain.GatewayMoyasar {
+		t.Fatalf("env router SAR provider: got %q want moyasar (unchanged)", got)
+	}
+}
+
+// The tenant-aware ProviderFor is what the saved-card guard, the card-update
+// policy and the checkout paid-payment check route on: a BYO-Stripe tenant's
+// SAR stays on Stripe, a tenant without a connection (or no tenant in ctx)
+// follows the env routing.
+func TestResolverProviderForUsesTheTenantInContext(t *testing.T) {
+	byoStripe, plain := uuid.New(), uuid.New()
+	vault := &fakeVault{conns: map[uuid.UUID][]*domain.GatewayConnection{
+		byoStripe: {{ID: uuid.New(), Provider: domain.GatewayStripe, SecretKeyEnc: "sk", Active: true, UpdatedAt: time.Unix(1, 0)}},
+	}}
+	resolver := newTestResolver(vault)
+	resolver.env.RegisterGateway("moyasar", &stubGateway{name: "env-moyasar"})
+	if err := resolver.env.SetCurrencyOverrides("SAR=moyasar"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		want domain.GatewayProvider
+	}{
+		{"BYO Stripe tenant", context.WithValue(context.Background(), domain.TenantIDKey, byoStripe), domain.GatewayStripe},
+		{"tenant without a connection", context.WithValue(context.Background(), domain.TenantIDKey, plain), domain.GatewayMoyasar},
+		{"no tenant", context.Background(), domain.GatewayMoyasar},
+	} {
+		if got := resolver.ProviderFor(tc.ctx, "SAR"); got != tc.want {
+			t.Errorf("%s: ProviderFor(SAR) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A tenant that connects its own Stripe after taking Moyasar payments must
+// still refund those payments on Moyasar: the payment id (a UUID, which no
+// other gateway issues) names the gateway, not the currency's current route.
+func TestResolverBYOStripeTenantRefundsMoyasarPaymentOnMoyasar(t *testing.T) {
+	byoStripe := uuid.New()
+	vault := &fakeVault{conns: map[uuid.UUID][]*domain.GatewayConnection{
+		byoStripe: {{ID: uuid.New(), Provider: domain.GatewayStripe, SecretKeyEnc: "sk", Active: true, UpdatedAt: time.Unix(1, 0)}},
+	}}
+	resolver := newTestResolver(vault)
+	resolver.env.RegisterGateway("moyasar", &stubGateway{name: "env-moyasar"})
+	if err := resolver.env.SetCurrencyOverrides("SAR=moyasar"); err != nil {
+		t.Fatal(err)
+	}
+	tg := NewTenantGateway(resolver, resolver.env)
+	ctx := context.WithValue(context.Background(), domain.TenantIDKey, byoStripe)
+
+	res, err := tg.Refund(ctx, uuid.NewString(), 100, "SAR")
+	if err != nil || res.RefundID != "env-moyasar" {
+		t.Fatalf("UUID payment refund = %+v, %v; want env-moyasar", res, err)
+	}
+	// Stripe ids still go to the tenant's own Stripe, whatever the currency.
+	res, err = tg.Refund(ctx, "pi_123", 100, "SAR")
+	if err != nil || res.RefundID != "byo-stripe:sk" {
+		t.Fatalf("pi_ refund = %+v, %v; want byo-stripe:sk", res, err)
+	}
+}

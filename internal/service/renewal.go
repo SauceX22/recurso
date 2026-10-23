@@ -35,29 +35,17 @@ type renewalInvoicer interface {
 	GenerateFinalUsageInvoice(ctx context.Context, sub *domain.Subscription, endedAt time.Time) (*domain.Invoice, error)
 }
 
-// renewalSavedCharger charges a saved payment method off-session; satisfied
-// by *gateway.StripeGateway (same slice the retry worker uses). nil-safe.
-type renewalSavedCharger interface {
-	ChargeSavedPaymentMethod(ctx context.Context, stripeCustomerID, paymentMethodID string, amount int64, currency, invoiceID, idempotencyKey string) (*port.PaymentResult, error)
-}
-
-// renewalPaymentLookup resolves the saved method; *db.CustomerRepository.
-type renewalPaymentLookup interface {
-	GetSavedPaymentMethod(ctx context.Context, customerID uuid.UUID) (stripeCustomerID, paymentMethodID string, gatewayConnectionID *uuid.UUID, err error)
-}
-
-// renewalChargerRouter picks the off-session charger for a saved card's gateway
-// connection (B1 autopay). nil-safe: when unset, renewal charges every card on
-// the single wired platform charger (pre-B1 behavior). Satisfied by
-// *SavedCardGatewayRouter.
-type renewalChargerRouter interface {
-	ChargerFor(ctx context.Context, gatewayConnectionID *uuid.UUID) (SavedCardCharger, error)
-}
-
 // renewalSettler settles a paid invoice through the ledger path;
 // *SubscriptionService.MarkInvoicePaid.
 type renewalSettler interface {
 	MarkInvoicePaid(ctx context.Context, invoiceID uuid.UUID) (bool, error)
+}
+
+// renewalPaymentRecorder writes a renewal charge's outcome on the invoice;
+// *db.InvoiceRepository satisfies it.
+type renewalPaymentRecorder interface {
+	gatewayPaymentClaimer
+	UpdateRetryState(ctx context.Context, tenantID, invoiceID uuid.UUID, s port.InvoiceRetryState) (bool, error)
 }
 
 type RenewalService struct {
@@ -65,15 +53,15 @@ type RenewalService struct {
 	plans    port.PlanRepository
 	invoicer renewalInvoicer
 
-	// Saved-method charging trio; all nil-safe — without them renewal
-	// invoices are generated open and dunning/notifications take over.
-	charger renewalSavedCharger
-	lookup  renewalPaymentLookup
-	settler renewalSettler
-	// chargerRouter routes each charge to the gateway the card was saved on
-	// (B1 autopay). nil-safe: when unset, `charger` (the platform gateway) is
-	// used for every card, preserving pre-B1 behavior.
-	chargerRouter renewalChargerRouter
+	// Saved-method charging; all nil-safe — without them renewal invoices are
+	// generated open and dunning/notifications take over. chargerRouter
+	// routes each charge to the gateway the method was saved on.
+	lookup        savedMethodLookup
+	chargerRouter savedChargerRouter
+	settler       renewalSettler
+	// payments records the settling payment id as the invoice's refund
+	// target, and a hard-declined method. nil-safe.
+	payments renewalPaymentRecorder
 
 	now func() time.Time // injectable for tests
 }
@@ -87,18 +75,19 @@ func NewRenewalService(subs renewalSubscriptionRepo, plans port.PlanRepository, 
 	}
 }
 
-// SetSavedMethodCharging wires off-session payment collection (nil-safe).
-func (s *RenewalService) SetSavedMethodCharging(charger renewalSavedCharger, lookup renewalPaymentLookup, settler renewalSettler) {
-	s.charger = charger
+// SetSavedMethodCharging wires off-session payment collection (nil-safe):
+// each saved method is charged on the gateway router picks for it.
+func (s *RenewalService) SetSavedMethodCharging(lookup savedMethodLookup, router savedChargerRouter, settler renewalSettler) {
 	s.lookup = lookup
+	s.chargerRouter = router
 	s.settler = settler
 }
 
-// SetChargerRouter wires BYO-gateway routing (B1 autopay): each saved card is
-// charged on the gateway connection it was saved with. nil-safe — without it,
-// every card charges on the platform `charger`.
-func (s *RenewalService) SetChargerRouter(router renewalChargerRouter) {
-	s.chargerRouter = router
+// SetPaymentRecorder wires recording of the gateway payment that settles a
+// renewal invoice, so refunds don't depend on a webhook, and of a hard-declined
+// method, so dunning doesn't charge it again. nil-safe.
+func (s *RenewalService) SetPaymentRecorder(r renewalPaymentRecorder) {
+	s.payments = r
 }
 
 // renewalClaimLease mirrors the mandate debitClaimWindow: shorter than the
@@ -195,49 +184,80 @@ func (s *RenewalService) RenewSubscription(ctx context.Context, sub *domain.Subs
 }
 
 // attemptPayment charges the customer's saved payment method for an open
-// renewal invoice. Strictly best-effort: no saved method, a lookup error,
-// or a gateway decline all leave the invoice open — dunning owns recovery.
+// renewal invoice. Strictly best-effort: no saved method, a lookup error, a
+// method on another gateway, or a decline all leave the invoice open — dunning
+// owns recovery.
 func (s *RenewalService) attemptPayment(ctx context.Context, inv *domain.Invoice) {
-	if s.charger == nil || s.lookup == nil || s.settler == nil {
+	if s.lookup == nil || s.settler == nil || s.chargerRouter == nil {
 		return
 	}
 	if inv == nil || inv.Status != domain.InvoiceStatusOpen || inv.Total <= 0 {
 		return
 	}
-	stripeCustomerID, paymentMethodID, gatewayConnID, err := s.lookup.GetSavedPaymentMethod(ctx, inv.CustomerID)
-	if err != nil || stripeCustomerID == "" || paymentMethodID == "" {
-		return // nothing saved; invoice stays open
-	}
-
+	// The freshly generated invoice wasn't read back through the repository,
+	// so its AmountDue isn't derived yet.
 	amountDue := inv.Total - inv.AmountPaid - inv.CreditApplied
 	if amountDue <= 0 {
 		return
 	}
-
-	// B1 autopay: charge on the gateway the card was saved on. Without a router
-	// (pre-B1), every card charges on the single platform charger.
-	charger := s.charger
-	if s.chargerRouter != nil {
-		c, rerr := s.chargerRouter.ChargerFor(ctx, gatewayConnID)
-		if rerr != nil || c == nil {
-			slog.WarnContext(ctx, "renewal: could not resolve saved-card gateway; invoice left open for dunning",
-				"invoice_id", inv.ID, "error", rerr)
-			return
-		}
-		charger = c
+	m, err := s.lookup.GetSavedPaymentMethod(ctx, inv.CustomerID)
+	if err != nil {
+		slog.WarnContext(ctx, "renewal: saved payment method lookup failed; invoice left open for dunning",
+			"invoice_id", inv.ID, "error", err)
+		return
+	}
+	if !m.Chargeable() {
+		slog.InfoContext(ctx, "renewal: no saved payment method; invoice left open for dunning",
+			"invoice_id", inv.ID, "customer_id", inv.CustomerID)
+		return
+	}
+	charger, err := s.chargerRouter.ChargerFor(ctx, m, inv.Currency)
+	if err != nil {
+		slog.WarnContext(ctx, "renewal: saved payment method can't be charged; invoice left open for dunning",
+			"invoice_id", inv.ID, "provider", m.Provider, "error", err)
+		return
 	}
 
 	// Idempotency key ties the charge to this invoice's renewal attempt, so
 	// a re-run after a crash cannot double-charge at the gateway.
-	idemKey := fmt.Sprintf("renewal-%s", inv.ID)
-	result, err := charger.ChargeSavedPaymentMethod(ctx, stripeCustomerID, paymentMethodID, amountDue, inv.Currency, inv.ID.String(), idemKey)
+	result, err := charger.ChargeSavedPaymentMethod(ctx, port.SavedMethodCharge{
+		CustomerRef:    m.CustomerRef,
+		MethodRef:      m.PaymentMethodRef,
+		Amount:         amountDue,
+		Currency:       inv.Currency,
+		InvoiceID:      inv.ID.String(),
+		IdempotencyKey: fmt.Sprintf("renewal-%s", inv.ID),
+	})
 	if err != nil || result == nil || !result.Success {
-		slog.WarnContext(ctx, "renewal payment attempt failed; invoice left open for dunning",
-			"invoice_id", inv.ID, "error", err)
+		logChargeFailure(ctx, "renewal payment attempt failed; invoice left open for dunning", result, err,
+			"invoice_id", inv.ID, "provider", m.Provider)
+		if result != nil && result.Permanent && s.payments != nil {
+			s.recordHardDecline(ctx, inv, result.ErrorCode, m.PaymentMethodRef)
+		}
 		return
 	}
-	if _, err := s.settler.MarkInvoicePaid(ctx, inv.ID); err != nil {
+	transitioned, err := s.settler.MarkInvoicePaid(ctx, inv.ID)
+	if err != nil {
 		slog.ErrorContext(ctx, "renewal charge succeeded but settlement failed (webhook will reconcile)",
+			"invoice_id", inv.ID, "payment_id", result.PaymentID, "error", err)
+		return
+	}
+	if s.payments != nil {
+		RecordSettlingPayment(ctx, s.payments, inv, transitioned, result.PaymentID)
+	}
+}
+
+// recordHardDecline marks the method as hard-declined on the invoice, the same
+// bookkeeping the retry worker writes, so the retry that dunning schedules skips
+// that method until the customer saves another card. The invoice stays open.
+func (s *RenewalService) recordHardDecline(ctx context.Context, inv *domain.Invoice, errorCode, methodRef string) {
+	if _, err := s.payments.UpdateRetryState(ctx, inv.TenantID, inv.ID, port.InvoiceRetryState{
+		Status:            domain.InvoiceStatusOpen,
+		RetryCount:        inv.RetryCount,
+		LastPaymentError:  errorCode,
+		DeclinedMethodRef: methodRef,
+	}); err != nil {
+		slog.ErrorContext(ctx, "renewal: failed to record the hard-declined method; dunning may charge it again",
 			"invoice_id", inv.ID, "error", err)
 	}
 }

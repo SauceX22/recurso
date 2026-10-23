@@ -33,6 +33,12 @@ describe("CreatePlan (Sheet form)", () => {
     endpoints.createPlan.mockResolvedValue({ data: { data: { id: "plan_1" } } });
   });
 
+  it("offers SAR among the plan currencies", () => {
+    renderPage();
+    const options = [...document.querySelectorAll("select option")].map((o) => o.value);
+    expect(options).toEqual(expect.arrayContaining(["USD", "INR", "EUR", "GBP", "SAR"]));
+  });
+
   it("refuses to submit without a name and code", async () => {
     renderPage();
     expect(screen.getByText("Create a new plan")).toBeInTheDocument();
@@ -56,7 +62,7 @@ describe("CreatePlan (Sheet form)", () => {
       expect(endpoints.createPlan).toHaveBeenCalledWith({
         name: "Pro",
         code: "pro-yearly",
-        currency: "USD",
+        currency: "SAR", // the form defaults to SAR (Moyasar deployments)
         amount: 4999,
         interval_unit: "year",
         interval_count: 1,

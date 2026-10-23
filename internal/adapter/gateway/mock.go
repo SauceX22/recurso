@@ -16,6 +16,9 @@ type MockGateway struct {
 	RevokeErr   error // if set, RevokeMandate returns this error
 	refundCalls []MockRefundCall
 	RefundErr   error // if set, Refund returns this error
+	// inert: no simulated collections. Retries and mandate debits report
+	// that nothing can be charged instead of a random or fixed success.
+	inert bool
 }
 
 // MockRevokeCall records the arguments of a RevokeMandate invocation.
@@ -31,8 +34,16 @@ type MockRefundCall struct {
 	Currency  string
 }
 
+// NewMockGateway simulates payment outcomes (tests, demo, development).
 func NewMockGateway() *MockGateway {
 	return &MockGateway{}
+}
+
+// NewInertMockGateway is the stand-in for an unconfigured gateway on a real
+// server: background retries and mandate debits never report money collected,
+// so no invoice is marked paid and no cash is booked for a fake payment.
+func NewInertMockGateway() *MockGateway {
+	return &MockGateway{inert: true}
 }
 
 func (g *MockGateway) CreateOrder(ctx context.Context, amount int64, currency string, receipt string, invoiceID string) (*port.PaymentOrder, error) {
@@ -67,6 +78,9 @@ func (g *MockGateway) CreateMandate(ctx context.Context, customerEmail, customer
 }
 
 func (g *MockGateway) ExecuteMandateDebit(ctx context.Context, req port.MandateDebitRequest) (*port.PaymentResult, error) {
+	if g.inert {
+		return &port.PaymentResult{Success: false, ErrorCode: "gateway_not_configured", ErrorMsg: "no payment gateway is configured"}, nil
+	}
 	return &port.PaymentResult{
 		Success:   true,
 		PaymentID: "pay_mock_" + uuid.New().String(),
@@ -127,6 +141,9 @@ func (g *MockGateway) CancelSubscription(ctx context.Context, subscriptionID str
 }
 
 func (g *MockGateway) RetryPayment(ctx context.Context, invoiceID string, amount int64, currency string) (*port.PaymentResult, error) {
+	if g.inert {
+		return &port.PaymentResult{Success: false, ErrorCode: port.ErrCodeNoSavedMethod, ErrorMsg: "no payment gateway is configured"}, nil
+	}
 	// ~40% success rate for mock simulation
 	if rand.Float64() < 0.4 {
 		return &port.PaymentResult{

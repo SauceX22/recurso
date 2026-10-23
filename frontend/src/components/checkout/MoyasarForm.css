@@ -1,0 +1,8 @@
+/* With save_card on, Moyasar renders its own notice under the Pay button
+   (a <p role="complementary"> with no class of its own). When our consent
+   text is shown it is the only disclosure the buyer should read, so hide
+   theirs. Moyasar's stylesheet sets `div#mysr .flex{display:flex!important}`,
+   so this selector needs an id and !important to win. */
+.mysr-form[data-own-consent] div#mysr p.flex[role="complementary"] {
+  display: none !important;
+}

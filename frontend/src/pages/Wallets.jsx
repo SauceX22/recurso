@@ -32,7 +32,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { toMinorUnits, fromMinorUnits, currencyDecimals } from "@/lib/utils";
+import { toMinorUnits, fromMinorUnits, currencyDecimals, BILLING_CURRENCIES } from "@/lib/utils";
 
 const fmtMoney = (minor, currency) => {
   const d = currencyDecimals(currency);
@@ -55,7 +55,8 @@ const Wallets = () => {
   const { sort, sortKey, onSortChange } = useTableSort();
 
   const [createOpen, setCreateOpen] = useState(false);
-  const [createForm, setCreateForm] = useState({ customer_id: "", currency: "INR" });
+  // Currency is chosen, never assumed (it used to default to INR).
+  const [createForm, setCreateForm] = useState({ customer_id: "", currency: "" });
   const [topUpWallet, setTopUpWallet] = useState(null);
   const [topUpForm, setTopUpForm] = useState({ amount: "", source: "manual" });
   const [autoWallet, setAutoWallet] = useState(null);
@@ -101,7 +102,7 @@ const Wallets = () => {
     mutationFn: () => api.createWallet(createForm),
     onSuccess: () => {
       setCreateOpen(false);
-      setCreateForm({ customer_id: "", currency: "INR" });
+      setCreateForm({ customer_id: "", currency: "" });
       invalidateWallets();
     },
     onError: (err) =>
@@ -164,8 +165,9 @@ const Wallets = () => {
     autoMutation.mutate(disable);
   };
 
-  // Closing settles the wallet: paid balance is refunded to the customer,
-  // promotional balance is forfeited. Irreversible, so it goes through a
+  // Closing settles the wallet in the books: paid balance is booked as
+  // returned to the customer (DR Customer Credit / CR Cash) and promotional
+  // balance is forfeited. No gateway refund is made; the operator pays out. Irreversible, so it goes through a
   // ConfirmDialog and the settlement result is surfaced afterward.
   const closeMutation = useMutation({
     mutationFn: () => api.closeWallet(closingWallet.id),
@@ -331,7 +333,7 @@ const Wallets = () => {
         submitLabel="Create wallet"
         busyLabel="Creating…"
         busy={creating}
-        canSubmit={Boolean(createForm.customer_id)}
+        canSubmit={Boolean(createForm.customer_id && createForm.currency)}
         dirty={Boolean(createForm.customer_id)}
         error={actionError}
       >
@@ -346,13 +348,21 @@ const Wallets = () => {
         </div>
         <div>
           <Label htmlFor="currency">Currency</Label>
-          <Input id="currency"
-            value={createForm.currency}
-            onChange={(e) =>
-              setCreateForm({ ...createForm, currency: e.target.value.toUpperCase() })
-            }
-            maxLength={3}
-          />
+          <Select
+            value={createForm.currency || undefined}
+            onValueChange={(v) => setCreateForm({ ...createForm, currency: v })}
+          >
+            <SelectTrigger id="currency">
+              <SelectValue placeholder="Select currency" />
+            </SelectTrigger>
+            <SelectContent>
+              {BILLING_CURRENCIES.map((c) => (
+                <SelectItem key={c} value={c}>
+                  {c}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
       </FormSheet>
 
@@ -463,7 +473,7 @@ const Wallets = () => {
         title="Close this wallet?"
         description={
           closingWallet
-            ? `The remaining ${fmtMoney(closingWallet.balance, closingWallet.currency)} will be settled: paid balance is refunded to the customer, promotional balance is forfeited. This can't be undone.`
+            ? `The remaining ${fmtMoney(closingWallet.balance, closingWallet.currency)} will be settled: paid balance is booked as returned to the customer, promotional balance is forfeited. No money is sent — pay the customer back yourself, e.g. as a refund in your payment gateway. This can't be undone.`
             : ""
         }
         confirmLabel="Close wallet"
@@ -480,7 +490,7 @@ const Wallets = () => {
           </DialogHeader>
           <div className="space-y-2 text-sm">
             <div className="flex items-center justify-between">
-              <span className="text-muted-foreground">Refunded to customer</span>
+              <span className="text-muted-foreground">Booked as returned to customer</span>
               <span className="tabular-nums font-medium">
                 {fmtMoney(closeResult?.refunded || 0, closeResult?.currency || "")}
               </span>
@@ -491,6 +501,11 @@ const Wallets = () => {
                 {fmtMoney(closeResult?.forfeited || 0, closeResult?.currency || "")}
               </span>
             </div>
+            {closeResult?.refunded > 0 && (
+              <p className="pt-1 text-muted-foreground">
+                Recurso sent no money: issue the refund in your payment gateway or by bank transfer.
+              </p>
+            )}
           </div>
           <DialogFooter>
             <Button onClick={() => setCloseResult(null)}>Done</Button>

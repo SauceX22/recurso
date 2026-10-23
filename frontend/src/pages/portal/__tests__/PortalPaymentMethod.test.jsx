@@ -27,9 +27,12 @@ const renderDialog = (props = {}) =>
 
 beforeEach(() => {
   vi.clearAllMocks();
-  global.fetch = vi.fn();
+  vi.stubGlobal("fetch", vi.fn());
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe("PortalPaymentMethod", () => {
   it("requests a card SetupIntent with the portal auth headers on open", async () => {
@@ -116,6 +119,17 @@ describe("PortalPaymentMethod", () => {
       )
     );
     expect(await screen.findByText("no active mandate")).toBeInTheDocument();
+  });
+
+  it("shows pay-an-invoice guidance instead of a card form when card update is unsupported", async () => {
+    global.fetch.mockImplementation(() =>
+      jsonResponse(409, { error: { code: "card_update_unsupported", message: "not supported" } })
+    );
+    renderDialog();
+    expect(await screen.findByText(/pay your open renewal invoice/i)).toBeInTheDocument();
+    expect(screen.queryByText("not supported")).toBeNull();
+    expect(screen.queryByRole("button", { name: /us bank \(ach\)/i })).toBeNull();
+    expect(screen.queryByTestId("payment-element")).toBeNull();
   });
 
   it("surfaces the server error when the SetupIntent cannot be created", async () => {

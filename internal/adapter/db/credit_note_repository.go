@@ -154,6 +154,26 @@ func (r *CreditNoteRepository) UpdateRefund(ctx context.Context, id uuid.UUID, s
 	return nil
 }
 
+// ResolvePendingRefund moves a refund that is still pending under refundID
+// to status. resolved is false when another caller already moved it, so
+// only the caller that made the transition books the refund.
+func (r *CreditNoteRepository) ResolvePendingRefund(ctx context.Context, id uuid.UUID, refundID string, status domain.CreditNoteRefundStatus, message string) (bool, error) {
+	query := `
+		UPDATE credit_notes
+		SET refund_status = $1, refund_message = $2, updated_at = NOW()
+		WHERE id = $3 AND refund_status = $4 AND refund_id = $5`
+
+	res, err := r.db.ExecContext(ctx, query, status, message, id, domain.RefundStatusPending, refundID)
+	if err != nil {
+		return false, fmt.Errorf("failed to resolve credit note refund: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	return rows == 1, nil
+}
+
 // SumActiveRefundsForInvoice returns the total amount of refund-type credit
 // notes already issued against an invoice (excluding voided notes and failed
 // refunds). Used for the over-refund guard.

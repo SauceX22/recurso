@@ -18,6 +18,12 @@ import {
 
 import { API_ROOT as API_BASE, portalCsrfHeader } from "../../lib/api";
 import PortalPaymentMethod from "./PortalPaymentMethod";
+import {
+  CARD_UPDATE_NO_INVOICE,
+  CARD_UPDATE_VIA_INVOICE,
+  cardUpdateInvoice,
+  cardUpdateViaInvoice,
+} from "./cardUpdate";
 import { formatCurrency, formatDate, shortId } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -287,6 +293,11 @@ const PortalDashboard = () => {
       : 0
   );
 
+  // Some gateways can only save a card during a payment, so for those the card
+  // is replaced by paying the next open invoice, not through the setup dialog.
+  const updateCardByPaying = cardUpdateViaInvoice(profile);
+  const cardInvoice = updateCardByPaying ? cardUpdateInvoice(profile, invoices) : null;
+
   if (loading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-muted">
@@ -312,14 +323,16 @@ const PortalDashboard = () => {
             </span>
           </div>
           <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setPmOpen(true)}
-            >
-              <CreditCard className="h-4 w-4" />
-              Update payment method
-            </Button>
+            {!updateCardByPaying && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPmOpen(true)}
+              >
+                <CreditCard className="h-4 w-4" />
+                Update payment method
+              </Button>
+            )}
             <Button
               variant="outline"
               size="sm"
@@ -348,6 +361,22 @@ const PortalDashboard = () => {
         {error && (
           <div className="mt-6 rounded-lg border border-destructive/20 bg-destructive/5 px-4 py-3 text-sm text-destructive">
             {error}
+          </div>
+        )}
+
+        {updateCardByPaying && (
+          <div className="mt-6 flex flex-col gap-3 rounded-lg border border-border bg-background px-4 py-3 text-sm text-foreground sm:flex-row sm:items-center sm:justify-between">
+            <span className="flex items-center gap-2">
+              <CreditCard className="h-4 w-4 shrink-0 text-muted-foreground" />
+              {cardInvoice ? CARD_UPDATE_VIA_INVOICE : CARD_UPDATE_NO_INVOICE}
+            </span>
+            {cardInvoice && (
+              <Button asChild size="sm" variant="outline" className="shrink-0">
+                <a href={`/checkout/${encodeURIComponent(cardInvoice.id)}`}>
+                  Pay {cardInvoice.invoiceNumber || "renewal invoice"}
+                </a>
+              </Button>
+            )}
           </div>
         )}
 

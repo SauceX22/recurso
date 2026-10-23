@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/recurso-dev/recurso/internal/core/domain"
 	"github.com/recurso-dev/recurso/internal/core/port"
 )
 
@@ -223,6 +224,27 @@ func TestSmartRouterCurrencyOverrides(t *testing.T) {
 	gw, _ = r.gatewayFor("USD")
 	if gw != port.PaymentGateway(stripe) {
 		t.Fatal("USD must still default to stripe")
+	}
+}
+
+// ProviderFor must name the same gateway gatewayFor picks, or the saved-method
+// routing guard would charge one gateway while checkout collects on another.
+func TestSmartRouterProviderForMatchesRouting(t *testing.T) {
+	r := NewSmartRouter(NewMockGateway(), NewMockGateway())
+	r.RegisterGateway("moyasar", NewMockGateway())
+	if err := r.SetCurrencyOverrides("SAR=moyasar"); err != nil {
+		t.Fatal(err)
+	}
+	for cur, want := range map[string]domain.GatewayProvider{
+		"SAR": domain.GatewayMoyasar,
+		"sar": domain.GatewayMoyasar,
+		"INR": domain.GatewayRazorpay,
+		"USD": domain.GatewayStripe,
+		"":    domain.GatewayStripe,
+	} {
+		if got := r.ProviderFor(cur); got != want {
+			t.Errorf("ProviderFor(%q) = %q, want %q", cur, got, want)
+		}
 	}
 }
 

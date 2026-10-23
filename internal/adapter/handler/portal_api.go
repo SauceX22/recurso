@@ -82,6 +82,55 @@ type PortalAPIHandler struct {
 	publishableKey string
 	mandateSvc     mandateReauth
 	invoiceReader  portalInvoiceReader
+	cardUpdate     cardUpdatePolicy // nil-safe; unset, every customer is self-serve
+}
+
+// cardUpdatePolicy reports which gateway governs a customer's card update and
+// whether the portal can replace that gateway's card. Satisfied by
+// *service.PaymentMethodUpdatePolicy.
+type cardUpdatePolicy interface {
+	Provider(ctx context.Context, customerID uuid.UUID, currency string) domain.GatewayProvider
+	SelfServe(provider domain.GatewayProvider) bool
+	// CardUpdateInvoice is the invoice whose payment saves a new card for a
+	// customer on provider, or uuid.Nil when none would.
+	CardUpdateInvoice(ctx context.Context, customerID uuid.UUID, provider domain.GatewayProvider) uuid.UUID
+}
+
+// SetCardUpdatePolicy wires the per-customer card-update routing. Nil-safe.
+func (h *PortalAPIHandler) SetCardUpdatePolicy(p cardUpdatePolicy) { h.cardUpdate = p }
+
+// cardUpdateProvider returns the gateway governing the customer's card and
+// whether the portal's Stripe setup flow may replace it.
+func (h *PortalAPIHandler) cardUpdateProvider(ctx context.Context, customerID uuid.UUID) (domain.GatewayProvider, bool) {
+	if h.cardUpdate == nil {
+		return domain.GatewayStripe, true
+	}
+	provider := h.cardUpdate.Provider(h.customerTenantCtx(ctx, customerID), customerID, "")
+	return provider, h.cardUpdate.SelfServe(provider)
+}
+
+// customerTenantCtx adds the customer's tenant to ctx: portal requests carry
+// none, and gateway routing is per tenant (BYO connections).
+func (h *PortalAPIHandler) customerTenantCtx(ctx context.Context, customerID uuid.UUID) context.Context {
+	if h.portalService == nil {
+		return ctx
+	}
+	if cust, err := h.portalService.GetCustomer(ctx, customerID); err == nil && cust != nil {
+		return context.WithValue(ctx, domain.TenantIDKey, cust.TenantID)
+	}
+	return ctx
+}
+
+// rejectUnsupportedCardUpdate answers 409 card_update_unsupported when saving a
+// Stripe method would move the customer's renewals off their gateway. Returns
+// true when it wrote the response.
+func (h *PortalAPIHandler) rejectUnsupportedCardUpdate(c *gin.Context, customerID uuid.UUID) bool {
+	if _, ok := h.cardUpdateProvider(c.Request.Context(), customerID); ok {
+		return false
+	}
+	respondError(c, http.StatusConflict, codeCardUpdateUnsupported,
+		"this card can't be replaced here; pay an open invoice to save a new card")
+	return true
 }
 
 // SetPaymentSetupResolver wires BYO-gateway routing for card save (B1 autopay).
@@ -283,8 +332,33 @@ func (h *PortalAPIHandler) GetProfile(c *gin.Context) {
 		respondInternalError(c, err)
 		return
 	}
+	if customer == nil {
+		c.JSON(http.StatusOK, customer)
+		return
+	}
 
-	c.JSON(http.StatusOK, customer)
+	provider, supported := h.cardUpdateProvider(c.Request.Context(), customer.ID)
+	profile := portalProfile{Customer: customer, PaymentMethodProvider: provider, CardUpdateSupported: supported}
+	if !supported {
+		tenantCtx := context.WithValue(c.Request.Context(), domain.TenantIDKey, customer.TenantID)
+		if id := h.cardUpdate.CardUpdateInvoice(tenantCtx, customer.ID, provider); id != uuid.Nil {
+			profile.CardUpdateInvoiceID = &id
+		}
+	}
+	c.JSON(http.StatusOK, profile)
+}
+
+// portalProfile is the customer plus how the portal may update their card.
+type portalProfile struct {
+	*domain.Customer
+	// PaymentMethodProvider is the gateway governing the customer's card.
+	PaymentMethodProvider domain.GatewayProvider `json:"payment_method_provider"`
+	// CardUpdateSupported is false when the card must be replaced by paying
+	// an open invoice instead of the portal's update flow.
+	CardUpdateSupported bool `json:"card_update_supported"`
+	// CardUpdateInvoiceID is the invoice whose checkout saves the new card
+	// when CardUpdateSupported is false; null when no invoice would.
+	CardUpdateInvoiceID *uuid.UUID `json:"card_update_invoice_id"`
 }
 
 // portalUpdatePaymentMethodRequest carries the gateway-tokenized card metadata.
@@ -331,6 +405,9 @@ func (h *PortalAPIHandler) StartPaymentMethodSetup(c *gin.Context) {
 	customerID, exists := c.Get("portal_customer_id")
 	if !exists {
 		respondError(c, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
+		return
+	}
+	if h.rejectUnsupportedCardUpdate(c, customerID.(uuid.UUID)) {
 		return
 	}
 	if h.paymentSetup == nil || h.customerStore == nil {
@@ -395,6 +472,9 @@ func (h *PortalAPIHandler) StartBankAccountSetup(c *gin.Context) {
 		respondError(c, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
 		return
 	}
+	if h.rejectUnsupportedCardUpdate(c, customerID.(uuid.UUID)) {
+		return
+	}
 	if h.paymentSetup == nil || h.customerStore == nil {
 		respondError(c, http.StatusServiceUnavailable, codeInternalError, "self-serve payment setup isn't available on this deployment")
 		return
@@ -456,6 +536,9 @@ func (h *PortalAPIHandler) ConfirmPaymentMethod(c *gin.Context) {
 	customerID, exists := c.Get("portal_customer_id")
 	if !exists {
 		respondError(c, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
+		return
+	}
+	if h.rejectUnsupportedCardUpdate(c, customerID.(uuid.UUID)) {
 		return
 	}
 	if h.paymentSetup == nil || h.customerStore == nil {

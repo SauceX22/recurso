@@ -4,7 +4,7 @@ import { useNavigate } from "react-router";
 import { endpoints } from "../lib/api";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "@/components/ui/sonner";
-import { cn, toMinorUnits } from "@/lib/utils";
+import { BILLING_CURRENCIES, cn, toMinorUnits } from "@/lib/utils";
 import { FormField } from "@/components/patterns/FormField";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -25,7 +25,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-const CURRENCIES = ["USD", "INR", "EUR", "GBP"];
 
 export default function CreatePlan() {
   const navigate = useNavigate();
@@ -35,7 +34,7 @@ export default function CreatePlan() {
     name: "",
     code: "",
     price: 99,
-    currency: "USD",
+    currency: "SAR",
     interval: "month",
   });
 
@@ -152,7 +151,7 @@ export default function CreatePlan() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {CURRENCIES.map((c) => (
+                    {BILLING_CURRENCIES.map((c) => (
                       <SelectItem key={c} value={c}>
                         {c}
                       </SelectItem>

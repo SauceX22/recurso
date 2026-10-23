@@ -20,6 +20,8 @@ type fakeWalletRepo struct {
 	drains     []int64 // maxAmount requested
 	drainGives int64   // amount the fake "drains"
 	dueList    []domain.Wallet
+	outcomes   []port.RechargeOutcome
+	reserved   map[uuid.UUID]int64
 }
 
 func (f *fakeWalletRepo) Create(ctx context.Context, w *domain.Wallet) error {
@@ -64,6 +66,43 @@ func (f *fakeWalletRepo) Drain(ctx context.Context, tenantID, walletID uuid.UUID
 
 func (f *fakeWalletRepo) ListDueForRecharge(ctx context.Context, limit int) ([]domain.Wallet, error) {
 	return f.dueList, nil
+}
+
+// ReserveRechargeAmount freezes the attempt's amount like the conditional
+// UPDATE: the first reservation of the current attempt wins.
+func (f *fakeWalletRepo) ReserveRechargeAmount(_ context.Context, _, walletID uuid.UUID, attempt int, amount int64) (int64, bool, error) {
+	if f.reserved == nil {
+		f.reserved = map[uuid.UUID]int64{}
+	}
+	for _, w := range f.dueList {
+		if w.ID == walletID && w.RechargeAttempt != attempt {
+			return 0, false, nil
+		}
+	}
+	if frozen, ok := f.reserved[walletID]; ok {
+		return frozen, true, nil
+	}
+	f.reserved[walletID] = amount
+	return amount, true, nil
+}
+
+// RecordRechargeOutcome records the outcome and, like the conditional
+// UPDATE, applies it to the listed wallet only while attempt is current.
+func (f *fakeWalletRepo) RecordRechargeOutcome(_ context.Context, _, walletID uuid.UUID, attempt int, o port.RechargeOutcome) error {
+	f.outcomes = append(f.outcomes, o)
+	for i := range f.dueList {
+		w := &f.dueList[i]
+		if w.ID != walletID || w.RechargeAttempt != attempt {
+			continue
+		}
+		if o.Answered {
+			w.RechargeAttempt++
+			delete(f.reserved, walletID)
+		}
+		w.RechargeFailures = o.Failures
+		w.RechargeDeclines, w.RechargeDeclinesRef = o.Declines, o.DeclinesRef
+	}
+	return nil
 }
 
 type fakeWalletLedger struct {
@@ -325,7 +364,7 @@ func TestWalletAutoRecharge(t *testing.T) {
 	repo.dueList = []domain.Wallet{*w}
 
 	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: "pay_w1"}}
-	svc.SetSavedMethodCharging(charger, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"})
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, NewSavedCardGatewayRouter(nil, nil, charger))
 
 	recharged, err := svc.ProcessAutoRecharges(context.Background())
 	if err != nil {
@@ -354,7 +393,7 @@ func TestWalletAutoRecharge_ConcurrentSweepCreditsOnce(t *testing.T) {
 	repo.dueList = []domain.Wallet{*w}
 
 	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: "pay_w1"}}
-	svc.SetSavedMethodCharging(charger, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"})
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, NewSavedCardGatewayRouter(nil, nil, charger))
 
 	// Two sweeps fire back-to-back before either recharge drops the balance.
 	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
@@ -386,9 +425,8 @@ func TestWalletAutoRecharge_ChargesOnRecordedGateway(t *testing.T) {
 	platform := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
 	byo := &fakeRenewalCharger{result: &port.PaymentResult{Success: true, PaymentID: "pay_byo"}}
 	connID := uuid.New()
-	svc.SetSavedMethodCharging(platform, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1", connID: &connID})
 	router := &fakeChargerRouter{charger: byo}
-	svc.SetChargerRouter(router)
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1", connID: &connID}, router)
 
 	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -408,7 +446,7 @@ func TestWalletAutoRechargeNoSavedMethodOnlyNotifies(t *testing.T) {
 	repo.dueList = []domain.Wallet{*w}
 
 	charger := &fakeRenewalCharger{}
-	svc.SetSavedMethodCharging(charger, &fakeRenewalLookup{}) // nothing saved
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{}, NewSavedCardGatewayRouter(nil, nil, charger)) // nothing saved
 
 	recharged, err := svc.ProcessAutoRecharges(context.Background())
 	if err != nil {

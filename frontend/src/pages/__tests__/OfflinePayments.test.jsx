@@ -44,3 +44,46 @@ describe("OfflinePayments page", () => {
     await waitFor(() => expect(screen.getByText("No offline payments recorded")).toBeInTheDocument());
   });
 });
+
+describe("OfflinePayments — record currency", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    if (!Element.prototype.hasPointerCapture) Element.prototype.hasPointerCapture = () => false;
+    if (!Element.prototype.scrollIntoView) Element.prototype.scrollIntoView = () => {};
+    endpoints.getOfflinePayments.mockResolvedValue({ data: { data: [] } });
+    endpoints.getCustomers.mockResolvedValue({
+      data: { data: [{ id: "cus_9", name: "Riyadh Co", email: "ap@riyadh.sa" }] },
+    });
+    endpoints.getInvoices.mockResolvedValue({ data: { data: [] } });
+    endpoints.recordOfflinePayment.mockResolvedValue({ data: { data: { id: "op9" } } });
+  });
+
+  it("asks for a billing currency (no INR default) and always sends the chosen one", async () => {
+    const { default: userEvent } = await import("@testing-library/user-event");
+    const user = userEvent.setup();
+    render(<OfflinePayments />, { wrapper });
+    await waitFor(() => expect(screen.getByText("No offline payments recorded")).toBeInTheDocument());
+
+    await user.click(screen.getAllByRole("button", { name: /Record payment/ })[0]);
+    const currency = await screen.findByRole("combobox", { name: "Currency" });
+    expect(currency).not.toHaveTextContent("INR");
+    expect(screen.queryByText("Amount (INR)")).not.toBeInTheDocument();
+
+    await user.click(document.getElementById("record-customer"));
+    await user.click(await screen.findByRole("option", { name: /Riyadh Co/ }));
+    await user.type(document.getElementById("amount"), "115");
+
+    const submit = () => screen.getAllByRole("button", { name: "Record payment" }).at(-1);
+    // No currency yet: the payment can't be recorded (the API would assume INR).
+    expect(submit()).toBeDisabled();
+
+    await user.click(currency);
+    await user.click(await screen.findByRole("option", { name: "SAR" }));
+    await user.click(submit());
+    await waitFor(() =>
+      expect(endpoints.recordOfflinePayment).toHaveBeenCalledWith(
+        expect.objectContaining({ customer_id: "cus_9", currency: "SAR", amount: 11500 })
+      )
+    );
+  });
+});

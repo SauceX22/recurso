@@ -40,7 +40,7 @@ intentional and `core/service` is vestigial — verify via imports.
 - `adapter/middleware/` — the chain (`auth`, `rate_limit`, `request_id`,
   `secure`, `idempotency`, `audit`, `metrics`, `sentry`, `portal_auth`, `cache`,
   `demo_guard`).
-- `adapter/gateway/` — Stripe/Razorpay/GoCardless/Adyen/Mock + BYO routing
+- `adapter/gateway/` — Stripe/Razorpay/GoCardless/Adyen/Moyasar/Mock + BYO routing
   (`resolver.go`, `smart_router.go`, `tenant_gateway.go`).
 - `adapter/accounting/` — QuickBooks/Xero/NetSuite/Tally + `oauth.go`.
 - `adapter/taxprovider/` (TaxJar/Avalara/Ziptax), `adapter/vatprovider/vies.go`,

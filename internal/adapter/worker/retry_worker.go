@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -12,23 +13,10 @@ import (
 	"github.com/recurso-dev/recurso/internal/service"
 )
 
-// RecoveryRecorder records recovered-revenue attribution when a retried
-// payment succeeds. Implemented by service.DunningRecoveryService.
-type RecoveryRecorder interface {
-	RecordIfRecovered(ctx context.Context, inv *domain.Invoice) bool
-}
-
-// savedMethodCharger charges a customer's saved payment method off-session
-// (ENG-5 Phase 2). Implemented by *gateway.StripeGateway; wired only when
-// Stripe is configured.
-type savedMethodCharger interface {
-	ChargeSavedPaymentMethod(ctx context.Context, stripeCustomerID, paymentMethodID string, amount int64, currency, invoiceID, idempotencyKey string) (*port.PaymentResult, error)
-}
-
 // customerPaymentLookup resolves a customer's saved payment method. Implemented
 // by *db.CustomerRepository.
 type customerPaymentLookup interface {
-	GetSavedPaymentMethod(ctx context.Context, customerID uuid.UUID) (stripeCustomerID, paymentMethodID string, gatewayConnectionID *uuid.UUID, err error)
+	GetSavedPaymentMethod(ctx context.Context, customerID uuid.UUID) (domain.SavedPaymentMethod, error)
 }
 
 // invoiceSettler marks an invoice paid through the ledger path (amount_paid,
@@ -39,28 +27,39 @@ type invoiceSettler interface {
 	MarkInvoicePaid(ctx context.Context, invoiceID uuid.UUID) (bool, error)
 }
 
-// savedCardChargerRouter routes an off-session charge to the gateway a card was
-// saved on (B1 autopay). Implemented by *service.SavedCardGatewayRouter.
+// savedCardChargerRouter routes an off-session charge to the gateway a method
+// was saved on. Implemented by *service.SavedCardGatewayRouter.
 type savedCardChargerRouter interface {
-	ChargerFor(ctx context.Context, gatewayConnectionID *uuid.UUID) (service.SavedCardCharger, error)
+	ChargerFor(ctx context.Context, m domain.SavedPaymentMethod, currency string) (service.SavedCardCharger, error)
+}
+
+// retryDecider schedules the next retry and learns from outcomes. Implemented
+// by *service.SmartRetryService.
+type retryDecider interface {
+	DecideRetry(ctx context.Context, inv *domain.Invoice, errorCode string) *service.RetryDecision
+	RecordOutcome(ctx context.Context, history domain.DunningHistory) error
+}
+
+// dunningRecoveryMarker closes an invoice's dunning campaign once it is paid.
+// Implemented by *service.DunningCampaignService.
+type dunningRecoveryMarker interface {
+	MarkRecovered(ctx context.Context, invoiceID uuid.UUID) error
 }
 
 type RetryWorker struct {
-	invoiceRepo            port.InvoiceRepository
-	retryService           *service.SmartRetryService
-	gateway                port.PaymentGateway
-	notifier               port.Notifier
-	dunningCampaignService *service.DunningCampaignService
-	recoveryRecorder       RecoveryRecorder
-	savedCharger           savedMethodCharger
-	customerLookup         customerPaymentLookup
-	chargerRouter          savedCardChargerRouter
-	settler                invoiceSettler
+	invoiceRepo    port.InvoiceRepository
+	retryService   retryDecider
+	gateway        port.PaymentGateway
+	notifier       port.Notifier
+	recovery       *service.DunningSuccessRecorder
+	customerLookup customerPaymentLookup
+	chargerRouter  savedCardChargerRouter
+	settler        invoiceSettler
 }
 
 func NewRetryWorker(
 	invoiceRepo port.InvoiceRepository,
-	retryService *service.SmartRetryService,
+	retryService retryDecider,
 	gateway port.PaymentGateway,
 	notifier port.Notifier,
 ) *RetryWorker {
@@ -69,44 +68,41 @@ func NewRetryWorker(
 		retryService: retryService,
 		gateway:      gateway,
 		notifier:     notifier,
+		recovery:     service.NewDunningSuccessRecorder(nil, retryService),
 	}
 }
 
-func (w *RetryWorker) SetDunningCampaignService(svc *service.DunningCampaignService) {
-	w.dunningCampaignService = svc
-}
-
-func (w *RetryWorker) SetRecoveryRecorder(rr RecoveryRecorder) {
-	w.recoveryRecorder = rr
+// SetDunningCampaignService closes the invoice's dunning campaign when a retry
+// collects, through the recorder every settlement path shares.
+func (w *RetryWorker) SetDunningCampaignService(campaigns dunningRecoveryMarker) {
+	w.recovery = service.NewDunningSuccessRecorder(campaigns, w.retryService)
 }
 
 // SetSettler routes successful retries through the ledger-posting
-// MarkInvoicePaid instead of a bare status update, so recovered payments get
-// amount_paid, a ledger entry, and a rev-rec schedule like every other payment.
+// MarkInvoicePaid, so recovered payments get amount_paid, recovery
+// attribution, a ledger entry, and a rev-rec schedule like every other
+// payment. Without it a successful retry is not settled.
 func (w *RetryWorker) SetSettler(s invoiceSettler) {
 	w.settler = s
 }
 
 // SetSavedMethodCharging wires off-session collection with the customer's saved
-// card (ENG-5 Phase 2). When either dependency is nil, retries fall back to the
-// interactive gateway path — behavior is unchanged for customers without a
-// saved payment method.
-func (w *RetryWorker) SetSavedMethodCharging(charger savedMethodCharger, lookup customerPaymentLookup) {
-	w.savedCharger = charger
+// method, charged on the gateway router picks for it. When either dependency is
+// nil, retries use the interactive gateway path.
+func (w *RetryWorker) SetSavedMethodCharging(lookup customerPaymentLookup, router savedCardChargerRouter) {
 	w.customerLookup = lookup
-}
-
-// SetChargerRouter wires BYO-gateway routing (B1 autopay): the retry charges on
-// the gateway the card was saved with. nil-safe — without it, the platform
-// `savedCharger` is used.
-func (w *RetryWorker) SetChargerRouter(router savedCardChargerRouter) {
 	w.chargerRouter = router
 }
 
+// errCodeDeclinedMethodUnchanged is the worker's own result for a saved method
+// that already hard-declined this invoice: it is not charged again.
+const errCodeDeclinedMethodUnchanged = "declined_method_unchanged"
+
 // chargeInvoice attempts collection, preferring the customer's saved payment
 // method (charged off-session) when one exists, and falling back to the
-// interactive gateway retry otherwise.
-func (w *RetryWorker) chargeInvoice(ctx context.Context, inv *domain.Invoice) (*port.PaymentResult, error) {
+// interactive gateway retry otherwise. methodRef is the saved method charged,
+// "" for the interactive retry.
+func (w *RetryWorker) chargeInvoice(ctx context.Context, inv *domain.Invoice) (result *port.PaymentResult, methodRef string, err error) {
 	// Collect only the OUTSTANDING balance — Total net of any wallet drain and
 	// account credit already applied (mirrors renewal.go's amountDue). Charging
 	// the full inv.Total here over-charged the customer's card by the wallet/
@@ -115,31 +111,65 @@ func (w *RetryWorker) chargeInvoice(ctx context.Context, inv *domain.Invoice) (*
 	if amountDue <= 0 {
 		// Fully covered by wallet/credit — nothing left to collect, so treat it as
 		// paid rather than charging the card for an amount that isn't owed.
-		return &port.PaymentResult{Success: true, PaymentID: "no_charge_due"}, nil
+		return &port.PaymentResult{Success: true, PaymentID: noChargeDue}, "", nil
 	}
 
-	if w.savedCharger != nil && w.customerLookup != nil {
-		stripeCustomerID, paymentMethodID, connID, err := w.customerLookup.GetSavedPaymentMethod(ctx, inv.CustomerID)
-		if err == nil && stripeCustomerID != "" && paymentMethodID != "" {
-			// B1: charge on the gateway the card was saved on (BYO or platform).
-			charger := w.savedCharger
-			if w.chargerRouter != nil {
-				c, rerr := w.chargerRouter.ChargerFor(ctx, connID)
-				if rerr != nil || c == nil {
-					// Can't reach the saved card's gateway; fall through to the
-					// interactive retry path rather than charge the wrong account.
-					slog.Warn("retry: could not resolve saved-card gateway; using interactive retry", "invoice_id", inv.ID, "error", rerr)
-					return w.gateway.RetryPayment(ctx, inv.ID.String(), amountDue, inv.Currency)
-				}
-				charger = c
-			}
-			// Idempotent per attempt: a worker re-run for the same attempt won't
-			// double-charge.
-			key := fmt.Sprintf("retry-%s-%d", inv.ID, inv.RetryCount)
-			return charger.ChargeSavedPaymentMethod(ctx, stripeCustomerID, paymentMethodID, amountDue, inv.Currency, inv.ID.String(), key)
-		}
+	charger, m, err := w.savedMethodCharger(ctx, inv)
+	if err != nil {
+		return nil, "", err
 	}
-	return w.gateway.RetryPayment(ctx, inv.ID.String(), amountDue, inv.Currency)
+	if charger != nil {
+		// The scheduler hands the invoice back after each email; a card that
+		// hard-declined (lost, stolen, closed) must not be charged again until
+		// the customer saves another one.
+		if inv.DeclinedMethodRef != "" && inv.DeclinedMethodRef == m.PaymentMethodRef {
+			return &port.PaymentResult{Success: false, ErrorCode: errCodeDeclinedMethodUnchanged}, m.PaymentMethodRef, nil
+		}
+		// Idempotent per attempt: a worker re-run for the same attempt won't
+		// double-charge.
+		result, err := charger.ChargeSavedPaymentMethod(ctx, port.SavedMethodCharge{
+			CustomerRef:    m.CustomerRef,
+			MethodRef:      m.PaymentMethodRef,
+			Amount:         amountDue,
+			Currency:       inv.Currency,
+			InvoiceID:      inv.ID.String(),
+			IdempotencyKey: fmt.Sprintf("retry-%s-%d", inv.ID, inv.RetryCount),
+		})
+		return result, m.PaymentMethodRef, err
+	}
+	result, err = w.gateway.RetryPayment(ctx, inv.ID.String(), amountDue, inv.Currency)
+	return result, "", err
+}
+
+// savedMethodCharger resolves the customer's saved method and the charger for
+// it. A nil charger with a nil error means there is nothing to charge
+// off-session: no method, or one that can't be charged for this invoice
+// (another gateway, a connection that is gone) — never the wrong account. An
+// error means the method couldn't be resolved right now (lookup or connection
+// store failure); the caller retries rather than concluding there is no card.
+func (w *RetryWorker) savedMethodCharger(ctx context.Context, inv *domain.Invoice) (service.SavedCardCharger, domain.SavedPaymentMethod, error) {
+	if w.customerLookup == nil || w.chargerRouter == nil {
+		return nil, domain.SavedPaymentMethod{}, nil
+	}
+	m, err := w.customerLookup.GetSavedPaymentMethod(ctx, inv.CustomerID)
+	if err != nil {
+		return nil, domain.SavedPaymentMethod{}, fmt.Errorf("look up saved payment method: %w", err)
+	}
+	if !m.Chargeable() {
+		return nil, domain.SavedPaymentMethod{}, nil
+	}
+	// The worker's ctx carries no tenant; gateway routing is per tenant.
+	tenantCtx := context.WithValue(ctx, domain.TenantIDKey, inv.TenantID)
+	charger, err := w.chargerRouter.ChargerFor(tenantCtx, m, inv.Currency)
+	if errors.Is(err, service.ErrSavedMethodNotChargeable) {
+		slog.Warn("retry: saved payment method can't be charged; using interactive retry",
+			"invoice_id", inv.ID, "provider", m.Provider, "error", err)
+		return nil, domain.SavedPaymentMethod{}, nil
+	}
+	if err != nil {
+		return nil, domain.SavedPaymentMethod{}, fmt.Errorf("resolve saved payment method gateway: %w", err)
+	}
+	return charger, m, nil
 }
 
 // Start runs the worker loop.
@@ -180,152 +210,208 @@ func (w *RetryWorker) processRetries(ctx context.Context) {
 	}
 }
 
+// Infrastructure errors (gateway outage, revoked key, rate limit, lookup
+// failure) back off exponentially from 5 minutes (at most 160 minutes), and
+// after maxInfraFailures in a row the invoice goes to email dunning: a key
+// that stays broken must not call the gateway every few minutes forever.
+const (
+	infraRetryBase   = 5 * time.Minute
+	maxInfraFailures = 6
+)
+
+func infraRetryDelay(failures int) time.Duration {
+	return infraRetryBase << (failures - 1)
+}
+
 func (w *RetryWorker) processInvoice(ctx context.Context, inv *domain.Invoice) {
 	slog.Info("retry worker: retrying invoice", "invoice_number", inv.InvoiceNumber, "attempt", inv.RetryCount+1)
 
 	// 1. Attempt payment — via the customer's saved method (off-session) when
 	// available, else the interactive gateway path.
-	result, err := w.chargeInvoice(ctx, inv)
+	result, methodRef, err := w.chargeInvoice(ctx, inv)
 	if err != nil {
-		// Infrastructure error (network, etc.) — schedule short retry, don't record outcome
-		slog.Warn("retry worker: gateway infra error, scheduling 5min retry", "invoice_number", inv.InvoiceNumber, "error", err)
-		shortRetry := time.Now().Add(5 * time.Minute)
-		inv.NextRetryAt = &shortRetry
-		if updateErr := w.invoiceRepo.Update(ctx, inv); updateErr != nil {
-			slog.Error("retry worker: failed to update invoice", "invoice_id", inv.ID, "error", updateErr)
-		}
+		w.retryAfterError(ctx, inv, err)
 		return
 	}
 
-	// 2. Record outcome for the PREVIOUS action (if one was tracked)
-	if inv.DunningActionID != "" && inv.DunningContextKey != "" {
-		outcome := "failure"
-		reward := 0.0
-		if result.Success {
-			outcome = "success"
-			reward = 1.0
-		}
+	// The saved method already hard-declined this invoice: leave it to the
+	// email ladder, which keeps its count, until the customer changes cards.
+	if !result.Success && result.ErrorCode == errCodeDeclinedMethodUnchanged {
+		slog.Info("retry worker: saved method hard-declined before and is unchanged; not charging it again",
+			"invoice_number", inv.InvoiceNumber)
+		w.handToEmailDunning(ctx, inv, inv.LastPaymentError, inv.DeclinedMethodRef)
+		return
+	}
 
+	// Nothing chargeable off-session (any gateway reporting
+	// no_saved_payment_method, Stripe included): a retry can't collect, so
+	// stop worker retries; the scheduler's email ladder and pay link take
+	// over. The bandit learns nothing about retry timing from this, so no
+	// outcome.
+	if !result.Success && result.ErrorCode == port.ErrCodeNoSavedMethod {
+		slog.Info("retry worker: no saved payment method, handing invoice to email dunning", "invoice_number", inv.InvoiceNumber)
+		w.handToEmailDunning(ctx, inv, result.ErrorCode, "")
+		return
+	}
+
+	// A success closes the invoice's dunning (campaign, bandit reward) once it
+	// settles.
+	if result.Success {
+		w.settle(ctx, inv, result.PaymentID)
+		return
+	}
+
+	// The previous action (if one was tracked) failed to collect.
+	if inv.DunningActionID != "" && inv.DunningContextKey != "" {
 		historyErr := w.retryService.RecordOutcome(ctx, domain.DunningHistory{
 			ID:            uuid.New(),
 			TenantID:      inv.TenantID,
 			InvoiceID:     inv.ID,
 			ContextKey:    inv.DunningContextKey,
 			ActionID:      inv.DunningActionID,
-			RetryInterval: getDurationSeconds(inv.DunningActionID),
-			Outcome:       outcome,
-			Reward:        reward,
+			RetryInterval: service.DunningActionIntervalSeconds(inv.DunningActionID),
+			Outcome:       "failure",
+			Reward:        0.0,
 			CreatedAt:     time.Now(),
 		})
 		if historyErr != nil {
 			slog.Error("retry worker: failed to record outcome", "invoice_number", inv.InvoiceNumber, "error", historyErr)
 		} else {
-			slog.Info("retry worker: recorded outcome", "outcome", outcome, "action_id", inv.DunningActionID, "context_key", inv.DunningContextKey)
+			slog.Info("retry worker: recorded outcome", "outcome", "failure", "action_id", inv.DunningActionID, "context_key", inv.DunningContextKey)
 		}
 	}
 
-	// 3. Handle result
-	if result.Success {
-		slog.Info("retry worker: payment succeeded", "invoice_number", inv.InvoiceNumber, "payment_id", result.PaymentID)
-		if w.settler != nil {
-			// Settle through the ledger path — the same idempotent method the
-			// checkout and payment webhooks use, so amount_paid, recovery
-			// attribution, the ledger entry, and the rev-rec schedule all
-			// happen here rather than in a racing webhook that would no-op on
-			// an already-paid invoice. The worker's ctx carries no tenant, so
-			// inject the invoice's own (same as the webhook handlers).
-			tenantCtx := context.WithValue(ctx, domain.TenantIDKey, inv.TenantID)
-			if _, err := w.settler.MarkInvoicePaid(tenantCtx, inv.ID); err != nil {
-				// Leave dunning state untouched: the next poll retries and the
-				// settle is idempotent, so nothing is lost or double-posted.
-				slog.Error("retry worker: failed to settle invoice", "invoice_id", inv.ID, "error", err)
-				return
-			}
-			// Re-read the settled row before clearing dunning state — Update
-			// writes the full struct and would clobber paid_at/amount_paid.
-			settled, err := w.invoiceRepo.GetByID(tenantCtx, inv.ID)
-			if err != nil || settled == nil {
-				slog.Error("retry worker: failed to reload settled invoice", "invoice_id", inv.ID, "error", err)
-				return
-			}
-			settled.NextRetryAt = nil
-			settled.DunningActionID = ""
-			settled.DunningContextKey = ""
-			settled.LastPaymentError = ""
-			if updateErr := w.invoiceRepo.Update(ctx, settled); updateErr != nil {
-				slog.Error("retry worker: failed to clear dunning state", "invoice_id", inv.ID, "error", updateErr)
-			}
-		} else {
-			// No settler wired (tests / minimal setups): the legacy direct
-			// update, which skips the ledger and rev-rec.
-			now := time.Now()
-			inv.Status = domain.InvoiceStatusPaid
-			inv.PaidAt = &now
-			inv.AmountPaid = inv.Total
-			// Snapshot before dunning fields are cleared — recovery attribution
-			// needs retry_count and the action that was in effect at payment time.
-			recoverySnapshot := *inv
-			inv.NextRetryAt = nil
-			inv.DunningActionID = ""
-			inv.DunningContextKey = ""
-			inv.LastPaymentError = ""
-			if updateErr := w.invoiceRepo.Update(ctx, inv); updateErr != nil {
-				slog.Error("retry worker: failed to mark invoice as paid", "invoice_id", inv.ID, "error", updateErr)
-			} else if w.recoveryRecorder != nil {
-				// Recovered revenue attribution (idempotent, non-fatal)
-				w.recoveryRecorder.RecordIfRecovered(ctx, &recoverySnapshot)
-			}
-		}
-
-		// Mark dunning campaign as recovered
-		if w.dunningCampaignService != nil {
-			if err := w.dunningCampaignService.MarkRecovered(ctx, inv.ID); err != nil {
-				slog.Error("retry worker: failed to mark dunning campaign recovered", "invoice_id", inv.ID, "error", err)
-			}
-		}
-		return
-	}
-
-	// 4. Payment failed — decide next retry
-	inv.RetryCount++
+	// Payment failed.
 	errorCode := result.ErrorCode
 	if errorCode == "" {
 		errorCode = "GENERIC_FAILURE"
 	}
-	inv.LastPaymentError = errorCode
+	slog.Warn("retry worker: payment declined",
+		"invoice_id", inv.ID, "payment_id", result.PaymentID, "error_code", result.ErrorCode,
+		"permanent", result.Permanent, "message", result.ErrorMsg)
 
+	// Hard decline: retrying the same method cannot succeed, so stop charging
+	// it and let the email ladder (pay link, escalation) take over. The
+	// scheduler counts its own emails; counting this attempt too would skip
+	// one of them.
+	if result.Permanent {
+		slog.Warn("retry worker: hard decline, handing invoice to email dunning", "invoice_number", inv.InvoiceNumber, "error_code", errorCode)
+		w.handToEmailDunning(ctx, inv, errorCode, methodRef)
+		return
+	}
+
+	inv.RetryCount++
 	decision := w.retryService.DecideRetry(ctx, inv, errorCode)
 	if decision == nil {
-		// Max retries reached
 		slog.Warn("retry worker: max retries reached, marking uncollectible", "invoice_number", inv.InvoiceNumber)
-		inv.Status = domain.InvoiceStatusUncollectible
-		inv.NextRetryAt = nil
-		inv.DunningActionID = ""
-		inv.DunningContextKey = ""
-		if updateErr := w.invoiceRepo.Update(ctx, inv); updateErr != nil {
-			slog.Error("retry worker: failed to mark invoice uncollectible", "invoice_id", inv.ID, "error", updateErr)
-		}
+		w.writeRetryState(ctx, inv, port.InvoiceRetryState{
+			Status:           domain.InvoiceStatusUncollectible,
+			RetryCount:       inv.RetryCount,
+			LastPaymentError: errorCode,
+		})
 		return
 	}
 
 	// 5. Schedule next retry with RL decision tracking
 	slog.Warn("retry worker: payment failed, scheduling next retry", "error_code", errorCode, "action_id", decision.Action.ID, "next_retry_at", decision.NextRetryAt)
-	inv.NextRetryAt = &decision.NextRetryAt
-	inv.Status = domain.InvoiceStatusPastDue
-	inv.DunningActionID = decision.Action.ID
-	inv.DunningContextKey = decision.ContextKey
+	next := decision.NextRetryAt
+	w.writeRetryState(ctx, inv, port.InvoiceRetryState{
+		Status:            domain.InvoiceStatusPastDue,
+		NextRetryAt:       &next,
+		RetryCount:        inv.RetryCount,
+		DunningActionID:   decision.Action.ID,
+		DunningContextKey: decision.ContextKey,
+		LastPaymentError:  errorCode,
+	})
+}
 
-	if updateErr := w.invoiceRepo.Update(ctx, inv); updateErr != nil {
-		slog.Error("retry worker: failed to update invoice", "invoice_id", inv.ID, "error", updateErr)
+// retryAfterError schedules a backed-off retry after an attempt that got no
+// answer. It is not an attempt: no outcome, no retry count, the dunning action
+// stays.
+func (w *RetryWorker) retryAfterError(ctx context.Context, inv *domain.Invoice, err error) {
+	failures := inv.RetryInfraFailures + 1
+	if failures > maxInfraFailures {
+		slog.Error("retry worker: gateway keeps failing; handing invoice to email dunning — check the gateway credentials and status",
+			"invoice_number", inv.InvoiceNumber, "invoice_id", inv.ID, "failures", failures, "error", err)
+		w.handToEmailDunning(ctx, inv, "gateway_error", inv.DeclinedMethodRef)
+		return
+	}
+	delay := infraRetryDelay(failures)
+	slog.Warn("retry worker: gateway infra error, scheduling a backed-off retry",
+		"invoice_number", inv.InvoiceNumber, "failures", failures, "retry_in", delay, "error", err)
+	next := time.Now().Add(delay)
+	w.writeRetryState(ctx, inv, port.InvoiceRetryState{
+		Status:             inv.Status,
+		NextRetryAt:        &next,
+		RetryCount:         inv.RetryCount,
+		DunningActionID:    inv.DunningActionID,
+		DunningContextKey:  inv.DunningContextKey,
+		LastPaymentError:   inv.LastPaymentError,
+		DeclinedMethodRef:  inv.DeclinedMethodRef,
+		RetryInfraFailures: failures,
+	})
+}
+
+// handToEmailDunning ends worker-driven retries of inv: past_due, no next
+// retry, no pending dunning action, and the dunning scheduler as owner, so its
+// claim emails the pay link right away and escalates to uncollectible on
+// schedule. declinedRef records a hard-declined saved method.
+func (w *RetryWorker) handToEmailDunning(ctx context.Context, inv *domain.Invoice, lastError, declinedRef string) {
+	w.writeRetryState(ctx, inv, port.InvoiceRetryState{
+		Status:            domain.InvoiceStatusPastDue,
+		RetryCount:        inv.RetryCount,
+		LastPaymentError:  lastError,
+		DunningManagedBy:  dunningManagedByScheduler,
+		DeclinedMethodRef: declinedRef,
+	})
+}
+
+// writeRetryState writes the attempt's bookkeeping unless the invoice was
+// settled or closed while the attempt ran.
+func (w *RetryWorker) writeRetryState(ctx context.Context, inv *domain.Invoice, s port.InvoiceRetryState) {
+	written, err := w.invoiceRepo.UpdateRetryState(ctx, inv.TenantID, inv.ID, s)
+	switch {
+	case err != nil:
+		slog.Error("retry worker: failed to update invoice", "invoice_id", inv.ID, "status", s.Status, "error", err)
+	case !written:
+		slog.Info("retry worker: invoice was settled or closed during the attempt; leaving it as is", "invoice_id", inv.ID)
 	}
 }
 
-// getDurationSeconds maps action ID to its interval in seconds
-func getDurationSeconds(actionID string) int64 {
-	for _, a := range domain.DefaultDunningActions {
-		if a.ID == actionID {
-			return int64(a.Interval.Seconds())
-		}
+// settle marks inv paid after a successful charge through the ledger path —
+// the same idempotent method the checkout and payment webhooks use, so
+// amount_paid, recovery attribution, the ledger entry, and the rev-rec
+// schedule all happen here rather than in a racing webhook that would no-op on
+// an already-paid invoice.
+func (w *RetryWorker) settle(ctx context.Context, inv *domain.Invoice, paymentID string) {
+	slog.Info("retry worker: payment succeeded", "invoice_number", inv.InvoiceNumber, "payment_id", paymentID)
+	if w.settler == nil {
+		slog.Error("retry worker: no settler wired; the charged invoice is not settled", "invoice_id", inv.ID, "payment_id", paymentID)
+		return
 	}
-	return 86400 // default 24h
+	// The worker's ctx carries no tenant, so inject the invoice's own (same
+	// as the webhook handlers).
+	tenantCtx := context.WithValue(ctx, domain.TenantIDKey, inv.TenantID)
+	transitioned, err := w.settler.MarkInvoicePaid(tenantCtx, inv.ID)
+	if err != nil {
+		// Leave dunning state untouched: the next poll retries under the same
+		// idempotency key and the settle is idempotent, so nothing is lost or
+		// double-posted.
+		slog.Error("retry worker: failed to settle invoice", "invoice_id", inv.ID, "error", err)
+		return
+	}
+	if paymentID != noChargeDue {
+		service.RecordSettlingPayment(tenantCtx, w.invoiceRepo, inv, transitioned, paymentID)
+	}
+	if err := w.invoiceRepo.ClearRetryState(tenantCtx, inv.TenantID, inv.ID); err != nil {
+		slog.Error("retry worker: failed to clear dunning state", "invoice_id", inv.ID, "error", err)
+	}
+	w.recovery.Record(tenantCtx, inv)
 }
+
+// noChargeDue is the PaymentID of a "success" where nothing was charged.
+const noChargeDue = "no_charge_due"
+
+// dunningManagedByScheduler puts an invoice on the dunning scheduler's email
+// ladder (ClaimOverdueForDunning) instead of the worker's retry claim.
+const dunningManagedByScheduler = "scheduler"

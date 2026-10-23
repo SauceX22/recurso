@@ -81,6 +81,9 @@ type CreditNoteRepository interface {
 	Create(ctx context.Context, creditNote *domain.CreditNote) error
 	List(ctx context.Context, tenantID uuid.UUID, filter domain.CreditNoteFilter) ([]*domain.CreditNote, error)
 	UpdateRefund(ctx context.Context, id uuid.UUID, status domain.CreditNoteRefundStatus, refundID *string, message string) error
+	// ResolvePendingRefund moves a refund still pending under refundID to
+	// status; resolved=false means another caller already moved it.
+	ResolvePendingRefund(ctx context.Context, id uuid.UUID, refundID string, status domain.CreditNoteRefundStatus, message string) (resolved bool, err error)
 	SumActiveRefundsForInvoice(ctx context.Context, invoiceID uuid.UUID) (int64, error)
 	// CreateRefundWithinLimit atomically enforces the over-refund limit and
 	// inserts the refund note under an invoice-row lock, so concurrent refund
@@ -459,13 +462,7 @@ func (s *CreditNoteService) createRefund(ctx context.Context, tenantID uuid.UUID
 		return nil
 	}
 
-	status := domain.RefundStatusProcessed
-	if strings.EqualFold(res.Status, "pending") {
-		status = domain.RefundStatusPending
-	}
-	refundID := res.RefundID
-	message := fmt.Sprintf("gateway refund %s (gateway status: %s)", res.RefundID, res.Status)
-
+	status, refundID, message, unknown := refundOutcome(res)
 	if err := s.repo.UpdateRefund(ctx, cn.ID, status, &refundID, message); err != nil {
 		// The money moved at the gateway but we could not record it — surface
 		// loudly instead of returning a note that claims otherwise.
@@ -473,9 +470,54 @@ func (s *CreditNoteService) createRefund(ctx context.Context, tenantID uuid.UUID
 			res.RefundID, cn.ID, err)
 	}
 	cn.RefundStatus = status
+	if !unknown {
+		s.postRefund(ctx, tenantID, inv, cn)
+	}
+	cn.RefundID = &refundID
+	cn.RefundMessage = message
 
-	// Ledger reversal: debit Refunds, credit Cash. Same soft-fail stance as
-	// invoice/payment postings — the reconciliation job surfaces any gap.
+	s.logger.InfoContext(ctx, "gateway refund issued for credit note",
+		"credit_note_id", cn.ID,
+		"invoice_id", inv.ID,
+		"payment_id", inv.GatewayPaymentID,
+		"refund_id", res.RefundID,
+		"amount", cn.Amount,
+		"status", status,
+	)
+	return nil
+}
+
+// unknownRefundMarker is how a gateway adapter marks a refund whose outcome it
+// could not confirm: the answer was lost and its read-back did not show the
+// refund ("<payment id>:unknown:<uuid>", reported "pending"; Moyasar, which
+// has no refund ids or refund webhooks). Unlike a gateway's own pending
+// refund, it may never have happened.
+const unknownRefundMarker = ":unknown:"
+
+// refundOutcome maps a gateway refund result to the credit note's refund
+// state. unknown reports a refund the gateway could not confirm: it stays
+// pending and is not booked until ResolveUnknownRefunds settles it.
+func refundOutcome(res *port.RefundResult) (status domain.CreditNoteRefundStatus, refundID, message string, unknown bool) {
+	status = domain.RefundStatusProcessed
+	if strings.EqualFold(res.Status, "pending") {
+		status = domain.RefundStatusPending
+	}
+	refundID = res.RefundID
+	message = fmt.Sprintf("gateway refund %s (gateway status: %s)", res.RefundID, res.Status)
+	if status == domain.RefundStatusPending && strings.Contains(res.RefundID, unknownRefundMarker) {
+		message = fmt.Sprintf("gateway refund outcome unknown (%s): the gateway did not confirm it, so it is not booked yet; "+
+			"it resolves when the gateway reports the payment's refunds — confirm it on the gateway dashboard before re-issuing", res.RefundID)
+		return status, refundID, message, true
+	}
+	return status, refundID, message, false
+}
+
+// postRefund books a refund the gateway made: DR Refunds / CR Cash, the tax
+// slice out of Tax Payable, and the rev-rec unwind of the net amount. Each
+// leg is best-effort and logged on failure (the reconciliation job surfaces
+// any gap). cn's refund status must already be set, so the tax allocation
+// counts it once.
+func (s *CreditNoteService) postRefund(ctx context.Context, tenantID uuid.UUID, inv *domain.Invoice, cn *domain.CreditNote) {
 	// The GST slice of this refund, allocated against the refunds already
 	// active on the invoice so a series of partials never over-reverses; used
 	// by both the ledger reversal and the net rev-rec unwind below.
@@ -497,7 +539,6 @@ func (s *CreditNoteService) createRefund(ctx context.Context, tenantID uuid.UUID
 	// Rev-rec unwind: reverse the still-deferred portion of this invoice's
 	// recognition schedule and void the matching future events, so a mid-period
 	// refund doesn't keep recognizing revenue the customer got back (ENG-147).
-	// Best-effort: a failure is logged, never fails the refund.
 	if s.revrec != nil {
 		// Unwind the NET (ex-tax) refund from Deferred. The tax slice was already
 		// removed via RecordRefundTaxReversal above, and Deferred holds net revenue
@@ -512,17 +553,84 @@ func (s *CreditNoteService) createRefund(ctx context.Context, tenantID uuid.UUID
 			s.logger.InfoContext(ctx, "rev-rec deferred reversed on refund", "credit_note_id", cn.ID, "amount", reversed)
 		}
 	}
-	cn.RefundID = &refundID
-	cn.RefundMessage = message
+}
 
-	s.logger.InfoContext(ctx, "gateway refund issued for credit note",
-		"credit_note_id", cn.ID,
-		"invoice_id", inv.ID,
-		"payment_id", inv.GatewayPaymentID,
-		"refund_id", res.RefundID,
-		"amount", cn.Amount,
-		"status", status,
-	)
+// ResolveUnknownRefunds settles inv's refunds of paymentID whose outcome was
+// unknown, from refundedTotal, the gateway's read-back of everything refunded
+// on the payment (called on the gateway's refund webhook). The total is one
+// number with no refund ids, so it settles a refund only when that is
+// unambiguous: exactly one unknown refund, no other refund of the invoice in
+// flight (it may already be in the total), and the total beyond the processed
+// refunds equal to its amount. That note moves to processed and is booked now.
+// Anything else (several unknowns, a dashboard refund in the total, nothing
+// beyond the processed refunds yet) leaves every note pending, holding its
+// refundable amount, and logs an error for an operator to confirm on the
+// gateway; a total alone never fails a note. The pending -> processed move is
+// conditional, so a redelivered or concurrent webhook books it once.
+// A payment that is not inv's recorded one resolves nothing.
+func (s *CreditNoteService) ResolveUnknownRefunds(ctx context.Context, inv *domain.Invoice, paymentID string, refundedTotal int64) error {
+	if paymentID == "" || paymentID != inv.GatewayPaymentID {
+		return nil
+	}
+	notes, err := s.repo.List(ctx, inv.TenantID, domain.CreditNoteFilter{CustomerID: &inv.CustomerID})
+	if err != nil {
+		return fmt.Errorf("failed to list refunds of invoice %s: %w", inv.ID, err)
+	}
+	var processed int64
+	var unknown []*domain.CreditNote
+	inFlight := 0
+	for _, cn := range notes {
+		if cn.Type != domain.CreditNoteTypeRefund || cn.InvoiceID == nil || *cn.InvoiceID != inv.ID || cn.Status == domain.CreditNoteStatusVoid {
+			continue
+		}
+		if cn.RefundID == nil {
+			// Being sent to the gateway now: its refund id is not stored yet.
+			if cn.Status != domain.CreditNoteStatusPending &&
+				(cn.RefundStatus == domain.RefundStatusPending || cn.RefundStatus == domain.RefundStatusNone) {
+				inFlight++
+			}
+			continue
+		}
+		if !strings.HasPrefix(*cn.RefundID, paymentID+":") {
+			continue
+		}
+		switch {
+		case cn.RefundStatus == domain.RefundStatusProcessed:
+			processed += cn.Amount
+		case cn.RefundStatus == domain.RefundStatusPending && strings.HasPrefix(*cn.RefundID, paymentID+unknownRefundMarker):
+			unknown = append(unknown, cn)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+
+	applied := refundedTotal - processed
+	if len(unknown) != 1 || inFlight != 0 || applied != unknown[0].Amount {
+		ids := make([]string, len(unknown))
+		for i, cn := range unknown {
+			ids[i] = cn.ID.String()
+		}
+		s.logger.ErrorContext(ctx, "refunds of unknown outcome left pending: the gateway's refunded total does not say which were applied — confirm each on the gateway dashboard",
+			"invoice_id", inv.ID, "payment_id", paymentID, "credit_note_ids", ids, "gateway_refunded_total", refundedTotal,
+			"processed_total", processed, "refunds_in_flight", inFlight)
+		return nil
+	}
+
+	cn := unknown[0]
+	message := fmt.Sprintf("the gateway reports %d refunded on payment %s, which includes this refund", refundedTotal, paymentID)
+	resolved, err := s.repo.ResolvePendingRefund(ctx, cn.ID, *cn.RefundID, domain.RefundStatusProcessed, message)
+	if err != nil {
+		return fmt.Errorf("failed to resolve refund %s on credit note %s: %w", *cn.RefundID, cn.ID, err)
+	}
+	if !resolved {
+		// Another delivery resolved it first and booked it.
+		return nil
+	}
+	cn.RefundStatus = domain.RefundStatusProcessed
+	s.postRefund(ctx, inv.TenantID, inv, cn)
+	s.logger.InfoContext(ctx, "unknown refund outcome resolved", "credit_note_id", cn.ID, "invoice_id", inv.ID,
+		"refund_id", *cn.RefundID, "refund_status", cn.RefundStatus, "gateway_refunded_total", refundedTotal)
 	return nil
 }
 
@@ -1015,47 +1123,15 @@ func (s *CreditNoteService) executeRefundGatewayAndLedger(ctx context.Context, t
 		return false, nil
 	}
 
-	// From here the money has moved at the gateway: charged=true on every path.
-	status := domain.RefundStatusProcessed
-	if strings.EqualFold(res.Status, "pending") {
-		status = domain.RefundStatusPending
-	}
-	refundID := res.RefundID
-	message := fmt.Sprintf("gateway refund %s (gateway status: %s)", res.RefundID, res.Status)
-
+	// From here the money may have moved at the gateway: charged=true on every
+	// path.
+	status, refundID, message, unknown := refundOutcome(res)
 	if err := s.repo.UpdateRefund(ctx, cn.ID, status, &refundID, message); err != nil {
 		return true, fmt.Errorf("refund %s succeeded at gateway but persisting it on credit note %s failed: %w", res.RefundID, cn.ID, err)
 	}
 	cn.RefundStatus = status
-
-	// The GST slice of this refund, allocated against the refunds already
-	// active on the invoice so a series of partials never over-reverses; used
-	// by both the ledger reversal and the net rev-rec unwind below.
-	refundTax := refundTaxSlice(cn.Amount, s.priorRefundedExcluding(ctx, inv.ID, cn), inv.TaxAmount, inv.Total)
-	if s.ledger != nil {
-		if err := s.ledger.RecordRefund(ctx, tenantID, inv.EntityID, cn.ID, cn.Amount, "Refund for invoice "+inv.InvoiceNumber); err != nil {
-			s.logger.ErrorContext(ctx, "ledger refund write failed", "error", err, "credit_note_id", cn.ID)
-		}
-		if refundTax > 0 {
-			if _, err := s.ledger.RecordRefundTaxReversal(ctx, tenantID, inv.EntityID, cn.ID, refundTax, "GST reversal on refund for invoice "+inv.InvoiceNumber); err != nil {
-				s.logger.ErrorContext(ctx, "ledger refund tax reversal write failed", "error", err, "credit_note_id", cn.ID)
-			}
-		}
-	}
-
-	if s.revrec != nil {
-		// Unwind the NET (ex-tax) refund from Deferred. The tax slice was already
-		// removed via RecordRefundTaxReversal above, and Deferred holds net revenue
-		// (Total − TaxAmount). Passing gross cn.Amount here double-reversed the tax
-		// on partial refunds — Refunds expense went negative and the deferred-revenue
-		// rollforward broke. (Full refunds happened to be clamped to net by the
-		// reverse>deferred guard, which is why this only bit partial refunds.)
-		netRefund := cn.Amount - refundTax
-		if reversed, err := s.revrec.UnwindOnRefund(ctx, tenantID, inv.EntityID, inv.ID, cn.ID, netRefund); err != nil {
-			s.logger.ErrorContext(ctx, "rev-rec unwind on refund failed", "error", err, "credit_note_id", cn.ID)
-		} else if reversed > 0 {
-			s.logger.InfoContext(ctx, "rev-rec deferred reversed on refund", "credit_note_id", cn.ID, "amount", reversed)
-		}
+	if !unknown {
+		s.postRefund(ctx, tenantID, inv, cn)
 	}
 	cn.RefundID = &refundID
 	cn.RefundMessage = message

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -107,5 +107,24 @@ describe("WalletPage", () => {
     endpoints.getWallet.mockRejectedValue({ response: { status: 404 } });
     renderPage("missing");
     await waitFor(() => expect(screen.getByText(/not found/i)).toBeInTheDocument());
+  });
+
+  // Closing posts a ledger entry only; no gateway refund is made, so the copy
+  // must never claim the customer got their money back.
+  it("says closing books the paid balance but sends no money", async () => {
+    endpoints.closeWallet.mockResolvedValue({ data: { data: { refunded: 5000, forfeited: 2000 } } });
+    renderPage();
+    await waitFor(() => expect(screen.getByText("Drainable balance")).toBeInTheDocument());
+    expect(screen.queryByText(/refunded to the customer/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent(/No money is sent/);
+    expect(dialog).not.toHaveTextContent(/refunded to the customer/);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close wallet" }));
+    expect(await screen.findByText("Booked as returned to customer")).toBeInTheDocument();
+    expect(screen.getByText(/issue the refund in your payment gateway/i)).toBeInTheDocument();
+    expect(screen.queryByText("Refunded to customer")).not.toBeInTheDocument();
   });
 });

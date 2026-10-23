@@ -1,6 +1,6 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { useParams } from "react-router";
-import { CheckCircle2, AlertCircle, Clock } from "lucide-react";
+import { CheckCircle2, AlertCircle, Clock, Loader2 } from "lucide-react";
 import { loadStripe } from "@stripe/stripe-js";
 import {
   Elements,
@@ -10,15 +10,89 @@ import {
   useElements,
 } from "@stripe/react-stripe-js";
 
-import { API_ROOT as API_BASE } from "../lib/api";
+import { API_ROOT as API_BASE, endpoints } from "../lib/api";
 import { formatCurrency } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/patterns/LoadingSkeleton";
+import MoyasarForm from "@/components/checkout/MoyasarForm";
+import {
+  forgetMoyasarPayment,
+  storedMoyasarPayment,
+} from "@/components/checkout/moyasarAssets";
+import {
+  RTL_LOCALES,
+  checkoutCopy,
+  detectCheckoutLocale,
+  verifyErrorMessage,
+  verifyErrorRetryable,
+} from "@/lib/checkoutCopy";
+import { SCRIPT_TIMEOUT_MS, loadExternalScript } from "@/lib/useExternalScript";
+
+const RAZORPAY_JS = "https://checkout.razorpay.com/v1/checkout.js";
+
+// readGatewayReturn inspects the URL once, on first render, for a return from
+// a gateway redirect. Stripe appends ?payment_intent. Moyasar appends
+// ?id=&status=&message= to our callback_url, which carries ?gateway=moyasar;
+// the id is also recognised when it equals the payment id the form stored for
+// this invoice. The status param is never trusted: the server decides.
+function readGatewayReturn(invoiceId) {
+  const params = new URLSearchParams(window.location.search);
+  const pi = params.get("payment_intent");
+  if (pi) return { gateway: "stripe", paymentId: pi };
+  const paymentId = params.get("id");
+  if (!paymentId) return null;
+  const marked = params.get("gateway") === "moyasar";
+  if (marked || storedMoyasarPayment(invoiceId) === paymentId) {
+    return { gateway: "moyasar", paymentId };
+  }
+  return null;
+}
+
+// verifyReturn asks the server for the outcome of a returned or captured
+// payment and resolves { status, paymentStatus }. It throws an axios-style
+// error ({ response: { status, data } }, or no response on a network failure).
+async function verifyReturn(invoiceId, ret) {
+  if (ret.gateway === "razorpay") {
+    // Signature check plus the order↔invoice binding, then settlement.
+    const res = await fetch(`${API_BASE}/checkout/${invoiceId}/razorpay/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        razorpay_order_id: ret.orderId,
+        razorpay_payment_id: ret.paymentId,
+        razorpay_signature: ret.signature,
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    // A captured payment is never "failed" or "processing" here: anything but
+    // paid is a confirmation we couldn't get.
+    if (!res.ok || body.data?.status !== "paid") {
+      throw { response: { status: res.ok ? 502 : res.status, data: body } };
+    }
+    return { status: "paid" };
+  }
+  if (ret.gateway === "moyasar") {
+    const res = await endpoints.verifyMoyasarCheckout(invoiceId, {
+      payment_id: ret.paymentId,
+    });
+    const d = res.data?.data || {};
+    return { status: d.status, paymentStatus: d.payment_status };
+  }
+  const res = await fetch(
+    `${API_BASE}/checkout/${invoiceId}/success?payment_intent=${encodeURIComponent(ret.paymentId)}`
+  );
+  const body = await res.json().catch(() => ({}));
+  if (!body.data?.status && !res.ok) {
+    throw { response: { status: res.status, data: body } };
+  }
+  return { status: body.data?.status };
+}
 
 // PaymentForm renders the Stripe Payment Element and confirms the intent. It
 // must live inside <Elements>. On a card success it settles inline; methods
 // that need a bank redirect come back to this page's return_url, where the
 // parent verifies via ?payment_intent.
-function PaymentForm({ invoice, onPaid, onProcessing }) {
+function PaymentForm({ payLabel, t, onPaid, onProcessing }) {
   const stripe = useStripe();
   const elements = useElements();
   const { id } = useParams();
@@ -35,7 +109,7 @@ function PaymentForm({ invoice, onPaid, onProcessing }) {
     if (res.ok && data.data?.status === "paid") {
       onPaid();
     } else if (data.data?.status === "failed") {
-      setError("Payment could not be completed. Please try another method.");
+      setError(t.stripeFailed);
     } else {
       onProcessing();
     }
@@ -59,7 +133,7 @@ function PaymentForm({ invoice, onPaid, onProcessing }) {
     });
 
     if (confirmError) {
-      setError(confirmError.message || "Payment could not be completed.");
+      setError(confirmError.message || t.stripeFailed);
       setSubmitting(false);
       return;
     }
@@ -71,7 +145,7 @@ function PaymentForm({ invoice, onPaid, onProcessing }) {
       // (the webhook marks the invoice paid once funds clear).
       onProcessing();
     } else {
-      setError("Payment is not complete. Please try another method.");
+      setError(t.stripeIncomplete);
     }
     setSubmitting(false);
   };
@@ -84,7 +158,10 @@ function PaymentForm({ invoice, onPaid, onProcessing }) {
       <AddressElement options={{ mode: "billing" }} />
       <PaymentElement />
       {error && (
-        <div className="rounded-lg bg-destructive/5 px-3 py-3 text-sm text-destructive ring-1 ring-inset ring-destructive/20">
+        <div
+          role="alert"
+          className="rounded-lg bg-destructive/5 px-3 py-3 text-sm text-destructive ring-1 ring-inset ring-destructive/20"
+        >
           {error}
         </div>
       )}
@@ -94,9 +171,7 @@ function PaymentForm({ invoice, onPaid, onProcessing }) {
         size="lg"
         className="w-full"
       >
-        {submitting
-          ? "Processing..."
-          : `Pay ${formatCurrency(invoice.total, invoice.currency)}`}
+        {submitting ? t.processingButton : payLabel}
       </Button>
     </form>
   );
@@ -104,21 +179,56 @@ function PaymentForm({ invoice, onPaid, onProcessing }) {
 
 export default function Checkout() {
   const { id } = useParams();
+  const [locale] = useState(detectCheckoutLocale);
+  const t = checkoutCopy(locale);
+
+  // A callbackUrl search param means an embedding provider wants the buyer sent
+  // back once the invoice is paid. Gateways drop query params across their
+  // redirect (see moyasarAssets), so stash it per invoice to survive the
+  // round-trip. Reject non-http(s) schemes so a crafted link can't turn the
+  // redirect into a javascript: payload.
+  const callbackUrl = useMemo(() => {
+    const key = `checkout:callback:${id}`;
+    let raw = new URLSearchParams(window.location.search).get("callbackUrl");
+    try {
+      if (raw) sessionStorage.setItem(key, raw);
+      else raw = sessionStorage.getItem(key);
+    } catch {
+      // storage disabled; the URL param alone still works when it survives
+    }
+    if (!raw) return null;
+    try {
+      const u = new URL(raw, window.location.origin);
+      return u.protocol === "https:" || u.protocol === "http:" ? u.href : null;
+    } catch {
+      return null;
+    }
+  }, [id]);
+
   const [invoice, setInvoice] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [status, setStatus] = useState("open"); // open | paid | processing
   const [initiating, setInitiating] = useState(false);
 
-  // Payment session (from POST /pay)
-  const [clientSecret, setClientSecret] = useState(null);
-  const [publishableKey, setPublishableKey] = useState(null);
-  const [gateway, setGateway] = useState(null);
-  const [rzpOrder, setRzpOrder] = useState(null); // Razorpay order details
+  // A gateway return is read once, so a verifying screen replaces the Pay
+  // button from the very first render: a buyer who just paid must never see
+  // a live Pay button while the server confirms. Razorpay's modal reports a
+  // captured payment later, through the same state.
+  const [gatewayReturn, setGatewayReturn] = useState(() => readGatewayReturn(id));
+  // open | verifying | verify_error | paid | failed | processing
+  const [status, setStatus] = useState(() => (gatewayReturn ? "verifying" : "open"));
+  const [paymentStatus, setPaymentStatus] = useState(null);
+  const [verifyError, setVerifyError] = useState(null);
+
+  // Payment session from POST /pay.
+  const [order, setOrder] = useState(null);
+  const gateway = order?.gateway || null;
 
   // Load the invoice for display + paid check.
   useEffect(() => {
-    fetch(`${API_BASE}/checkout/${id}`)
+    // The page and this API share /checkout/:id; without no-store a reload can
+    // answer the fetch from the cached page HTML.
+    fetch(`${API_BASE}/checkout/${id}`, { cache: "no-store", headers: { Accept: "application/json" } })
       .then((res) => {
         if (!res.ok) throw new Error("Invoice not found");
         return res.json();
@@ -131,91 +241,123 @@ export default function Checkout() {
       .finally(() => setLoading(false));
   }, [id]);
 
-  // Returning from a bank redirect: Stripe appends ?payment_intent — verify it.
-  // A declined/abandoned intent comes back "failed" and must never show the
-  // "we've received your payment" screen.
+  // aliveRef drops results that arrive after unmount. A plain per-effect
+  // `cancelled` flag would also drop the single verify call under StrictMode,
+  // whose second effect pass is collapsed by startedRef below.
+  const aliveRef = useRef(false);
   useEffect(() => {
-    const pi = new URLSearchParams(window.location.search).get("payment_intent");
-    if (!pi) return;
-    fetch(
-      `${API_BASE}/checkout/${id}/success?payment_intent=${encodeURIComponent(pi)}`
-    )
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.data?.status === "paid") setStatus("paid");
-        else if (data.data?.status === "failed") setStatus("failed");
-        else setStatus("processing");
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+    };
+  }, []);
+
+  const runVerify = useCallback(() => {
+    if (!gatewayReturn) return;
+    verifyReturn(id, gatewayReturn)
+      .then(({ status: s, paymentStatus: ps }) => {
+        if (!aliveRef.current) return;
+        if (s === "paid" || s === "failed") {
+          // Terminal: drop the payment id from the URL, history and Referer,
+          // so a refresh doesn't re-verify.
+          window.history.replaceState(null, "", window.location.pathname);
+          if (gatewayReturn.gateway === "moyasar") forgetMoyasarPayment(id);
+          setStatus(s);
+        } else {
+          setPaymentStatus(ps || null);
+          setStatus("processing");
+        }
       })
-      .catch(() => {});
-  }, [id]);
+      .catch((err) => {
+        if (!aliveRef.current) return;
+        setVerifyError(err);
+        setStatus("verify_error");
+      });
+  }, [id, gatewayReturn]);
+
+  // Verify each return once: StrictMode's second effect pass sees the same
+  // object and is skipped.
+  const startedRef = useRef(null);
+  useEffect(() => {
+    if (!gatewayReturn || startedRef.current === gatewayReturn) return;
+    startedRef.current = gatewayReturn;
+    runVerify();
+  }, [gatewayReturn, runVerify]);
+
+  // Once paid, bounce back to the provider's callbackUrl after a short pause.
+  useEffect(() => {
+    if (status !== "paid" || !callbackUrl) return;
+    const timer = setTimeout(() => {
+      try {
+        sessionStorage.removeItem(`checkout:callback:${id}`);
+      } catch {
+        // nothing to clean up
+      }
+      window.location.assign(callbackUrl);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [status, callbackUrl, id]);
+
+  const handleCheckAgain = () => {
+    setVerifyError(null);
+    setStatus("verifying");
+    runVerify();
+  };
 
   // Clear the redirect params and payment session for a fresh attempt.
   const handleRetryPayment = () => {
     window.history.replaceState(null, "", window.location.pathname);
-    setGateway(null);
-    setClientSecret(null);
-    setPublishableKey(null);
-    setRzpOrder(null);
+    forgetMoyasarPayment(id);
+    setGatewayReturn(null);
+    setOrder(null);
     setError(null);
+    setPaymentStatus(null);
     setStatus("open");
   };
 
   // Load Stripe.js only once we have the publishable key from /pay.
+  const publishableKey = order?.publishable_key || null;
   const stripePromise = useMemo(
     () => (publishableKey ? loadStripe(publishableKey) : null),
     [publishableKey]
   );
 
-  // Razorpay Checkout.js is loaded on demand (only for INR / Razorpay orders).
-  const loadRazorpayScript = () =>
-    new Promise((resolve) => {
-      if (window.Razorpay) return resolve(true);
-      const s = document.createElement("script");
-      s.src = "https://checkout.razorpay.com/v1/checkout.js";
-      s.onload = () => resolve(true);
-      s.onerror = () => resolve(false);
-      document.body.appendChild(s);
+  const openRazorpay = async (rzpOrder) => {
+    if (!rzpOrder) return;
+    // checkout.js is unversioned and often fetched over slow mobile links, so
+    // it gets twice the default timeout.
+    const ok = await loadExternalScript(RAZORPAY_JS, {
+      isReady: () => !!window.Razorpay,
+      timeoutMs: 2 * SCRIPT_TIMEOUT_MS,
     });
-
-  const openRazorpay = async (order) => {
-    if (!order) return;
-    const ok = await loadRazorpayScript();
     if (!ok || !window.Razorpay) {
-      setError("Could not load the payment gateway. Please try again.");
+      setError(t.razorpayLoadError);
       return;
     }
     const rzp = new window.Razorpay({
-      key: order.razorpay_key_id,
-      order_id: order.order_id,
-      amount: order.amount,
-      currency: order.currency,
+      key: rzpOrder.razorpay_key_id,
+      order_id: rzpOrder.order_id,
+      amount: rzpOrder.amount,
+      currency: rzpOrder.currency,
       name: "Recurso",
       description: `Invoice ${invoice?.invoice_number || ""}`,
       theme: { color: "#10b981" },
-      handler: async (resp) => {
-        // Verify server-side (signature + order↔invoice bind) then settle.
-        const vres = await fetch(`${API_BASE}/checkout/${id}/razorpay/verify`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            razorpay_order_id: resp.razorpay_order_id,
-            razorpay_payment_id: resp.razorpay_payment_id,
-            razorpay_signature: resp.razorpay_signature,
-          }),
+      // The money is captured by now. Confirm it like a redirect return, so
+      // the Pay button is gone and a failed confirmation offers Check again
+      // with the same signature rather than a second payment.
+      handler: (resp) => {
+        setError(null);
+        setStatus("verifying");
+        setGatewayReturn({
+          gateway: "razorpay",
+          paymentId: resp.razorpay_payment_id,
+          orderId: resp.razorpay_order_id,
+          signature: resp.razorpay_signature,
         });
-        const body = await vres.json().catch(() => ({}));
-        if (vres.ok && body.data?.status === "paid") {
-          setStatus("paid");
-        } else {
-          setError(
-            body?.error?.message ||
-              "We couldn't confirm your payment. If you were charged, it will be reconciled shortly."
-          );
-        }
       },
     });
     rzp.on("payment.failed", (r) =>
-      setError(r?.error?.description || "Payment failed. Please try again.")
+      setError(r?.error?.description || t.paymentFailed)
     );
     rzp.open();
   };
@@ -227,17 +369,19 @@ export default function Checkout() {
       const res = await fetch(`${API_BASE}/checkout/${id}/pay`, {
         method: "POST",
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error?.message || "Could not start payment");
-      setGateway(data.data.gateway);
-      setClientSecret(data.data.client_secret || null);
-      setPublishableKey(data.data.publishable_key || null);
-      if (data.data.gateway === "razorpay") {
-        setRzpOrder(data.data);
-        openRazorpay(data.data);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (data.error?.code === "invoice_already_paid") {
+          setStatus("paid");
+          return;
+        }
+        setError(res.status === 503 ? t.notConfigured : t.errStart);
+        return;
       }
-    } catch (err) {
-      setError(err.message);
+      setOrder(data.data);
+      if (data.data.gateway === "razorpay") openRazorpay(data.data);
+    } catch {
+      setError(t.errStart);
     } finally {
       setInitiating(false);
     }
@@ -245,128 +389,209 @@ export default function Checkout() {
 
   if (loading) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-muted">
-        <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-      </div>
+      <CheckoutShell locale={locale}>
+        <div role="status" aria-busy="true" aria-label={t.loading} className="space-y-4">
+          <Skeleton className="mx-auto h-12 w-12 rounded-xl" />
+          <Skeleton className="mx-auto h-6 w-32" />
+          <Skeleton className="h-32 w-full rounded-xl" />
+          <Skeleton className="h-11 w-full" />
+        </div>
+      </CheckoutShell>
     );
   }
 
   if (error && !invoice) {
     return (
-      <CheckoutShell>
-        <div className="text-center">
-          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-destructive/5">
-            <AlertCircle className="h-6 w-6 text-destructive" />
-          </div>
-          <h1 className="text-xl font-semibold tracking-tight text-foreground">
-            Invoice not found
-          </h1>
-          <p className="mt-1 text-sm text-muted-foreground">{error}</p>
-        </div>
+      <CheckoutShell locale={locale}>
+        <StatusScreen tone="destructive" title={t.notFoundTitle}>
+          {t.notFoundBody}
+        </StatusScreen>
+      </CheckoutShell>
+    );
+  }
+
+  const invoiceNumber = invoice?.invoice_number;
+
+  // A voided or unfinalized invoice is not owed; the server refuses to take
+  // payment for it, so don't offer a Pay button.
+  if (status !== "paid" && (invoice?.status === "void" || invoice?.status === "draft")) {
+    return (
+      <CheckoutShell locale={locale}>
+        <StatusScreen tone="destructive" title={t.notPayableTitle}>
+          {t.notPayableBody}
+        </StatusScreen>
       </CheckoutShell>
     );
   }
 
   if (status === "paid") {
     return (
-      <CheckoutShell>
-        <div className="text-center">
-          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-success/5">
-            <CheckCircle2 className="h-7 w-7 text-success" />
-          </div>
-          <h1 className="text-2xl font-semibold tracking-tight text-foreground">
-            Payment successful
-          </h1>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Invoice {invoice?.invoice_number} has been paid.
-          </p>
-          <p className="mt-4 text-xs text-subtle">You can close this page.</p>
-        </div>
+      <CheckoutShell locale={locale}>
+        <StatusScreen tone="success" title={t.paidTitle}>
+          {t.paidBody(invoiceNumber)}
+          <span className="mt-4 block text-xs text-subtle">
+            {callbackUrl ? t.redirecting : t.closePage}
+          </span>
+        </StatusScreen>
       </CheckoutShell>
     );
   }
 
   if (status === "failed") {
     return (
-      <CheckoutShell>
-        <div className="text-center">
-          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-destructive/5">
-            <AlertCircle className="h-7 w-7 text-destructive" />
-          </div>
-          <h1 className="text-2xl font-semibold tracking-tight text-foreground">
-            Payment not completed
-          </h1>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Your payment for invoice {invoice?.invoice_number} was declined or
-            cancelled. You have not been charged.
-          </p>
-          <Button onClick={handleRetryPayment} size="lg" className="mt-6 w-full">
-            Try again
-          </Button>
-        </div>
+      <CheckoutShell locale={locale}>
+        <StatusScreen
+          tone="destructive"
+          title={t.failedTitle}
+          actions={
+            <Button onClick={handleRetryPayment} size="lg" className="w-full">
+              {t.tryAgain}
+            </Button>
+          }
+        >
+          {t.failedBody(invoiceNumber)}
+        </StatusScreen>
+      </CheckoutShell>
+    );
+  }
+
+  if (status === "verifying") {
+    return (
+      <CheckoutShell locale={locale}>
+        <StatusScreen tone="pending" title={t.verifyingTitle} busy>
+          {t.verifyingBody}
+        </StatusScreen>
+      </CheckoutShell>
+    );
+  }
+
+  if (status === "verify_error") {
+    return (
+      <CheckoutShell locale={locale}>
+        <StatusScreen
+          tone="destructive"
+          title={t.verifyErrorTitle}
+          alert
+          actions={
+            // Re-checking only helps when the failure may be transient; a
+            // missing invoice or a mismatched payment answers the same again.
+            verifyErrorRetryable(verifyError) && (
+              <Button onClick={handleCheckAgain} size="lg" className="w-full">
+                {t.checkAgain}
+              </Button>
+            )
+          }
+        >
+          {verifyErrorMessage(t, verifyError, {
+            invoiceNumber,
+            paymentId: gatewayReturn?.paymentId,
+          })}
+        </StatusScreen>
       </CheckoutShell>
     );
   }
 
   if (status === "processing") {
+    // Only a bank debit that Stripe accepted is "received". A card payment
+    // still waiting on the bank (Moyasar `initiated`: 3DS not completed) has
+    // taken no money, so it says so and offers a way forward.
+    const cardPending = gatewayReturn?.gateway === "moyasar";
     return (
-      <CheckoutShell>
-        <div className="text-center">
-          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-warning/5">
-            <Clock className="h-7 w-7 text-warning" />
-          </div>
-          <h1 className="text-2xl font-semibold tracking-tight text-foreground">
-            Payment processing
-          </h1>
-          <p className="mt-2 text-sm text-muted-foreground">
-            We've received your payment for invoice {invoice?.invoice_number}.
-            Bank payments (like ACH) take a few business days to clear — you'll
-            get a receipt once it settles. No further action is needed.
-          </p>
-        </div>
+      <CheckoutShell locale={locale}>
+        {cardPending ? (
+          <StatusScreen
+            tone="warning"
+            title={t.unconfirmedTitle}
+            actions={
+              <div className="space-y-2">
+                {paymentStatus === "initiated" && (
+                  <Button onClick={handleRetryPayment} size="lg" className="w-full">
+                    {t.tryAgain}
+                  </Button>
+                )}
+                <Button
+                  onClick={handleCheckAgain}
+                  size="lg"
+                  variant={paymentStatus === "initiated" ? "outline" : "default"}
+                  className="w-full"
+                >
+                  {t.checkAgain}
+                </Button>
+              </div>
+            }
+          >
+            {paymentStatus === "initiated"
+              ? t.initiatedBody(invoiceNumber)
+              : t.pendingBody(invoiceNumber)}
+          </StatusScreen>
+        ) : (
+          <StatusScreen tone="warning" title={t.processingTitle}>
+            {t.processingBankBody(invoiceNumber)}
+          </StatusScreen>
+        )}
       </CheckoutShell>
     );
   }
 
+  // What the buyer owes now: the total less payments and credits already
+  // applied. Older servers don't send amount_due; fall back to the total.
+  const amountDue =
+    typeof invoice.amount_due === "number" ? invoice.amount_due : invoice.total;
+  const settledPart = invoice.total - amountDue;
+  const money = (v) => formatCurrency(v, invoice.currency);
+  // Once a gateway order exists, its button shows the amount that order will
+  // actually charge.
+  const orderPayLabel = t.pay(money(typeof order?.amount === "number" ? order.amount : amountDue));
+
+  const clientSecret = order?.client_secret || null;
   const showStripeForm = gateway === "stripe" && clientSecret && stripePromise;
 
   return (
-    <CheckoutShell>
+    <CheckoutShell locale={locale}>
       <div className="mb-6 text-center">
         <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-success/50 text-2xl font-bold text-white">
           R
         </div>
         <h1 className="text-2xl font-semibold tracking-tight text-foreground">
-          Checkout
+          {t.checkoutTitle}
         </h1>
       </div>
 
       <div className="mb-6 space-y-3 rounded-xl border border-border bg-muted p-4">
-        <SummaryRow label="Invoice" value={invoice.invoice_number} strong />
+        <SummaryRow label={t.invoice} value={invoiceNumber} strong />
         {invoice.subtotal !== invoice.total && (
           <>
-            <SummaryRow
-              label="Subtotal"
-              value={formatCurrency(invoice.subtotal, invoice.currency)}
-            />
-            <SummaryRow
-              label="Tax"
-              value={formatCurrency(invoice.tax_amount, invoice.currency)}
-            />
+            <SummaryRow label={t.subtotal} value={money(invoice.subtotal)} />
+            <SummaryRow label={t.tax} value={money(invoice.tax_amount)} />
             <div className="border-t border-border pt-2" />
           </>
         )}
+        {settledPart !== 0 && (
+          <>
+            <SummaryRow label={t.total} value={money(invoice.total)} />
+            <SummaryRow label={t.paidOrCredited} value={money(-settledPart)} />
+          </>
+        )}
         <div className="flex items-center justify-between">
-          <span className="text-sm text-muted-foreground">Total</span>
-          <span className="text-lg font-bold tabular-nums text-foreground">
-            {formatCurrency(invoice.total, invoice.currency)}
+          <span className="text-sm text-muted-foreground">
+            {settledPart !== 0 ? t.amountDue : t.total}
+          </span>
+          <span
+            data-testid="amount-due"
+            dir="ltr"
+            className="text-lg font-bold tabular-nums text-foreground"
+          >
+            {money(amountDue)}
           </span>
         </div>
-        <SummaryRow label="Due date" value={invoice.due_date} />
+        <SummaryRow label={t.dueDate} value={invoice.due_date} />
       </div>
 
       {error && (
-        <div className="mb-4 rounded-lg bg-destructive/5 px-3 py-3 text-sm text-destructive ring-1 ring-inset ring-destructive/20">
+        <div
+          role="alert"
+          className="mb-4 rounded-lg bg-destructive/5 px-3 py-3 text-sm text-destructive ring-1 ring-inset ring-destructive/20"
+        >
           {error}
         </div>
       )}
@@ -374,7 +599,8 @@ export default function Checkout() {
       {showStripeForm ? (
         <Elements stripe={stripePromise} options={{ clientSecret }}>
           <PaymentForm
-            invoice={invoice}
+            payLabel={orderPayLabel}
+            t={t}
             onPaid={() => setStatus("paid")}
             onProcessing={() => setStatus("processing")}
           />
@@ -384,27 +610,20 @@ export default function Checkout() {
         // showing the Pay button again would mint a new PaymentIntent per
         // click with no form ever appearing.
         <div className="rounded-lg bg-warning/5 px-3 py-3 text-sm text-warning ring-1 ring-inset ring-warning/20">
-          This checkout isn't fully configured. Please contact the sender to
-          arrange payment.
+          {t.notConfigured}
         </div>
       ) : gateway === "razorpay" ? (
         <div className="space-y-3">
-          <Button
-            onClick={() => openRazorpay(rzpOrder)}
-            size="lg"
-            className="w-full"
-          >
-            {`Pay ${formatCurrency(invoice.total, invoice.currency)}`}
+          <Button onClick={() => openRazorpay(order)} size="lg" className="w-full">
+            {orderPayLabel}
           </Button>
-          <p className="text-center text-xs text-subtle">
-            A secure Razorpay window opens to complete your payment (UPI, cards,
-            netbanking).
-          </p>
+          <p className="text-center text-xs text-subtle">{t.razorpayNote}</p>
         </div>
-      ) : gateway && gateway !== "stripe" ? (
+      ) : gateway === "moyasar" ? (
+        <MoyasarForm order={order} invoiceId={id} locale={locale} t={t} />
+      ) : gateway ? (
         <div className="rounded-lg bg-warning/5 px-3 py-3 text-sm text-warning ring-1 ring-inset ring-warning/20">
-          Self-serve checkout for {invoice.currency} isn't available here yet.
-          Please contact the sender to arrange payment.
+          {t.unsupportedCurrency(invoice.currency)}
         </div>
       ) : (
         <Button
@@ -413,23 +632,65 @@ export default function Checkout() {
           size="lg"
           className="w-full"
         >
-          {initiating
-            ? "Starting..."
-            : `Pay ${formatCurrency(invoice.total, invoice.currency)}`}
+          {initiating ? t.starting : t.pay(money(amountDue))}
         </Button>
       )}
-
-      <p className="mt-4 text-center text-xs text-subtle">Powered by Recurso</p>
     </CheckoutShell>
   );
 }
 
-function CheckoutShell({ children }) {
+function CheckoutShell({ locale = "en", children }) {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-muted p-4">
+    <div
+      lang={locale}
+      dir={RTL_LOCALES.has(locale) ? "rtl" : "ltr"}
+      className="flex min-h-screen items-center justify-center bg-muted p-4"
+    >
       <div className="w-full max-w-md rounded-2xl border border-border bg-white p-8 shadow-sm">
         {children}
       </div>
+    </div>
+  );
+}
+
+const TONES = {
+  success: { Icon: CheckCircle2, ring: "bg-success/5", icon: "text-success" },
+  destructive: { Icon: AlertCircle, ring: "bg-destructive/5", icon: "text-destructive" },
+  warning: { Icon: Clock, ring: "bg-warning/5", icon: "text-warning" },
+  pending: { Icon: Loader2, ring: "bg-muted", icon: "animate-spin text-subtle" },
+};
+
+// StatusScreen is the single-message state of the checkout (paid, failed,
+// verifying, ...). Focus moves to its heading so screen-reader users hear the
+// new state.
+function StatusScreen({ tone, title, children, actions, busy, alert }) {
+  const headingRef = useRef(null);
+  useEffect(() => {
+    headingRef.current?.focus();
+  }, [title]);
+  const { Icon, ring, icon } = TONES[tone];
+  return (
+    <div
+      className="text-center"
+      role={busy ? "status" : undefined}
+      aria-busy={busy || undefined}
+    >
+      <div className={`mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full ${ring}`}>
+        <Icon className={`h-7 w-7 ${icon}`} />
+      </div>
+      <h1
+        ref={headingRef}
+        tabIndex={-1}
+        className="text-2xl font-semibold tracking-tight text-foreground outline-none"
+      >
+        {title}
+      </h1>
+      {/* The alert covers the message only, so a screen reader doesn't
+          announce the action buttons as part of it. */}
+      <p role={alert ? "alert" : undefined} className="mt-2 text-sm text-muted-foreground">
+        {children}
+      </p>
+      {actions && <div className="mt-6">{actions}</div>}
     </div>
   );
 }
@@ -438,7 +699,10 @@ function SummaryRow({ label, value, strong }) {
   return (
     <div className="flex justify-between">
       <span className="text-sm text-muted-foreground">{label}</span>
+      {/* Values are amounts, invoice numbers and ISO dates: left-to-right
+          even on an Arabic page, so "-SAR 20.00" keeps its minus in front. */}
       <span
+        dir="ltr"
         className={
           strong
             ? "text-sm font-semibold text-foreground"

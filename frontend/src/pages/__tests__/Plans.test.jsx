@@ -57,7 +57,8 @@ describe("Plans page", () => {
 
   // The currency filter must reach the server — filtering only the fetched
   // page silently hid matching plans on other pages.
-  it("sends the currency filter to the server", async () => {
+  // Every billing currency is filterable, SAR included.
+  it.each(["INR", "SAR", "EUR"])("sends the %s currency filter to the server", async (currency) => {
     if (!Element.prototype.hasPointerCapture) Element.prototype.hasPointerCapture = () => false;
     if (!Element.prototype.scrollIntoView) Element.prototype.scrollIntoView = () => {};
     const { default: userEvent } = await import("@testing-library/user-event");
@@ -68,11 +69,11 @@ describe("Plans page", () => {
 
     // Toolbar selects in order: currency, interval.
     await user.click(screen.getAllByRole("combobox")[0]);
-    await user.click(await screen.findByRole("option", { name: "Currency: INR" }));
+    await user.click(await screen.findByRole("option", { name: `Currency: ${currency}` }));
 
     await waitFor(() =>
       expect(endpoints.getPlans).toHaveBeenCalledWith(
-        expect.objectContaining({ currency: "INR", page: 1 })
+        expect.objectContaining({ currency, page: 1 })
       )
     );
   });

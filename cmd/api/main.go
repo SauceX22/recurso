@@ -233,12 +233,19 @@ func main() {
 	reconciliationService.SetReportingResolver(ledgerService)                      // label discrepancy amounts with the tenant's reporting currency
 
 	// 5. Initialize Gateways
+	// Without a key, outside demo and development, the stand-in gateway is
+	// inert: a simulated "successful" dunning retry or mandate debit would mark
+	// real invoices paid with no money collected.
+	unconfiguredGateway := gateway.NewInertMockGateway
+	if os.Getenv("APP_ENV") == "development" {
+		unconfiguredGateway = gateway.NewMockGateway
+	}
 	var razorpayGateway port.PaymentGateway
 	if keyID := os.Getenv("RAZORPAY_KEY_ID"); keyID != "" {
 		razorpayGateway = gateway.NewRazorpayGateway(keyID, os.Getenv("RAZORPAY_KEY_SECRET"))
 		log.Println("Using Real Razorpay Gateway")
 	} else {
-		razorpayGateway = gateway.NewMockGateway()
+		razorpayGateway = unconfiguredGateway()
 		log.Println("Using Razorpay Gateway (Mock — set RAZORPAY_KEY_ID for real payments)")
 	}
 
@@ -247,7 +254,7 @@ func main() {
 		stripeGateway = gateway.NewStripeGateway(key, os.Getenv("STRIPE_WEBHOOK_SECRET"))
 		log.Println("Using Real Stripe Gateway")
 	} else {
-		stripeGateway = gateway.NewMockGateway()
+		stripeGateway = unconfiguredGateway()
 		log.Println("Using Stripe Gateway (Mock)")
 	}
 
@@ -273,6 +280,36 @@ func main() {
 		paymentGateway.RegisterGateway("adyen", gateway.NewAdyenGateway(key,
 			os.Getenv("ADYEN_MERCHANT_ACCOUNT"), os.Getenv("ADYEN_ENV"), os.Getenv("ADYEN_LIVE_URL_PREFIX")))
 		log.Println("Adyen gateway configured (EXPERIMENTAL — sandbox verification pending)")
+	}
+	// Moyasar (SAR, docs/spec_moyasar.md; EXPERIMENTAL until sandbox-verified):
+	// reachable via GATEWAY_CURRENCY_OVERRIDES="SAR=moyasar". nil when not
+	// configured. Wired in three places, each beside its generic sibling: here
+	// (registered before SetCurrencyOverrides, which refuses an override
+	// naming an unregistered gateway), the saved-card router (before the
+	// retry worker and billing scheduler start), and the checkout/webhook
+	// handlers. Its saved cards can't be replaced from the portal.
+	//
+	// The server's payment mode is decided first: a Moyasar key in the other
+	// mode (or the test-only API override on a live server) refuses to boot.
+	gatewayMode, modeWarnings := gatewayModeFromEnv(os.Getenv, !demo.Enabled())
+	for _, w := range modeWarnings {
+		slog.Warn("PAYMENT GATEWAY MODE MISMATCH", "problem", w)
+	}
+	var moyasarGateway *gateway.MoyasarGateway
+	var noSelfServeCardUpdate []domain.GatewayProvider
+	moyasarCfg := moyasarConfigFromEnv(os.Getenv, baseURL)
+	if moyasarCfg.secretKey != "" && !demo.Enabled() {
+		warnings, err := validateMoyasarConfig(moyasarCfg, gatewayMode)
+		if err != nil {
+			log.Fatalf("Invalid Moyasar configuration: %v", err)
+		}
+		for _, w := range warnings {
+			slog.Warn("Moyasar configuration incomplete", "problem", w)
+		}
+		moyasarGateway = gateway.NewMoyasarGateway(moyasarCfg.secretKey, moyasarCfg.callbackBaseURL, moyasarCfg.apiURL)
+		paymentGateway.RegisterGateway("moyasar", moyasarGateway)
+		noSelfServeCardUpdate = append(noSelfServeCardUpdate, domain.GatewayMoyasar)
+		log.Println("Moyasar gateway configured (EXPERIMENTAL — sandbox verification pending)")
 	}
 	if err := paymentGateway.SetCurrencyOverrides(os.Getenv("GATEWAY_CURRENCY_OVERRIDES")); err != nil && !demo.Enabled() {
 		log.Fatalf("Invalid GATEWAY_CURRENCY_OVERRIDES: %v", err)
@@ -813,15 +850,28 @@ func main() {
 
 	// 6. Initialize Workers
 	retryWorker := worker.NewRetryWorker(invoiceRepo, retryService, tenantGateway, notifier)
-	// ENG-5 Phase 2: charge the customer's saved card off-session on retries.
-	// The mock gateway doesn't implement it, so this stays disabled (interactive
-	// fallback) until real Stripe keys are set.
-	retryStripeCharger, _ := stripeGateway.(interface {
-		ChargeSavedPaymentMethod(ctx context.Context, stripeCustomerID, paymentMethodID string, amount int64, currency, invoiceID, idempotencyKey string) (*port.PaymentResult, error)
-	})
-	retryWorker.SetSavedMethodCharging(retryStripeCharger, customerRepo)
+	// The mock gateway can't charge saved methods, so platform Stripe cards stay
+	// on the interactive retry until real Stripe keys are set.
+	stripeCharger, _ := stripeGateway.(service.SavedCardCharger)
+	// One router for every off-session charge (dunning retry, renewal, wallet
+	// auto-recharge): each saved method charges on the gateway that issued it —
+	// a BYO connection, or the platform account of its provider. Built in full
+	// before the retry worker starts.
+	savedCardRouter := service.NewSavedCardGatewayRouter(
+		gatewayConnService,
+		func(secret string) service.SavedCardCharger { return gateway.NewStripeGateway(secret, "") },
+		stripeCharger,
+	)
+	if moyasarGateway != nil {
+		savedCardRouter.RegisterProvider(domain.GatewayMoyasar, moyasarGateway)
+	}
+	// A customer has one saved slot; charge it only when it lives on the
+	// gateway the charge's currency routes to (never a Moyasar token on
+	// Stripe, or a Stripe card for a SAR invoice). Otherwise dunning and the
+	// pay link collect.
+	savedCardRouter.SetCurrencyRouting(gatewayResolver)
+	retryWorker.SetSavedMethodCharging(customerRepo, savedCardRouter)
 	retryWorker.SetDunningCampaignService(dunningCampaignService)
-	retryWorker.SetRecoveryRecorder(dunningRecoveryService)
 	// Successful retries settle through the same ledger-posting MarkInvoicePaid
 	// as checkout and the payment webhooks (idempotent across all three).
 	retryWorker.SetSettler(subscriptionService)
@@ -999,6 +1049,11 @@ func main() {
 	preChargeScheduler.Start()
 	defer preChargeScheduler.Stop()
 
+	// Customers of a gateway without a portal card-setup flow update their card
+	// by paying an open invoice, so dunning, card-expiry and portal links go
+	// there instead of the Stripe portal.
+	cardUpdatePolicy := service.NewPaymentMethodUpdatePolicy(customerRepo, invoiceRepo.(*db.InvoiceRepository), gatewayResolver.ProviderFor, noSelfServeCardUpdate...)
+
 	// Dunning Scheduler (P30 - payment retry and escalation)
 	dunningScheduler := scheduler.NewDunningScheduler(
 		invoiceRepo.(*db.InvoiceRepository),
@@ -1009,6 +1064,7 @@ func main() {
 	)
 	dunningScheduler.SetPaymentAttempts(db.NewPaymentAttemptRepository(database))          // skip dunning for a settling ACH (Inc 3b)
 	dunningScheduler.SetWriteOffLedger(ledgerService, invoiceRepo.(*db.InvoiceRepository)) // auto-write-off posts its ledger reversal (#466 follow-up)
+	dunningScheduler.SetPaymentMethodLinks(cardUpdatePolicy)
 	dunningScheduler.Start()
 	defer dunningScheduler.Stop()
 
@@ -1031,6 +1087,7 @@ func main() {
 		locker,
 		baseURL,
 	)
+	cardExpiryScheduler.SetPaymentMethodLinks(cardUpdatePolicy)
 	cardExpiryScheduler.Start()
 	defer cardExpiryScheduler.Stop()
 
@@ -1060,26 +1117,9 @@ func main() {
 	// preserving period advance, best-effort saved-method payment.
 	// BILLING_CYCLE_INTERVAL=0 disables; default 5m.
 	renewalService := service.NewRenewalService(subscriptionRepo.(*db.SubscriptionRepository), planRepo, invoiceService)
-	renewalCharger, _ := stripeGateway.(interface {
-		ChargeSavedPaymentMethod(ctx context.Context, stripeCustomerID, paymentMethodID string, amount int64, currency, invoiceID, idempotencyKey string) (*port.PaymentResult, error)
-	})
-	renewalService.SetSavedMethodCharging(renewalCharger, customerRepo, subscriptionService)
-	walletService.SetSavedMethodCharging(renewalCharger, customerRepo)
-	// B1 autopay: route every off-session charge to the gateway the card was
-	// saved on (BYO connection or platform). One shared router across the
-	// renewal, wallet auto-recharge, and dunning-retry paths so a BYO tenant's
-	// recurring charges all land in their own account. renewalCharger is the
-	// platform fallback for cards saved with no connection (pre-B1).
-	if renewalCharger != nil {
-		savedCardRouter := service.NewSavedCardGatewayRouter(
-			gatewayConnService,
-			func(secret string) service.SavedCardCharger { return gateway.NewStripeGateway(secret, "") },
-			renewalCharger,
-		)
-		renewalService.SetChargerRouter(savedCardRouter)
-		walletService.SetChargerRouter(savedCardRouter)
-		retryWorker.SetChargerRouter(savedCardRouter)
-	}
+	renewalService.SetSavedMethodCharging(customerRepo, savedCardRouter, subscriptionService)
+	renewalService.SetPaymentRecorder(invoiceRepo)
+	walletService.SetSavedMethodCharging(customerRepo, savedCardRouter)
 	var billingCycleScheduler *scheduler.BillingCycleScheduler
 	billingCycleInterval := 5 * time.Minute
 	if raw := os.Getenv("BILLING_CYCLE_INTERVAL"); raw != "" {
@@ -1389,6 +1429,7 @@ func main() {
 	notificationService.SetAppBaseURL(getEnvDefault("DASHBOARD_URL", portalBaseURL))
 	portalService := service.NewPortalService(customerRepo, invoiceRepo, magicLinkRepo, portalSessionRepo, disputeRepo, giftService, emailSender, portalBaseURL)
 	portalAPIHandler := handler.NewPortalAPIHandler(portalService)
+	portalAPIHandler.SetCardUpdatePolicy(cardUpdatePolicy)
 	// ENG-5: wire the Stripe SetupIntent card-update flow. The mock gateway
 	// doesn't implement these methods, so the endpoints stay disabled until real
 	// Stripe keys are set. customerRepo (concrete) provides the PM persistence.
@@ -1436,12 +1477,14 @@ func main() {
 
 	// GST & PDF (P30)
 	pdfService := service.NewInvoicePDFService(
-		getEnvDefault("PDF_COMPANY_NAME", "Your Company Name"),
-		getEnvDefault("PDF_COMPANY_ADDRESS", "123 Business Street, City, State - 000000"),
+		// No placeholder seller details: they would print on real customer
+		// invoices. Tenant branding (Settings) overrides name and bank details.
+		getEnvDefault("PDF_COMPANY_NAME", ""),
+		getEnvDefault("PDF_COMPANY_ADDRESS", ""),
 		getEnvDefault("PDF_COMPANY_GSTIN", ""),
 		getEnvDefault("PDF_COMPANY_PAN", ""),
 		getEnvDefault("PDF_COMPANY_STATE", ""),
-		getEnvDefault("PDF_BANK_DETAILS", "Bank: HDFC Bank\nAccount: 00000000000000\nIFSC: HDFC0000000"),
+		getEnvDefault("PDF_BANK_DETAILS", ""),
 		getEnvDefault("PDF_COMPANY_COUNTRY", companyCountry),
 		getEnvDefault("PDF_COMPANY_TAX_ID", ""),
 	)
@@ -1537,6 +1580,18 @@ func main() {
 	webhookHandler.SetInboundWebhookDedup(db.NewInboundWebhookRepository(database)) // skip redelivered gateway webhooks (ENG-162)
 	webhookHandler.SetGatewayConnections(gatewayConnService)                        // BYO increment 3: per-connection webhook secrets
 	webhookHandler.SetPaymentAttempts(db.NewPaymentAttemptRepository(database))     // ACH async settlement (Inc 3b)
+	// Moyasar (EXPERIMENTAL): embedded-form checkout verified server-side, and
+	// the webhook, settling through one path. Guarded so an unconfigured
+	// gateway stays a nil interface, not a typed nil.
+	if moyasarGateway != nil {
+		moyasarSettlement := service.NewGatewaySettlementService(domain.GatewayMoyasar, subscriptionService, invoiceRepo.(*db.InvoiceRepository), subscriptionRepo)
+		moyasarSettlement.SetCardSaving(customerRepo, moyasarGateway)
+		moyasarSettlement.SetDunningRecovery(dunningCampaignService, retryService)
+		moyasarSettlement.SetPaidPaymentLookup(moyasarGateway, gatewayResolver.ProviderFor)
+		moyasarSettlement.SetCardOnFileTerms(planRepo, tenantRepo)
+		checkoutHandler.SetMoyasar(moyasarGateway, moyasarSettlement, moyasarCfg.publishableKey)
+		webhookHandler.SetMoyasar(moyasarGateway, moyasarSettlement, moyasarCfg.webhookSecret)
+	}
 
 	// Revenue Recognition Handler
 	revrecHandler := handler.NewRevRecHandler(revrecService)
@@ -1656,20 +1711,6 @@ func main() {
 	founderToken := os.Getenv("FOUNDER_TOKEN")
 	platformRepo := db.NewPlatformRepository(database)
 	platformChargeRepo := db.NewCloudChargeRepository(database)
-
-	// gateway_mode drives the dashboard's "Test mode" chip: "test" when any
-	// configured gateway key is a test key, "live" when keys are live-only,
-	// "none" when no real gateway is configured (mock).
-	gatewayMode := "none"
-	stripeKey := os.Getenv("STRIPE_SECRET_KEY")
-	razorpayKey := os.Getenv("RAZORPAY_KEY_ID")
-	if stripeKey != "" || razorpayKey != "" {
-		if strings.HasPrefix(stripeKey, "sk_test") || strings.HasPrefix(razorpayKey, "rzp_test") {
-			gatewayMode = "test"
-		} else {
-			gatewayMode = "live"
-		}
-	}
 
 	// Public Routes — stricter rate limit (20 req/min per IP) for endpoints
 	// worth brute-forcing (credentials, tokens, payment initiation).

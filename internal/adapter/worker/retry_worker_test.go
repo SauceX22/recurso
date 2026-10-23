@@ -18,6 +18,8 @@ type mockInvoiceRepo struct {
 	porttest.UnimplementedInvoiceRepository
 	invoices []*domain.Invoice
 	updated  []*domain.Invoice
+	cleared  []uuid.UUID
+	claimed  []string
 }
 
 func (m *mockInvoiceRepo) ClaimDueForRetry(ctx context.Context, lease time.Duration, limit int) ([]*domain.Invoice, error) {
@@ -28,6 +30,35 @@ func (m *mockInvoiceRepo) ClaimDueForRetry(ctx context.Context, lease time.Durat
 func (m *mockInvoiceRepo) Update(ctx context.Context, inv *domain.Invoice) error {
 	m.updated = append(m.updated, inv)
 	return nil
+}
+
+// UpdateRetryState records the invoice as the write leaves it.
+func (m *mockInvoiceRepo) UpdateRetryState(_ context.Context, tenantID, invoiceID uuid.UUID, s port.InvoiceRetryState) (bool, error) {
+	for _, inv := range m.invoices {
+		if inv.ID != invoiceID || inv.TenantID != tenantID {
+			continue
+		}
+		got := *inv
+		got.Status, got.NextRetryAt, got.RetryCount = s.Status, s.NextRetryAt, s.RetryCount
+		got.DunningActionID, got.DunningContextKey, got.LastPaymentError = s.DunningActionID, s.DunningContextKey, s.LastPaymentError
+		if s.DunningManagedBy != "" {
+			got.DunningManagedBy = s.DunningManagedBy
+		}
+		got.DeclinedMethodRef, got.RetryInfraFailures = s.DeclinedMethodRef, s.RetryInfraFailures
+		m.updated = append(m.updated, &got)
+		return true, nil
+	}
+	return false, nil
+}
+
+func (m *mockInvoiceRepo) ClearRetryState(_ context.Context, _, invoiceID uuid.UUID) error {
+	m.cleared = append(m.cleared, invoiceID)
+	return nil
+}
+
+func (m *mockInvoiceRepo) ClaimGatewayPaymentID(_ context.Context, _, _ uuid.UUID, id string) (bool, bool, error) {
+	m.claimed = append(m.claimed, id)
+	return true, true, nil
 }
 
 // Stubs for interface compliance
@@ -118,17 +149,6 @@ func (m *mockDunningRepo) RecordHistory(ctx context.Context, history domain.Dunn
 	return nil
 }
 
-// --- Mock RecoveryRecorder ---
-
-type mockRecoveryRecorder struct {
-	recorded []*domain.Invoice
-}
-
-func (m *mockRecoveryRecorder) RecordIfRecovered(ctx context.Context, inv *domain.Invoice) bool {
-	m.recorded = append(m.recorded, inv)
-	return true
-}
-
 // --- Tests ---
 
 func TestRetryWorker_PaymentSuccess(t *testing.T) {
@@ -154,23 +174,22 @@ func TestRetryWorker_PaymentSuccess(t *testing.T) {
 	}}
 	dunningRepo := &mockDunningRepo{weights: make(map[string]domain.DunningWeight)}
 	retrySvc := service.NewSmartRetryService(dunningRepo)
+	settler := &fakeSettler{transitioned: true}
 
 	w := NewRetryWorker(repo, retrySvc, gw, &mockNotifier{})
+	w.SetSettler(settler)
 	w.processRetries(context.Background())
 
-	if len(repo.updated) != 1 {
-		t.Fatalf("expected 1 update, got %d", len(repo.updated))
+	// Settled only through MarkInvoicePaid, under the invoice's tenant; the
+	// worker never writes the status itself.
+	if len(settler.settled) != 1 || settler.settled[0] != inv.ID || settler.tenant != inv.TenantID {
+		t.Fatalf("settled=%v tenant=%v, want %s under %s", settler.settled, settler.tenant, inv.ID, inv.TenantID)
 	}
-
-	updated := repo.updated[0]
-	if updated.Status != domain.InvoiceStatusPaid {
-		t.Errorf("expected status=paid, got %s", updated.Status)
+	if len(repo.updated) != 0 {
+		t.Fatalf("retry state written %d times on success, want 0", len(repo.updated))
 	}
-	if updated.PaidAt == nil {
-		t.Error("expected PaidAt to be set")
-	}
-	if updated.NextRetryAt != nil {
-		t.Error("expected NextRetryAt to be nil")
+	if len(repo.cleared) != 1 || len(repo.claimed) != 1 || repo.claimed[0] != "pay_123" {
+		t.Fatalf("cleared=%v claimed=%v, want the dunning state cleared and pay_123 recorded", repo.cleared, repo.claimed)
 	}
 
 	// Check outcome was recorded
@@ -219,31 +238,62 @@ func TestRetryWorker_ChargesOutstandingNotTotal(t *testing.T) {
 
 // --- B1 PR2: saved-card BYO routing fakes ---
 
+// fakeSavedCharger records each off-session charge request; result defaults
+// to a success with a payment id derived from name.
 type fakeSavedCharger struct {
 	name    string
 	charges int
+	result  *port.PaymentResult
+	reqs    []port.SavedMethodCharge
 }
 
-func (f *fakeSavedCharger) ChargeSavedPaymentMethod(_ context.Context, _, _ string, _ int64, _, _, _ string) (*port.PaymentResult, error) {
+func (f *fakeSavedCharger) ChargeSavedPaymentMethod(_ context.Context, req port.SavedMethodCharge) (*port.PaymentResult, error) {
 	f.charges++
+	f.reqs = append(f.reqs, req)
+	if f.result != nil {
+		return f.result, nil
+	}
 	return &port.PaymentResult{Success: true, PaymentID: "pay_" + f.name}, nil
 }
 
-type fakeCustomerLookup struct{ connID *uuid.UUID }
+// fakeCustomerLookup serves one saved method: a Stripe card by default, or a
+// method of provider/ref when set.
+type fakeCustomerLookup struct {
+	connID   *uuid.UUID
+	provider domain.GatewayProvider
+	ref      string
+	none     bool
+	err      error
+}
 
-func (f *fakeCustomerLookup) GetSavedPaymentMethod(_ context.Context, _ uuid.UUID) (string, string, *uuid.UUID, error) {
-	return "cus_1", "pm_1", f.connID, nil
+func (f *fakeCustomerLookup) GetSavedPaymentMethod(_ context.Context, _ uuid.UUID) (domain.SavedPaymentMethod, error) {
+	if f.err != nil {
+		return domain.SavedPaymentMethod{}, f.err
+	}
+	if f.none {
+		return domain.SavedPaymentMethod{Provider: domain.GatewayStripe}, nil
+	}
+	if f.provider != "" {
+		return domain.SavedPaymentMethod{Provider: f.provider, PaymentMethodRef: f.ref, GatewayConnectionID: f.connID}, nil
+	}
+	return domain.SavedPaymentMethod{Provider: domain.GatewayStripe, CustomerRef: "cus_1", PaymentMethodRef: "pm_1", GatewayConnectionID: f.connID}, nil
 }
 
 type fakeCardRouter struct {
 	charger   service.SavedCardCharger
 	gotConnID *uuid.UUID
+	gotTenant uuid.UUID
 	saw       bool
+	err       error
 }
 
-func (f *fakeCardRouter) ChargerFor(_ context.Context, connID *uuid.UUID) (service.SavedCardCharger, error) {
+func (f *fakeCardRouter) ChargerFor(ctx context.Context, m domain.SavedPaymentMethod, _ string) (service.SavedCardCharger, error) {
 	f.saw = true
-	f.gotConnID = connID
+	f.gotTenant, _ = ctx.Value(domain.TenantIDKey).(uuid.UUID)
+	f.gotConnID = m.GatewayConnectionID
+	if f.err != nil {
+		return nil, f.err
+	}
 	return f.charger, nil
 }
 
@@ -265,93 +315,23 @@ func TestRetryWorker_ChargesOnRecordedGateway(t *testing.T) {
 	platform := &fakeSavedCharger{name: "platform"}
 	byo := &fakeSavedCharger{name: "byo"}
 	connID := uuid.New()
-	w.SetSavedMethodCharging(platform, &fakeCustomerLookup{connID: &connID})
 	router := &fakeCardRouter{charger: byo}
-	w.SetChargerRouter(router)
+	w.SetSavedMethodCharging(&fakeCustomerLookup{connID: &connID}, router)
 
 	w.processRetries(context.Background())
 
 	if !router.saw || router.gotConnID == nil || *router.gotConnID != connID {
 		t.Fatalf("router should be consulted with the saved connection %v, got %v", connID, router.gotConnID)
 	}
+	// Routing is per tenant (BYO connections); the sweep's ctx has none.
+	if router.gotTenant != inv.TenantID {
+		t.Fatalf("router routed as tenant %v, want the invoice's %v", router.gotTenant, inv.TenantID)
+	}
 	if byo.charges != 1 {
 		t.Fatalf("BYO gateway should be charged once, got %d", byo.charges)
 	}
 	if platform.charges != 0 || gw.calls != 0 {
 		t.Fatalf("must not charge platform (%d) or interactive gateway (%d) when a BYO card is recorded", platform.charges, gw.calls)
-	}
-}
-
-func TestRetryWorker_PaymentSuccess_RecordsRecoveryWithDunningSnapshot(t *testing.T) {
-	now := time.Now()
-	inv := &domain.Invoice{
-		ID:                uuid.New(),
-		TenantID:          uuid.New(),
-		InvoiceNumber:     "INV-005",
-		Total:             10000,
-		Currency:          "USD",
-		Status:            domain.InvoiceStatusPastDue,
-		RetryCount:        2,
-		DunningActionID:   "24h",
-		DunningContextKey: "USD:insufficient_funds",
-		NextRetryAt:       &now,
-	}
-
-	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
-	gw := &mockGateway{result: &port.PaymentResult{Success: true, PaymentID: "pay_456"}}
-	retrySvc := service.NewSmartRetryService(&mockDunningRepo{weights: make(map[string]domain.DunningWeight)})
-	recorder := &mockRecoveryRecorder{}
-
-	w := NewRetryWorker(repo, retrySvc, gw, &mockNotifier{})
-	w.SetRecoveryRecorder(recorder)
-	w.processRetries(context.Background())
-
-	if len(recorder.recorded) != 1 {
-		t.Fatalf("expected 1 recovery recording, got %d", len(recorder.recorded))
-	}
-	snap := recorder.recorded[0]
-	// The snapshot must retain the attribution fields that the paid update clears.
-	if snap.RetryCount != 2 {
-		t.Errorf("snapshot RetryCount = %d, want 2", snap.RetryCount)
-	}
-	if snap.DunningActionID != "24h" {
-		t.Errorf("snapshot DunningActionID = %q, want 24h (pre-clear value)", snap.DunningActionID)
-	}
-	if snap.PaidAt == nil {
-		t.Error("snapshot PaidAt should be set at payment time")
-	}
-	// The persisted invoice still has its dunning fields cleared.
-	if len(repo.updated) != 1 || repo.updated[0].DunningActionID != "" {
-		t.Error("stored invoice should have DunningActionID cleared")
-	}
-}
-
-func TestRetryWorker_PaymentFailure_NoRecoveryRecorded(t *testing.T) {
-	now := time.Now()
-	inv := &domain.Invoice{
-		ID:                uuid.New(),
-		TenantID:          uuid.New(),
-		InvoiceNumber:     "INV-006",
-		Total:             10000,
-		Currency:          "USD",
-		Status:            domain.InvoiceStatusPastDue,
-		RetryCount:        1,
-		DunningActionID:   "1h",
-		DunningContextKey: "USD:card_declined",
-		NextRetryAt:       &now,
-	}
-
-	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
-	gw := &mockGateway{result: &port.PaymentResult{Success: false, ErrorCode: "card_declined"}}
-	retrySvc := service.NewSmartRetryService(&mockDunningRepo{weights: make(map[string]domain.DunningWeight)})
-	recorder := &mockRecoveryRecorder{}
-
-	w := NewRetryWorker(repo, retrySvc, gw, &mockNotifier{})
-	w.SetRecoveryRecorder(recorder)
-	w.processRetries(context.Background())
-
-	if len(recorder.recorded) != 0 {
-		t.Fatalf("failed payment must not record a recovery, got %d", len(recorder.recorded))
 	}
 }
 
@@ -505,5 +485,25 @@ func TestRetryWorker_GatewayError(t *testing.T) {
 	// No outcome should be recorded for infra errors
 	if len(dunningRepo.history) != 0 {
 		t.Errorf("expected 0 history entries for infra error, got %d", len(dunningRepo.history))
+	}
+}
+
+// A Stripe payment method is charged through its customer; without the cus_*
+// every off-session Stripe retry is refused by Stripe.
+func TestRetryWorker_ChargePassesCustomerRef(t *testing.T) {
+	inv := pastDueSARInvoice(1)
+	inv.Currency = "USD"
+	repo := &mockInvoiceRepo{invoices: []*domain.Invoice{inv}}
+	stripe := &fakeSavedCharger{name: "stripe"}
+	w := NewRetryWorker(repo, &countingDecider{}, &mockGateway{}, &mockNotifier{})
+	w.SetSavedMethodCharging(&fakeCustomerLookup{}, service.NewSavedCardGatewayRouter(nil, nil, stripe))
+	w.SetSettler(&fakeSettler{transitioned: true})
+	w.processRetries(context.Background())
+
+	if len(stripe.reqs) != 1 {
+		t.Fatalf("charges = %d, want 1", len(stripe.reqs))
+	}
+	if r := stripe.reqs[0]; r.CustomerRef != "cus_1" || r.MethodRef != "pm_1" || r.Amount != 10000 || r.Currency != "USD" || r.InvoiceID != inv.ID.String() {
+		t.Fatalf("charge request = %+v, want cus_1/pm_1/10000 USD for the invoice", r)
 	}
 }

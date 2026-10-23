@@ -54,7 +54,7 @@ describe('CreateCustomer (redesign — Sheet form)', () => {
         expect(endpoints.createCustomer).not.toHaveBeenCalled();
     });
 
-    it('submits the create-customer payload (US default)', async () => {
+    it('submits no country when none was chosen (never a silent US default)', async () => {
         renderForm();
 
         await userEvent.type(screen.getByLabelText(/Customer name/), 'Acme Corporation');
@@ -69,10 +69,53 @@ describe('CreateCustomer (redesign — Sheet form)', () => {
         expect(payload).toMatchObject({
             name: 'Acme Corporation',
             email: 'billing@acme.com',
-            country: 'US',
+            country: '',
+            state: '',
             gstin: '',
             place_of_supply: '',
         });
         expect(navigateMock).toHaveBeenCalledWith('/customers');
+    });
+
+    const pickOption = async (user, triggerId, optionText) => {
+        await user.click(document.getElementById(triggerId));
+        await user.click(await screen.findByRole('option', { name: optionText }));
+    };
+
+    it('offers the shared country list, including Saudi Arabia', async () => {
+        const user = userEvent.setup();
+        renderForm();
+        await user.click(document.getElementById('country'));
+        expect(await screen.findByRole('option', { name: 'Saudi Arabia' })).toBeInTheDocument();
+        // Comes from lib/countries.js, not a private US/IN/CA/GB list.
+        expect(screen.getByRole('option', { name: 'Germany' })).toBeInTheDocument();
+    });
+
+    it('creates a Saudi customer with country SA, no state field and no US tax-exempt toggle', async () => {
+        const user = userEvent.setup();
+        renderForm();
+        await user.type(screen.getByLabelText(/Customer name/), 'Riyadh Co');
+        await user.type(screen.getByLabelText(/Email address/), 'ap@riyadh.sa');
+        await pickOption(user, 'country', 'Saudi Arabia');
+
+        expect(document.getElementById('state')).toBeNull();
+        expect(screen.queryByText(/Tax exempt/)).not.toBeInTheDocument();
+
+        fireEvent.submit(document.getElementById('create-customer-form'));
+        await waitFor(() => expect(endpoints.createCustomer).toHaveBeenCalledTimes(1));
+        expect(endpoints.createCustomer.mock.calls[0][0]).toMatchObject({
+            country: 'SA',
+            state: '',
+            tax_exempt: false,
+            gstin: '',
+        });
+    });
+
+    it('keeps the state field and the US sales-tax exemption for US customers', async () => {
+        const user = userEvent.setup();
+        renderForm();
+        await pickOption(user, 'country', 'United States');
+        expect(document.getElementById('state')).toBeInTheDocument();
+        expect(screen.getByText('Tax exempt (US)')).toBeInTheDocument();
     });
 });

@@ -10,6 +10,8 @@ import (
 
 	"github.com/stripe/stripe-go/v76"
 	"github.com/stripe/stripe-go/v76/client"
+
+	"github.com/recurso-dev/recurso/internal/core/port"
 )
 
 func TestStripePaymentMethodTypes(t *testing.T) {
@@ -149,7 +151,7 @@ func TestStripeChargeSavedPaymentMethod(t *testing.T) {
 	defer srv.Close()
 
 	gw := newTestStripeGateway(t, srv)
-	res, err := gw.ChargeSavedPaymentMethod(context.Background(), "cus_123", "pm_456", 4900, "usd", "inv-uuid-9", "retry-inv-uuid-9-2")
+	res, err := gw.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{CustomerRef: "cus_123", MethodRef: "pm_456", Amount: 4900, Currency: "usd", InvoiceID: "inv-uuid-9", IdempotencyKey: "retry-inv-uuid-9-2"})
 	if err != nil {
 		t.Fatalf("ChargeSavedPaymentMethod returned error: %v", err)
 	}
@@ -167,6 +169,34 @@ func TestStripeChargeSavedPaymentMethod(t *testing.T) {
 	}
 }
 
+// A wallet top-up must not carry an invoice_id: the payment_intent.succeeded
+// webhook would try to settle an invoice with the wallet's id.
+func TestStripeChargeSavedPaymentMethod_WalletTopUp(t *testing.T) {
+	var form map[string][]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		form = r.Form
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"pi_wallet","status":"succeeded"}`))
+	}))
+	defer srv.Close()
+
+	gw := newTestStripeGateway(t, srv)
+	res, err := gw.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{CustomerRef: "cus_1", MethodRef: "pm_1", Amount: 5000, Currency: "usd", WalletID: "wallet-9", IdempotencyKey: "k"})
+	if err != nil || !res.Success {
+		t.Fatalf("res = %+v, err = %v", res, err)
+	}
+	if got := form["metadata[wallet_id]"]; len(got) != 1 || got[0] != "wallet-9" {
+		t.Errorf("metadata[wallet_id] = %v, want wallet-9", got)
+	}
+	if _, ok := form["metadata[invoice_id]"]; ok {
+		t.Errorf("metadata[invoice_id] = %v, want none on a wallet top-up", form["metadata[invoice_id]"])
+	}
+	if got := form["description"]; len(got) != 1 || got[0] != "Wallet top-up wallet-9" {
+		t.Errorf("description = %v, want Wallet top-up wallet-9", got)
+	}
+}
+
 // A card decline must come back as a business failure (for dunning), never as a
 // transport error.
 func TestStripeChargeSavedPaymentMethod_Decline(t *testing.T) {
@@ -178,7 +208,7 @@ func TestStripeChargeSavedPaymentMethod_Decline(t *testing.T) {
 	defer srv.Close()
 
 	gw := newTestStripeGateway(t, srv)
-	res, err := gw.ChargeSavedPaymentMethod(context.Background(), "cus_1", "pm_1", 1000, "usd", "inv-1", "k1")
+	res, err := gw.ChargeSavedPaymentMethod(context.Background(), port.SavedMethodCharge{CustomerRef: "cus_1", MethodRef: "pm_1", Amount: 1000, Currency: "usd", InvoiceID: "inv-1", IdempotencyKey: "k1"})
 	if err != nil {
 		t.Fatalf("a decline must be a business failure, not an error: %v", err)
 	}

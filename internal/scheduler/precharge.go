@@ -114,6 +114,10 @@ func (s *PreChargeScheduler) runPreChargeNotifications() {
 	slog.Info("found subscriptions due tomorrow for pre-charge notification", "count", len(subscriptions))
 
 	for _, sub := range subscriptions {
+		paymentMethod := "your saved payment method"
+		if sub.PaymentMethodLast4 != "" {
+			paymentMethod = "•••• " + sub.PaymentMethodLast4
+		}
 		// Send pre-charge reminder email
 		data := email.PreChargeEmailData{
 			CustomerName:  sub.CustomerName,
@@ -121,7 +125,7 @@ func (s *PreChargeScheduler) runPreChargeNotifications() {
 			PlanName:      sub.PlanName,
 			Amount:        formatAmount(sub.Amount, sub.Currency),
 			ChargeDate:    sub.NextBillingDate,
-			PaymentMethod: "•••• " + sub.PaymentMethodLast4,
+			PaymentMethod: paymentMethod,
 			PortalURL:     s.portalBaseURL + "/portal",
 		}
 

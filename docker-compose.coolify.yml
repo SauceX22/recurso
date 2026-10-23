@@ -1,0 +1,130 @@
+# Coolify deployment (Build strategy: Compose, Docker Compose Location:
+# /docker-compose.coolify.yml). Same stack as docker-compose.prod.yml, adapted
+# to Coolify:
+#   - no `ports:`: Coolify's proxy routes the domain to `frontend` on its
+#     internal port 8080 (Domains -> frontend -> https://<host>:8080);
+#   - every setting is an explicit ${VAR} so it shows up as a field under the
+#     resource's Environment Variables (`:?` = required, deploy is blocked
+#     until set; `:-` = optional with a default).
+# One public origin serves the dashboard, checkout, portal, API and webhooks:
+# set BASE_URL, DASHBOARD_URL and PORTAL_URL all to it.
+services:
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        - VITE_API_BASE_URL=
+        - VITE_RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-}
+    restart: always
+    environment:
+      - API_UPSTREAM=http://api:8080
+    depends_on:
+      - api
+
+  api:
+    build: .
+    restart: always
+    environment:
+      # In-stack services
+      - DATABASE_URL=postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}?sslmode=disable
+      - REDIS_URL=redis://redis:6379
+      - REQUIRE_REDIS=true
+      - TIGERBEETLE_ADDRESS=tigerbeetle:3000
+      - GIN_MODE=release
+      # Pinned: development mode puts portal and email-verification login
+      # links in API responses.
+      - APP_ENV=production
+
+      # Public URLs (one origin, https)
+      - BASE_URL=${BASE_URL:?}
+      - DASHBOARD_URL=${DASHBOARD_URL:?}
+      - PORTAL_URL=${PORTAL_URL:?}
+      - OAUTH_REDIRECT_BASE_URL=${OAUTH_REDIRECT_BASE_URL:-}
+
+      # Secrets generated once and kept
+      - GATEWAY_ENCRYPTION_KEY=${GATEWAY_ENCRYPTION_KEY:?}
+      - OAUTH_STATE_SECRET=${OAUTH_STATE_SECRET:?}
+
+      # Seller / tax
+      - COMPANY_COUNTRY=${COMPANY_COUNTRY:-SA}
+      - COMPANY_STATE=${COMPANY_STATE:-}
+      - REPORTING_CURRENCY=${REPORTING_CURRENCY:-SAR}
+      - PDF_COMPANY_NAME=${PDF_COMPANY_NAME:-}
+      - PDF_COMPANY_ADDRESS=${PDF_COMPANY_ADDRESS:-}
+      - PDF_COMPANY_TAX_ID=${PDF_COMPANY_TAX_ID:-}
+      - PDF_BANK_DETAILS=${PDF_BANK_DETAILS:-}
+
+      # Moyasar (SAR)
+      - GATEWAY_CURRENCY_OVERRIDES=${GATEWAY_CURRENCY_OVERRIDES:-SAR=moyasar}
+      - MOYASAR_SECRET_KEY=${MOYASAR_SECRET_KEY:-}
+      - MOYASAR_PUBLISHABLE_KEY=${MOYASAR_PUBLISHABLE_KEY:-}
+      - MOYASAR_WEBHOOK_SECRET=${MOYASAR_WEBHOOK_SECRET:-}
+
+      # Other gateways (optional; unset = mock)
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - STRIPE_PUBLISHABLE_KEY=${STRIPE_PUBLISHABLE_KEY:-}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+
+      # Email (unset = logged, never sent)
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USERNAME=${SMTP_USERNAME:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM=${SMTP_FROM:-}
+      - SMTP_FROM_NAME=${SMTP_FROM_NAME:-}
+
+      # Ops (optional)
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+      - METRICS_TOKEN=${METRICS_TOKEN:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:?}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?}
+      - POSTGRES_DB=${POSTGRES_DB:?}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  tigerbeetle:
+    image: ghcr.io/tigerbeetle/tigerbeetle:latest
+    restart: always
+    privileged: true
+    init: true
+    volumes:
+      - tigerbeetle_data:/data
+    entrypoint: >
+      /bin/sh -c " if [ ! -f /data/0_0.tigerbeetle ]; then
+        ./tigerbeetle format --cluster=0 --replica=0 --replica-count=1 /data/0_0.tigerbeetle;
+      fi; ./tigerbeetle start --addresses=0.0.0.0:3000 /data/0_0.tigerbeetle "
+
+volumes:
+  postgres_data:
+  tigerbeetle_data:
+  redis_data:

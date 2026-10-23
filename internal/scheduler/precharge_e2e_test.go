@@ -57,6 +57,22 @@ func TestPreChargeScheduler_RunNotifications_Postgres(t *testing.T) {
 	notif := service.NewNotificationService(noopEmailSender{}, "http://example.test")
 	sched := NewPreChargeScheduler(subRepo, notif, memory.NewNoOpLocker(), "http://portal.test")
 
+	// The reminder names the card that will be charged.
+	seed(t, conn, `UPDATE customers SET card_last4 = '4242' WHERE id = $1`, customerID)
+	due, err := subRepo.GetSubscriptionsDueTomorrow(ctx)
+	if err != nil {
+		t.Fatalf("due tomorrow: %v", err)
+	}
+	var last4 string
+	for _, d := range due {
+		if d.ID == subID {
+			last4 = d.PaymentMethodLast4
+		}
+	}
+	if last4 != "4242" {
+		t.Fatalf("PaymentMethodLast4 = %q, want 4242", last4)
+	}
+
 	sched.runPreChargeNotifications()
 
 	// A notification row was recorded for this subscription's charge date, so it

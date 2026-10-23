@@ -32,12 +32,6 @@ var (
 	ErrWalletCustomerGone = errors.New("customer not found")
 )
 
-// walletCharger charges a saved payment method for auto-recharge; the same
-// gateway slice the renewal engine uses. nil-safe.
-type walletCharger interface {
-	ChargeSavedPaymentMethod(ctx context.Context, stripeCustomerID, paymentMethodID string, amount int64, currency, invoiceID, idempotencyKey string) (*port.PaymentResult, error)
-}
-
 // walletLedger is the slice of LedgerService wallets post through. Wallets are
 // entity-scoped (Multi-Entity Books): top-up/drain legs post on the wallet's
 // own entity ledger.
@@ -65,11 +59,10 @@ type WalletService struct {
 	entities  walletEntityReader // nil-safe: entity resolution for new wallets
 	notifier  port.Notifier      // auto-recharge failure notices; nil-safe
 
-	charger walletCharger        // nil-safe: without it auto-recharge only notifies
-	lookup  renewalPaymentLookup // saved-method resolution (shared slice)
-	// chargerRouter routes the recharge to the gateway the card was saved on
-	// (B1 autopay). nil-safe: without it, `charger` (platform) is used.
-	chargerRouter renewalChargerRouter
+	// Saved-method charging; nil-safe: without it auto-recharge does nothing.
+	// chargerRouter routes the recharge to the gateway the method was saved on.
+	lookup        savedMethodLookup
+	chargerRouter savedChargerRouter
 
 	now func() time.Time
 }
@@ -89,16 +82,10 @@ func (s *WalletService) SetEntityReader(r walletEntityReader) { s.entities = r }
 // SetNotifier wires auto-recharge failure notifications (nil-safe).
 func (s *WalletService) SetNotifier(n port.Notifier) { s.notifier = n }
 
-// SetSavedMethodCharging wires gateway charging for auto-recharge (nil-safe).
-func (s *WalletService) SetSavedMethodCharging(charger walletCharger, lookup renewalPaymentLookup) {
-	s.charger = charger
+// SetSavedMethodCharging wires gateway charging for auto-recharge (nil-safe):
+// the recharge charges on the gateway router picks for the saved method.
+func (s *WalletService) SetSavedMethodCharging(lookup savedMethodLookup, router savedChargerRouter) {
 	s.lookup = lookup
-}
-
-// SetChargerRouter wires BYO-gateway routing (B1 autopay): the recharge charges
-// on the gateway the card was saved with. nil-safe — without it, the platform
-// `charger` is used.
-func (s *WalletService) SetChargerRouter(router renewalChargerRouter) {
 	s.chargerRouter = router
 }
 
@@ -476,8 +463,8 @@ const autoRechargeBatchLimit = 100
 
 // ProcessAutoRecharges tops up every wallet sitting below its threshold by
 // charging the customer's saved payment method. No saved method or a
-// decline notifies (tenant + customer per the spec default) and moves on —
-// the wallet stays low and the next sweep retries.
+// decline notifies (tenant + customer per the spec default) and moves on;
+// the wallet stays low and is retried after a backoff.
 func (s *WalletService) ProcessAutoRecharges(ctx context.Context) (int, error) {
 	due, err := s.wallets.ListDueForRecharge(ctx, autoRechargeBatchLimit)
 	if err != nil {
@@ -494,37 +481,96 @@ func (s *WalletService) ProcessAutoRecharges(ctx context.Context) (int, error) {
 }
 
 func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bool {
-	if s.charger == nil || s.lookup == nil || w.AutoRechargeAmount == nil {
+	if s.lookup == nil || w.AutoRechargeAmount == nil || s.chargerRouter == nil {
 		return false
 	}
-	stripeCustomerID, paymentMethodID, connID, err := s.lookup.GetSavedPaymentMethod(ctx, w.CustomerID)
-	if err != nil || stripeCustomerID == "" || paymentMethodID == "" {
+	// The sweep runs on a background ctx; gateway routing is per tenant.
+	ctx = context.WithValue(ctx, domain.TenantIDKey, w.TenantID)
+	m, err := s.lookup.GetSavedPaymentMethod(ctx, w.CustomerID)
+	if err != nil {
+		slog.WarnContext(ctx, "wallet auto-recharge: saved payment method lookup failed", "wallet_id", w.ID, "error", err)
+		s.recordRechargeFailure(ctx, w, "")
+		return false
+	}
+	if !m.Chargeable() {
 		s.notifyRechargeFailure(ctx, w, "no saved payment method")
+		s.recordRechargeFailure(ctx, w, "")
+		return false
+	}
+	charger, err := s.chargerRouter.ChargerFor(ctx, m, w.Currency)
+	if errors.Is(err, ErrSavedMethodNotChargeable) {
+		// The method can never be charged as things stand (e.g. its gateway
+		// no longer collects this currency for the tenant): stop on it, as
+		// for a hard decline, until the customer saves another, and tell
+		// them once instead of on every sweep.
+		slog.WarnContext(ctx, "wallet auto-recharge: saved payment method can't be charged; auto-recharge stops on it", "wallet_id", w.ID, "provider", m.Provider, "error", err)
+		s.recordRechargeFailure(ctx, w, m.PaymentMethodRef)
+		s.notifyRechargeFailure(ctx, w, "payment gateway unavailable")
+		return false
+	}
+	if err != nil {
+		// Transient (connection store or vault): ours, not the customer's.
+		slog.WarnContext(ctx, "wallet auto-recharge: saved payment method's gateway could not be loaded", "wallet_id", w.ID, "provider", m.Provider, "error", err)
+		s.recordRechargeFailure(ctx, w, "")
 		return false
 	}
 
-	// B1: charge on the gateway the card was saved on (BYO or platform). Without
-	// a router, every card charges on the platform `charger`.
-	charger := s.charger
-	if s.chargerRouter != nil {
-		c, rerr := s.chargerRouter.ChargerFor(ctx, connID)
-		if rerr != nil || c == nil {
-			slog.WarnContext(ctx, "wallet auto-recharge: could not resolve saved-card gateway", "wallet_id", w.ID, "error", rerr)
-			s.notifyRechargeFailure(ctx, w, "payment gateway unavailable")
-			return false
-		}
-		charger = c
+	// The key advances only once an attempt's outcome is known (paid or
+	// declined), so a sweep after a lost response replays the same charge,
+	// whatever else changed on the wallet meanwhile, and each legitimate
+	// recharge gets a fresh key. Gateway keys can live forever (Moyasar's
+	// given_id does), so a key that repeated across recharges would replay
+	// an old payment instead of charging. The amount is frozen with the
+	// attempt: a replay at another amount is refused by the gateway, and the
+	// payment the lost response captured would never be credited.
+	amount, current, err := s.wallets.ReserveRechargeAmount(ctx, w.TenantID, w.ID, w.RechargeAttempt, *w.AutoRechargeAmount)
+	if err != nil {
+		slog.WarnContext(ctx, "wallet auto-recharge: could not reserve the attempt", "wallet_id", w.ID, "error", err)
+		s.recordRechargeFailure(ctx, w, "")
+		return false
 	}
-
-	amount := *w.AutoRechargeAmount
-	// Key on wallet + current balance so a crashed sweep retried within the
-	// same balance state cannot double-charge, while a later legitimate
-	// recharge (post-drain, different balance) gets a fresh key.
-	idemKey := fmt.Sprintf("wallet-recharge-%s-%d", w.ID, w.Balance)
-	result, err := charger.ChargeSavedPaymentMethod(ctx, stripeCustomerID, paymentMethodID, amount, w.Currency, w.ID.String(), idemKey)
-	if err != nil || result == nil || !result.Success {
-		slog.WarnContext(ctx, "wallet auto-recharge charge failed", "wallet_id", w.ID, "error", err)
-		s.notifyRechargeFailure(ctx, w, "payment failed")
+	if !current {
+		// Another sweep already recorded this attempt's outcome.
+		return false
+	}
+	idemKey := fmt.Sprintf("wallet-recharge-%s-%d", w.ID, w.RechargeAttempt)
+	result, err := charger.ChargeSavedPaymentMethod(ctx, port.SavedMethodCharge{
+		CustomerRef:    m.CustomerRef,
+		MethodRef:      m.PaymentMethodRef,
+		Amount:         amount,
+		Currency:       w.Currency,
+		WalletID:       w.ID.String(),
+		IdempotencyKey: idemKey,
+	})
+	if err != nil || result == nil {
+		// No answer: the card may have been charged, so tell no one it failed.
+		logChargeFailure(ctx, "wallet auto-recharge got no answer from the gateway; the same charge is replayed later", result, err, "wallet_id", w.ID, "provider", m.Provider)
+		s.recordRechargeFailure(ctx, w, "")
+		return false
+	}
+	if !result.Success {
+		logChargeFailure(ctx, "wallet auto-recharge charge declined", result, nil, "wallet_id", w.ID, "provider", m.Provider)
+		// The cap counts declines on this method only: a newly saved method
+		// starts afresh, and no-answer or lookup failures never count.
+		declines := 1
+		if w.RechargeDeclinesRef == m.PaymentMethodRef {
+			declines = w.RechargeDeclines + 1
+		}
+		blocked := ""
+		if result.Permanent || declines >= maxRechargeFailures {
+			blocked = m.PaymentMethodRef
+		}
+		failures := w.RechargeFailures + 1
+		retryAt := s.now().Add(rechargeBackoff(failures))
+		s.recordRechargeOutcome(ctx, w, port.RechargeOutcome{
+			Answered: true, Failures: failures, RetryAt: &retryAt, BlockedMethodRef: blocked,
+			Declines: declines, DeclinesRef: m.PaymentMethodRef,
+		})
+		// Tell the customer once when declines start, and once when
+		// auto-recharge stops; not on every backed-off retry in between.
+		if declines == 1 || blocked != "" {
+			s.notifyRechargeFailure(ctx, w, "payment failed")
+		}
 		return false
 	}
 
@@ -536,7 +582,7 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 		Source:   domain.WalletSourceAutoRecharge,
 		Amount:   amount,
 		// Same key the gateway charge used: a concurrent Redis-less sweep that
-		// read the same balance produces the same key, so the second credit
+		// read the same attempt produces the same key, so the second credit
 		// conflicts and no-ops — the card was charged once, the wallet is
 		// credited once.
 		IdempotencyKey: idemKey,
@@ -544,10 +590,13 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 	}
 	applied, err := s.wallets.TopUp(ctx, wtx)
 	if err != nil {
-		slog.ErrorContext(ctx, "wallet auto-recharge charged but top-up record failed — reconcile manually",
+		// The key stays, so the next sweep replays the paid charge and
+		// credits it then.
+		slog.ErrorContext(ctx, "wallet auto-recharge charged but the top-up record failed; the next sweep retries the credit",
 			"wallet_id", w.ID, "amount", amount, "payment_id", result.PaymentID, "error", err)
 		return false
 	}
+	s.recordRechargeOutcome(ctx, w, port.RechargeOutcome{Answered: true})
 	if !applied {
 		// Another sweep already credited this recharge — the gateway
 		// idempotency key also deduped the charge, so this is a clean no-op.
@@ -557,6 +606,45 @@ func (s *WalletService) rechargeWallet(ctx context.Context, w *domain.Wallet) bo
 	s.postTopUpLedger(ctx, w.TenantID, w.EntityID, wtx, domain.WalletSourceManual) // cash received
 	slog.InfoContext(ctx, "wallet auto-recharged", "wallet_id", w.ID, "amount", amount)
 	return true
+}
+
+// maxRechargeFailures caps answered declines in a row on one saved method:
+// the decline that reaches it stops auto-recharge on that method until the
+// customer saves another (card networks limit reattempts on a declined card).
+const maxRechargeFailures = 8
+
+// rechargeBackoff is how long a wallet waits after its nth failed recharge in
+// a row: retrying a declined card every sweep breaks card-network retry rules
+// and floods the customer with failure emails.
+func rechargeBackoff(failures int) time.Duration {
+	switch failures {
+	case 1:
+		return time.Hour
+	case 2:
+		return 6 * time.Hour
+	default:
+		return 24 * time.Hour
+	}
+}
+
+// recordRechargeFailure backs the wallet off after an attempt the gateway
+// did not answer (no answer, nothing to charge, a lookup or routing failure):
+// the attempt keeps its key and the decline count stays as it was.
+// blockedRef stops auto-recharge on a method that can't be charged until the
+// customer saves another.
+func (s *WalletService) recordRechargeFailure(ctx context.Context, w *domain.Wallet, blockedRef string) {
+	failures := w.RechargeFailures + 1
+	retryAt := s.now().Add(rechargeBackoff(failures))
+	s.recordRechargeOutcome(ctx, w, port.RechargeOutcome{
+		Failures: failures, RetryAt: &retryAt, BlockedMethodRef: blockedRef,
+		Declines: w.RechargeDeclines, DeclinesRef: w.RechargeDeclinesRef,
+	})
+}
+
+func (s *WalletService) recordRechargeOutcome(ctx context.Context, w *domain.Wallet, o port.RechargeOutcome) {
+	if err := s.wallets.RecordRechargeOutcome(ctx, w.TenantID, w.ID, w.RechargeAttempt, o); err != nil {
+		slog.ErrorContext(ctx, "wallet auto-recharge: failed to record the attempt", "wallet_id", w.ID, "error", err)
+	}
 }
 
 func (s *WalletService) notifyRechargeFailure(ctx context.Context, w *domain.Wallet, reason string) {

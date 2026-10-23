@@ -65,6 +65,10 @@ export const endpoints = {
       withCredentials: false,
     }),
 
+  // Public build info: { version, gateway_mode } — gateway_mode is "none"
+  // when the server has no env-configured payment gateway.
+  getVersion: () => axios.get(`${API_ROOT}/version`),
+
   // --- Auth (session, cookie-based) ---
   authRegister: (data) => axios.post(`${API_ROOT}/auth/register`, data),
   authLogin: (email, password) =>
@@ -346,6 +350,10 @@ export const endpoints = {
   // Checkout (public, uses base URL without /v1)
   getCheckoutInvoice: (id) => axios.get(`${API_ROOT}/checkout/${id}`),
   initiateCheckoutPayment: (id) => axios.post(`${API_ROOT}/checkout/${id}/pay`),
+  // Server fetches the Moyasar payment and settles only if it's paid and bound
+  // to this invoice; body is { payment_id }.
+  verifyMoyasarCheckout: (id, body) =>
+    axios.post(`${API_ROOT}/checkout/${id}/moyasar/verify`, body),
 
   // Smart Dunning Analytics
   getDunningOverview: () => api.get('/analytics/dunning/overview'),

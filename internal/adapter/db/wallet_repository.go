@@ -24,14 +24,17 @@ func NewWalletRepository(db *sql.DB) port.WalletRepository {
 	return &WalletRepository{db: db}
 }
 
-const walletColumns = `id, tenant_id, entity_id, customer_id, currency, balance, auto_recharge_threshold, auto_recharge_amount, created_at, updated_at, closed_at`
+const walletColumns = `id, tenant_id, entity_id, customer_id, currency, balance, auto_recharge_threshold, auto_recharge_amount, created_at, updated_at, closed_at, recharge_attempt, recharge_failures, recharge_declines, recharge_declines_ref`
 
 func scanWallet(row interface{ Scan(...any) error }) (*domain.Wallet, error) {
 	var w domain.Wallet
+	var declinesRef sql.NullString
 	if err := row.Scan(&w.ID, &w.TenantID, &w.EntityID, &w.CustomerID, &w.Currency, &w.Balance,
-		&w.AutoRechargeThreshold, &w.AutoRechargeAmount, &w.CreatedAt, &w.UpdatedAt, &w.ClosedAt); err != nil {
+		&w.AutoRechargeThreshold, &w.AutoRechargeAmount, &w.CreatedAt, &w.UpdatedAt, &w.ClosedAt,
+		&w.RechargeAttempt, &w.RechargeFailures, &w.RechargeDeclines, &declinesRef); err != nil {
 		return nil, err
 	}
+	w.RechargeDeclinesRef = declinesRef.String
 	return &w, nil
 }
 
@@ -447,6 +450,9 @@ func (r *WalletRepository) ListDueForRecharge(ctx context.Context, limit int) ([
 		AND auto_recharge_amount > 0
 		AND balance < auto_recharge_threshold
 		AND closed_at IS NULL
+		AND (recharge_retry_at IS NULL OR recharge_retry_at <= NOW())
+		AND (recharge_blocked_ref IS NULL OR recharge_blocked_ref IS DISTINCT FROM
+		     (SELECT c.default_payment_method FROM customers c WHERE c.id = wallets.customer_id))
 		ORDER BY updated_at
 		LIMIT $1`, limit)
 	if err != nil {
@@ -462,6 +468,46 @@ func (r *WalletRepository) ListDueForRecharge(ctx context.Context, limit int) ([
 		wallets = append(wallets, *w)
 	}
 	return wallets, rows.Err()
+}
+
+// ReserveRechargeAmount freezes the amount of auto-recharge attempt `attempt`
+// (the first reservation wins) and returns it; ok is false once the attempt
+// is no longer current.
+func (r *WalletRepository) ReserveRechargeAmount(ctx context.Context, tenantID, walletID uuid.UUID, attempt int, amount int64) (int64, bool, error) {
+	var frozen int64
+	err := r.db.QueryRowContext(ctx, `
+		UPDATE wallets SET recharge_amount = COALESCE(recharge_amount, $4)
+		WHERE tenant_id = $1 AND id = $2 AND recharge_attempt = $3
+		RETURNING recharge_amount`,
+		tenantID, walletID, attempt, amount).Scan(&frozen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to reserve wallet recharge amount: %w", err)
+	}
+	return frozen, true, nil
+}
+
+// RecordRechargeOutcome stores the outcome of auto-recharge attempt `attempt`.
+// The attempt guard makes concurrent sweeps that charged under the same key
+// record it once. Touching updated_at sends the wallet to the back of the
+// recharge queue.
+func (r *WalletRepository) RecordRechargeOutcome(ctx context.Context, tenantID, walletID uuid.UUID, attempt int, o port.RechargeOutcome) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE wallets
+		SET recharge_attempt = recharge_attempt + CASE WHEN $4 THEN 1 ELSE 0 END,
+		    recharge_amount = CASE WHEN $4 THEN NULL ELSE recharge_amount END,
+		    recharge_failures = $5, recharge_retry_at = $6, recharge_blocked_ref = $7,
+		    recharge_declines = $8, recharge_declines_ref = $9,
+		    updated_at = NOW()
+		WHERE tenant_id = $1 AND id = $2 AND recharge_attempt = $3`,
+		tenantID, walletID, attempt, o.Answered, o.Failures, o.RetryAt, nilIfEmpty(o.BlockedMethodRef),
+		o.Declines, nilIfEmpty(o.DeclinesRef))
+	if err != nil {
+		return fmt.Errorf("failed to record wallet recharge outcome: %w", err)
+	}
+	return nil
 }
 
 func (r *WalletRepository) ListTransactions(ctx context.Context, tenantID, walletID uuid.UUID, limit int) ([]domain.WalletTransaction, error) {

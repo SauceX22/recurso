@@ -30,6 +30,9 @@ type WebhookHandler struct {
 	paymentAttempts        paymentAttemptStore // nil-safe; ACH async settlement state (Inc 3b)
 	stripeWebhookSecret    string
 	gatewayConns           gatewayConnResolver // nil-safe; per-connection (BYO) webhook secrets
+	moyasarFetcher         paymentReader       // nil-safe; Moyasar payment read-back (SetMoyasar)
+	moyasarSettler         paymentSettler      // nil-safe; shared gateway settlement
+	moyasarWebhookSecret   string              // shared secret echoed as secret_token
 	logger                 *slog.Logger
 }
 
@@ -243,7 +246,7 @@ func (h *WebhookHandler) recordDunningFailure(ctx context.Context, invoiceID uui
 		InvoiceID:     inv.ID,
 		ContextKey:    inv.DunningContextKey,
 		ActionID:      inv.DunningActionID,
-		RetryInterval: getDunningActionSeconds(inv.DunningActionID),
+		RetryInterval: service.DunningActionIntervalSeconds(inv.DunningActionID),
 		Outcome:       "failure",
 		Reward:        0.0,
 		CreatedAt:     time.Now(),
@@ -262,60 +265,28 @@ func (h *WebhookHandler) recordDunningFailure(ctx context.Context, invoiceID uui
 	}
 }
 
-// recordDunningSuccess records a reward=1.0 outcome if the invoice has an active dunning action
+// recordDunningSuccess closes the invoice's dunning through the recorder the
+// gateway settlement path shares: the campaign is marked recovered and the
+// retry bandit rewarded when the invoice carries a dunning action.
 func (h *WebhookHandler) recordDunningSuccess(ctx context.Context, invoiceID uuid.UUID) {
-	// Mark dunning campaign as recovered
+	// Local interface variables keep an unset service a nil interface, not a
+	// typed nil the recorder would call.
+	var campaigns interface {
+		MarkRecovered(ctx context.Context, invoiceID uuid.UUID) error
+	}
 	if h.dunningCampaignService != nil {
-		if err := h.dunningCampaignService.MarkRecovered(ctx, invoiceID); err != nil {
-			h.logger.Error("failed to mark dunning campaign recovered", "error", err, "invoice_id", invoiceID)
+		campaigns = h.dunningCampaignService
+	}
+	var outcomes interface {
+		RecordOutcome(ctx context.Context, history domain.DunningHistory) error
+	}
+	inv := &domain.Invoice{ID: invoiceID}
+	if h.retryService != nil && h.invoiceRepo != nil {
+		if loaded, err := h.invoiceRepo.GetByIDPublic(ctx, invoiceID); err == nil && loaded != nil {
+			inv, outcomes = loaded, h.retryService
 		}
 	}
-
-	if h.retryService == nil || h.invoiceRepo == nil {
-		return
-	}
-
-	inv, err := h.invoiceRepo.GetByIDPublic(ctx, invoiceID)
-	if err != nil || inv == nil {
-		return
-	}
-
-	if inv.DunningActionID == "" || inv.DunningContextKey == "" {
-		return
-	}
-
-	err = h.retryService.RecordOutcome(ctx, domain.DunningHistory{
-		ID:            uuid.New(),
-		TenantID:      inv.TenantID,
-		InvoiceID:     inv.ID,
-		ContextKey:    inv.DunningContextKey,
-		ActionID:      inv.DunningActionID,
-		RetryInterval: getDunningActionSeconds(inv.DunningActionID),
-		Outcome:       "success",
-		Reward:        1.0,
-		CreatedAt:     time.Now(),
-	})
-	if err != nil {
-		h.logger.Error("failed to record dunning success outcome",
-			"invoice_id", invoiceID,
-			"error", err,
-		)
-	} else {
-		h.logger.Info("recorded dunning success outcome via webhook",
-			"invoice_id", invoiceID,
-			"action_id", inv.DunningActionID,
-			"context_key", inv.DunningContextKey,
-		)
-	}
-}
-
-func getDunningActionSeconds(actionID string) int64 {
-	for _, a := range domain.DefaultDunningActions {
-		if a.ID == actionID {
-			return int64(a.Interval.Seconds())
-		}
-	}
-	return 86400
+	service.NewDunningSuccessRecorder(campaigns, outcomes).Record(ctx, inv)
 }
 
 func formatInvoiceAmount(amountPaise int64, currency string) string {

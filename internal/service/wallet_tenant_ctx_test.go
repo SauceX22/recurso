@@ -19,16 +19,20 @@ func (r *dueWalletRepo) ListDueForRecharge(context.Context, int) ([]domain.Walle
 	return r.due, nil
 }
 
+func (r *dueWalletRepo) RecordRechargeOutcome(context.Context, uuid.UUID, uuid.UUID, int, port.RechargeOutcome) error {
+	return nil
+}
+
 // noSavedMethodLookup reports no saved card, forcing the failure notice.
 type noSavedMethodLookup struct{}
 
-func (noSavedMethodLookup) GetSavedPaymentMethod(context.Context, uuid.UUID) (string, string, *uuid.UUID, error) {
-	return "", "", nil, nil
+func (noSavedMethodLookup) GetSavedPaymentMethod(context.Context, uuid.UUID) (domain.SavedPaymentMethod, error) {
+	return domain.SavedPaymentMethod{Provider: domain.GatewayStripe}, nil
 }
 
 type unusedWalletCharger struct{}
 
-func (unusedWalletCharger) ChargeSavedPaymentMethod(context.Context, string, string, int64, string, string, string) (*port.PaymentResult, error) {
+func (unusedWalletCharger) ChargeSavedPaymentMethod(context.Context, port.SavedMethodCharge) (*port.PaymentResult, error) {
 	panic("charger must not be called without a saved method")
 }
 
@@ -55,7 +59,7 @@ func TestWalletAutoRecharge_FailureNoticeInjectsWalletTenant(t *testing.T) {
 	}}}
 	notifier := &recordingNotifier{}
 	svc := NewWalletService(wallets, &strictTenantCustomerRepo{tenantID: tenantID, customer: cust}, nil)
-	svc.SetSavedMethodCharging(unusedWalletCharger{}, noSavedMethodLookup{})
+	svc.SetSavedMethodCharging(noSavedMethodLookup{}, NewSavedCardGatewayRouter(nil, nil, unusedWalletCharger{}))
 	svc.SetNotifier(notifier)
 
 	if _, err := svc.ProcessAutoRecharges(context.Background()); err != nil {

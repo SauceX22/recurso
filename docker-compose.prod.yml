@@ -8,7 +8,7 @@ services:
         - VITE_RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-}
     restart: always
     ports:
-      - "5316:8080"
+      - "5168:8080"
     environment:
       - API_UPSTREAM=http://api:8080
     depends_on:
@@ -24,11 +24,18 @@ services:
     # here bypassed it.
     expose:
       - "8080"
+    # Everything in .env (gateways, SMTP, encryption key, URLs) reaches the API;
+    # the entries below override it for the in-stack services.
+    env_file:
+      - .env
     environment:
       # `:?` makes compose refuse to start with an unset password instead of
       # silently connecting with an empty one.
       - DATABASE_URL=postgres://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}?sslmode=disable
       - GIN_MODE=release
+      # Pinned: .env.example ships APP_ENV=development, which would put portal
+      # and email-verification login links in API responses.
+      - APP_ENV=production
       - TIGERBEETLE_ADDRESS=tigerbeetle:3000
       - REDIS_URL=redis://redis:6379
       # Refuse to start on the no-op locker: schedulers must be serialized across

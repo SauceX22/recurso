@@ -331,6 +331,12 @@ func gammaSample(alpha float64) float64 {
 	}
 }
 
+// DunningActionIntervalSeconds is the retry interval of the dunning action id,
+// in seconds; an unknown id counts as the 24h action.
+func DunningActionIntervalSeconds(id string) int64 {
+	return int64(actionByID(id).Interval.Seconds())
+}
+
 // actionByID maps an action ID back to a DunningAction
 func actionByID(id string) domain.DunningAction {
 	for _, a := range domain.DefaultDunningActions {

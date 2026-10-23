@@ -381,26 +381,81 @@ func (r *CustomerRepository) SetStripeCustomerID(ctx context.Context, customerID
 // for future invoices, and refreshes the card display fields in one write.
 // gatewayConnectionID records which gateway connection the card was saved on
 // (B1 autopay): nil means the platform gateway; a value means that BYO
-// connection, so off-session charges route to the same gateway.
+// connection, so off-session charges route to the same gateway. It also resets
+// pm_provider to NULL (Stripe): a customer who previously saved a Moyasar token
+// and now saves a Stripe card routes back to Stripe.
 func (r *CustomerRepository) SetDefaultPaymentMethod(ctx context.Context, customerID uuid.UUID, paymentMethodID, brand, last4 string, expMonth, expYear int, gatewayConnectionID *uuid.UUID) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE customers
 		    SET default_payment_method = $1, card_brand = $2, card_last4 = $3,
-		        card_exp_month = $4, card_exp_year = $5, pm_gateway_connection_id = $6
+		        card_exp_month = $4, card_exp_year = $5, pm_gateway_connection_id = $6,
+		        pm_provider = NULL
 		  WHERE id = $7`,
 		paymentMethodID, brand, last4, expMonth, expYear, gatewayConnectionID, customerID)
 	return err
 }
 
-// GetSavedPaymentMethod returns the customer's Stripe customer id, default
-// PaymentMethod id, and the gateway connection the card was saved on (nil =
-// platform gateway) for off-session charging. Either string may be "" if not
-// set, in which case the caller must fall back to the interactive payment path.
-func (r *CustomerRepository) GetSavedPaymentMethod(ctx context.Context, customerID uuid.UUID) (stripeCustomerID, paymentMethodID string, gatewayConnectionID *uuid.UUID, err error) {
-	err = r.db.QueryRowContext(ctx,
-		`SELECT COALESCE(stripe_customer_id, ''), COALESCE(default_payment_method, ''), pm_gateway_connection_id
-		   FROM customers WHERE id = $1`, customerID).Scan(&stripeCustomerID, &paymentMethodID, &gatewayConnectionID)
-	return
+// GetSavedPaymentMethod returns the customer's saved off-session method and
+// the gateway that issued it. A NULL pm_provider is Stripe: every method saved
+// before provider tracking existed is a Stripe pm_*.
+//
+// Cross-tenant by design: the renewal, dunning-retry and wallet sweeps call it
+// with the customer_id of a row they already claimed under its own tenant, so
+// the primary key alone identifies the customer. Never call it with an id
+// taken from a request.
+func (r *CustomerRepository) GetSavedPaymentMethod(ctx context.Context, customerID uuid.UUID) (domain.SavedPaymentMethod, error) {
+	var provider, customerRef, methodRef sql.NullString
+	var m domain.SavedPaymentMethod
+	err := r.db.QueryRowContext(ctx,
+		`SELECT pm_provider, stripe_customer_id, default_payment_method, pm_gateway_connection_id
+		   FROM customers WHERE id = $1`, customerID).
+		Scan(&provider, &customerRef, &methodRef, &m.GatewayConnectionID)
+	if err != nil {
+		return domain.SavedPaymentMethod{}, err
+	}
+	m.Provider = domain.GatewayStripe
+	if provider.Valid && provider.String != "" {
+		m.Provider = domain.GatewayProvider(provider.String)
+	}
+	m.CustomerRef = customerRef.String
+	m.PaymentMethodRef = methodRef.String
+	return m, nil
+}
+
+// SetGatewayPaymentMethod records a reusable method issued by provider on the
+// platform gateway (e.g. a Moyasar token_*) as the customer's default, with its
+// card display fields. expMonth/expYear of 0 mean unknown and store NULL, so
+// the card-expiry notifier never mails about the previous card's expiry.
+// pm_gateway_connection_id is cleared because the method lives on the platform
+// gateway; stripe_customer_id is left untouched. Scoped by tenant_id; returns
+// sql.ErrNoRows when no row matched.
+func (r *CustomerRepository) SetGatewayPaymentMethod(ctx context.Context, tenantID, customerID uuid.UUID, provider domain.GatewayProvider, ref, brand, last4 string, expMonth, expYear int) error {
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE customers
+		    SET default_payment_method = $1, card_brand = $2, card_last4 = $3,
+		        card_exp_month = $4, card_exp_year = $5,
+		        pm_provider = $6, pm_gateway_connection_id = NULL
+		  WHERE id = $7 AND tenant_id = $8`,
+		ref, brand, last4, nullIfZero(expMonth), nullIfZero(expYear), string(provider), customerID, tenantID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// nullIfZero stores an unknown (zero) integer as NULL.
+func nullIfZero(v int) interface{} {
+	if v == 0 {
+		return nil
+	}
+	return v
 }
 
 // CustomerWithExpiringCard holds customer info for card expiry notifications

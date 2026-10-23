@@ -54,34 +54,58 @@ func (f *fakeRenewalInvoicer) GenerateFinalUsageInvoice(ctx context.Context, sub
 	return f.finalInv, f.finalErr
 }
 
+// fakeRenewalCharger records every off-session charge request.
 type fakeRenewalCharger struct {
 	result  *port.PaymentResult
 	err     error
 	charges int
 	amount  int64
 	idemKey string
+	reqs    []port.SavedMethodCharge
 }
 
-func (f *fakeRenewalCharger) ChargeSavedPaymentMethod(ctx context.Context, stripeCustomerID, paymentMethodID string, amount int64, currency, invoiceID, idempotencyKey string) (*port.PaymentResult, error) {
+func (f *fakeRenewalCharger) ChargeSavedPaymentMethod(ctx context.Context, req port.SavedMethodCharge) (*port.PaymentResult, error) {
 	f.charges++
-	f.amount = amount
-	f.idemKey = idempotencyKey
+	f.amount = req.Amount
+	f.idemKey = req.IdempotencyKey
+	f.reqs = append(f.reqs, req)
 	return f.result, f.err
 }
 
+// fakeRenewalLookup serves one saved method; an empty provider is Stripe,
+// as the repository reads a NULL pm_provider.
 type fakeRenewalLookup struct {
 	stripeID, methodID string
 	connID             *uuid.UUID
+	provider           domain.GatewayProvider
+	err                error
+	calls              int
 }
 
-func (f *fakeRenewalLookup) GetSavedPaymentMethod(ctx context.Context, customerID uuid.UUID) (string, string, *uuid.UUID, error) {
-	return f.stripeID, f.methodID, f.connID, nil
+func (f *fakeRenewalLookup) GetSavedPaymentMethod(ctx context.Context, customerID uuid.UUID) (domain.SavedPaymentMethod, error) {
+	f.calls++
+	provider := f.provider
+	if provider == "" {
+		provider = domain.GatewayStripe
+	}
+	return domain.SavedPaymentMethod{Provider: provider, CustomerRef: f.stripeID, PaymentMethodRef: f.methodID, GatewayConnectionID: f.connID}, f.err
 }
 
-type fakeRenewalSettler struct{ settled []uuid.UUID }
+// fakeRenewalSettler records each settled invoice and the tenant its ctx
+// carried (uuid.Nil when none).
+type fakeRenewalSettler struct {
+	settled      []uuid.UUID
+	tenants      []uuid.UUID
+	transitioned *bool // nil = true
+}
 
 func (f *fakeRenewalSettler) MarkInvoicePaid(ctx context.Context, invoiceID uuid.UUID) (bool, error) {
 	f.settled = append(f.settled, invoiceID)
+	tid, _ := ctx.Value(domain.TenantIDKey).(uuid.UUID)
+	f.tenants = append(f.tenants, tid)
+	if f.transitioned != nil {
+		return *f.transitioned, nil
+	}
 	return true, nil
 }
 
@@ -194,7 +218,7 @@ func TestRenewSubscription_PaymentSuccessSettles(t *testing.T) {
 	svc, _, invoicer, sub := renewalFixture()
 	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
 	settler := &fakeRenewalSettler{}
-	svc.SetSavedMethodCharging(charger, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, settler)
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, NewSavedCardGatewayRouter(nil, nil, charger), settler)
 
 	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -212,15 +236,18 @@ func TestRenewSubscription_PaymentSuccessSettles(t *testing.T) {
 }
 
 type fakeChargerRouter struct {
-	charger   SavedCardCharger
-	gotConnID *uuid.UUID
-	sawCall   bool
-	err       error
+	charger     SavedCardCharger
+	gotConnID   *uuid.UUID
+	gotMethod   domain.SavedPaymentMethod
+	gotCurrency string
+	sawCall     bool
+	err         error
 }
 
-func (f *fakeChargerRouter) ChargerFor(_ context.Context, connID *uuid.UUID) (SavedCardCharger, error) {
+func (f *fakeChargerRouter) ChargerFor(_ context.Context, m domain.SavedPaymentMethod, currency string) (SavedCardCharger, error) {
 	f.sawCall = true
-	f.gotConnID = connID
+	f.gotConnID = m.GatewayConnectionID
+	f.gotMethod, f.gotCurrency = m, currency
 	return f.charger, f.err
 }
 
@@ -232,9 +259,8 @@ func TestRenewSubscription_ChargesOnRecordedGateway(t *testing.T) {
 	platform := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
 	byo := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
 	connID := uuid.New()
-	svc.SetSavedMethodCharging(platform, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1", connID: &connID}, &fakeRenewalSettler{})
 	router := &fakeChargerRouter{charger: byo}
-	svc.SetChargerRouter(router)
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1", connID: &connID}, router, &fakeRenewalSettler{})
 
 	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -257,8 +283,7 @@ func TestRenewSubscription_UnresolvableGatewayLeavesInvoiceOpen(t *testing.T) {
 	platform := &fakeRenewalCharger{result: &port.PaymentResult{Success: true}}
 	settler := &fakeRenewalSettler{}
 	connID := uuid.New()
-	svc.SetSavedMethodCharging(platform, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1", connID: &connID}, settler)
-	svc.SetChargerRouter(&fakeChargerRouter{err: errors.New("connection gone")})
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1", connID: &connID}, &fakeChargerRouter{err: errors.New("connection gone")}, settler)
 
 	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 		t.Fatalf("an unresolvable gateway must not fail the renewal: %v", err)
@@ -275,7 +300,7 @@ func TestRenewSubscription_PaymentDeclineLeavesInvoiceOpen(t *testing.T) {
 	svc, subRepo, _, sub := renewalFixture()
 	charger := &fakeRenewalCharger{result: &port.PaymentResult{Success: false, ErrorCode: "insufficient_funds"}}
 	settler := &fakeRenewalSettler{}
-	svc.SetSavedMethodCharging(charger, &fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, settler)
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{stripeID: "cus_1", methodID: "pm_1"}, NewSavedCardGatewayRouter(nil, nil, charger), settler)
 
 	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 		t.Fatalf("a payment decline must not fail the renewal: %v", err)
@@ -291,7 +316,7 @@ func TestRenewSubscription_PaymentDeclineLeavesInvoiceOpen(t *testing.T) {
 func TestRenewSubscription_NoSavedMethodNoCharge(t *testing.T) {
 	svc, _, _, sub := renewalFixture()
 	charger := &fakeRenewalCharger{}
-	svc.SetSavedMethodCharging(charger, &fakeRenewalLookup{}, &fakeRenewalSettler{}) // empty lookup
+	svc.SetSavedMethodCharging(&fakeRenewalLookup{}, NewSavedCardGatewayRouter(nil, nil, charger), &fakeRenewalSettler{}) // empty lookup
 
 	if err := svc.RenewSubscription(context.Background(), sub); err != nil {
 		t.Fatalf("unexpected error: %v", err)
