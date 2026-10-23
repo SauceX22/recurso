@@ -25,7 +25,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-const CURRENCIES = ["USD", "INR", "EUR", "GBP"];
+const CURRENCIES = ["USD", "INR", "EUR", "GBP", "SAR"];
 
 export default function CreatePlan() {
   const navigate = useNavigate();
@@ -35,7 +35,7 @@ export default function CreatePlan() {
     name: "",
     code: "",
     price: 99,
-    currency: "USD",
+    currency: "SAR",
     interval: "month",
   });
 
