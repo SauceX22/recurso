@@ -191,7 +191,9 @@ func (s *InvoiceService) notifyInvoiceCreated(inv *domain.Invoice) {
 		return
 	}
 	safego.Go("invoice.notifyInvoiceCreated", func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// Detached from the caller's cancellation, so carry the invoice's own
+		// tenant: the tenant-scoped customer lookup fails closed without it.
+		ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), domain.TenantIDKey, inv.TenantID), 30*time.Second)
 		defer cancel()
 		customer, err := s.CustomerRepo.GetByID(ctx, inv.CustomerID)
 		if err != nil || customer == nil || customer.Email == "" {

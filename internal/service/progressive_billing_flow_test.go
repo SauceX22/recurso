@@ -21,7 +21,7 @@ type mockProgressiveRepo struct {
 func (m *mockProgressiveRepo) GetThreshold(ctx context.Context, subID uuid.UUID) (*int64, error) {
 	return m.threshold, nil
 }
-func (m *mockProgressiveRepo) ListActiveProgressiveSubscriptionIDs(ctx context.Context) ([]uuid.UUID, error) {
+func (m *mockProgressiveRepo) ListActiveProgressiveSubscriptionIDs(ctx context.Context) ([]domain.TenantScopedID, error) {
 	return nil, nil
 }
 func (m *mockProgressiveRepo) GetWatermark(ctx context.Context, subID, chargeID uuid.UUID, periodStart time.Time) (int64, error) {
