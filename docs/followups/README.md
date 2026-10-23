@@ -63,7 +63,7 @@ written. Where an item and the code disagree, the code wins: fix the item.
 | UP-1 | Coupon codes unique across all tenants | upstream | medium | open | [upstream-bugs.md](upstream-bugs.md) |
 | UP-2 | Portal "login (dev only)" button doesn't log in | upstream | low | open | [upstream-bugs.md](upstream-bugs.md) |
 | UP-3 | BYO-Stripe tenants' Adyen currencies go to platform Adyen | upstream | medium | open | [upstream-bugs.md](upstream-bugs.md) |
-| OPS-1 | Mock gateways settle real invoices in production | deploy/ops | high | open | [deploy-ops.md](deploy-ops.md) |
+| OPS-1 | Mock gateways settle real invoices in production | deploy/ops | high | done (`2a5a4e36`) | [deploy-ops.md](deploy-ops.md) |
 | OPS-2 | Image build no longer runs Go tests; fork has no CI runs | deploy/ops | high | open | [deploy-ops.md](deploy-ops.md) |
 | OPS-3 | Prod compose publishes the frontend on 5168 | deploy/ops | low | open | [deploy-ops.md](deploy-ops.md) |
 | OPS-4 | Frontend tests time out under load | deploy/ops | low | open | [deploy-ops.md](deploy-ops.md) |

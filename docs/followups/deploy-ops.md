@@ -4,29 +4,6 @@ Back to the [index](README.md).
 
 ## Open
 
-### OPS-1: Mock gateways settle real invoices on a production deploy with no Stripe/Razorpay key
-
-- **Status:** open
-- **Severity:** high
-- **What's wrong:** with `STRIPE_SECRET_KEY` (or `RAZORPAY_KEY_ID`) unset, that
-  gateway is a `MockGateway`, even with `APP_ENV=production`. The mock's
-  `RetryPayment` succeeds at random. The dunning worker falls back to it for an
-  invoice with no saved method, routed by currency.
-- **Evidence:** `cmd/api/main.go:241,250` (`NewMockGateway()` when the key is
-  empty; no production guard); `internal/adapter/gateway/mock.go:129-136`
-  (`rand.Float64() < 0.4` ⇒ `Success: true`);
-  `internal/adapter/worker/retry_worker.go:140` (`w.gateway.RetryPayment`),
-  which then settles and posts the cash leg.
-- **Consequence:** on the expected Saudi setup (Moyasar only), overdue USD or
-  INR invoices, and SAR ones if `GATEWAY_CURRENCY_OVERRIDES=SAR=moyasar` is
-  missing, are randomly marked paid with no money collected. The books
-  overstate cash.
-- **Proposed fix:** refuse mock gateways outside demo/development (fail boot,
-  or use a "not configured" gateway that always errors); warn or fail at boot
-  when a Moyasar key is set without the SAR override
-  (`cmd/api/gateway_config.go`).
-- **Source:** `review_parity.md` "Adjacent blockers"; `review_ops.md` H1.
-
 ### OPS-2: The image build no longer runs the Go tests, and the fork has no CI runs
 
 - **Status:** open
@@ -143,4 +120,12 @@ Back to the [index](README.md).
 
 ## Done
 
-None yet.
+### OPS-1: Mock gateways settle real invoices on a production deploy with no Stripe/Razorpay key
+
+- **Status:** done, `2a5a4e36`
+- Outside `APP_ENV=development` an unconfigured gateway is now an inert mock:
+  dunning retries answer `no_saved_payment_method` (handed to email dunning)
+  and mandate debits `gateway_not_configured`. `DEMO_MODE` still simulates.
+  Public checkout paths were already guarded (verified on the local stack).
+- **Left open:** no boot warning when a Moyasar key is set without
+  `GATEWAY_CURRENCY_OVERRIDES=SAR=moyasar` (Moyasar then collects nothing).
